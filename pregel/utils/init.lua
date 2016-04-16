@@ -83,11 +83,47 @@ local xpcall_tb = function(func, ...)
     return xpcall(lazy_func(func, ...), xpcall_tb_cb)
 end
 
+local function timeit(func, ...)
+    local time = os.clock()
+    func(...)
+    return os.clock() - time
+end
+
+local function is_callable(arg)
+    if arg ~= nil then
+        local mt = (type(arg) == 'table' and getmetatable(arg) or nil)
+        if type(arg) == 'function' or mt ~= nil and type(mt.__call) == 'function' then
+            return true
+        end
+    end
+    return false
+--[[ ALTERNATIIVE FORM
+    if arg == nil then
+        return false
+    end
+    if type(arg) == 'function' then
+        return true
+    end
+    local mt = (type(arg) == 'table' and getmetatable(arg) or nil)
+    if mt ~= nil and type(mt.__call) == 'function' then
+        return true
+    end
+    return false
+]]--
+end
+
+local function is_main()
+    return debug.getinfo(2).what == "main" and pcall(debug.getlocal, 5, 1) == false
+end
+
 return {
     error = error,
     syserror = syserror,
     traceback = traceback,
     lazy_func = lazy_func,
-    xpcall_tb = xpcall_tb
+    xpcall_tb = xpcall_tb,
+    timeit = timeit,
+    is_callable = is_callable,
+    is_main = is_main
 }
 

@@ -9,8 +9,10 @@ local fiber = require('fiber')
 local queue  = require('pregel.queue')
 local vertex = require('pregel.vertex')
 
-local fmtstring = string.format
-local xpcall_tb = require('pregel.utils').xpcall_tb
+local fmtstring   = string.format
+local timeit      = require('pregel.utils').timeit
+local xpcall_tb   = require('pregel.utils').xpcall_tb
+local is_callable = require('pregel.utils').is_callable
 
 local pregel_mt = {
     run_superstep = function(self)
@@ -65,8 +67,6 @@ local pregel_mt = {
 
         acc = self.space:pairs():filter(tuple_filter):map(tuple_process):reduce(count_true, acc)
 
-        print('accum result', acc[1], acc[2])
-
         if self.vertex_pool.cnt > 0 then
             fiber.sleep(0)
         end
@@ -74,14 +74,22 @@ local pregel_mt = {
     run = function(self)
         while true do
             -- queue.verify(self.msg_out)
-            self:run_superstep()
-            log.info('stat: in_progress == %d', self.in_progress)
-            log.info('stat:   out_queue == %d', self.msg_out:len())
-            log.info('stat:    in_queue == %d', self.msg_in:len())
-            self.msg_in:truncate()
+            log.info('stat:         step time == %f', timeit(self.run_superstep, self))
+            log.info('-------------------------------------------------')
+            log.info('stat:       in_progress == %d', self.in_progress)
+            log.info('-------------------------------------------------')
+            log.info('stat:         out_queue == %d', self.msg_out:len())
+            log.info('stat:          in_queue == %d', self.msg_in:len())
+            log.info('-------------------------------------------------')
+            log.info('stat:     truncate time == %f', timeit(self.msg_in.truncate, self.msg_in))
+            log.info('stat:       squash time == %f', timeit(self.msg_out.squash, self.msg_out))
+            log.info('stat:  squash_out_queue == %d', self.msg_out:len())
+            log.info('stat: truncate_in_queue == %d', self.msg_in:len())
+            log.info('-------------------------------------------------')
             if self.in_progress == 0 and self.msg_out:len() == 0 then
                 break
             end
+--            os.exit()
             -- swap message queues
             local tmp = self.msg_out
             self.msg_out = self.msg_in
@@ -94,18 +102,35 @@ local pregel_mt = {
     end
 }
 
-local pregel_new = function(name, compute, aggregator)
-    if type(compute) ~= 'function' then
-        error('Bad compute function', 2)
-    end
-    if type(aggregator) ~= 'function' and type(aggregator) ~= 'nil' then
-        error('Bad aggregator function', 2)
-    end
+local pregel_new = function(name, options)
+    assert(type(options) == 'nil' or type(options) == 'table',
+           'options must be "table" or "nil"')
+    options = options or {}
+
+    local compute     = options.compute
+    local preload     = options.preload
+    local aggregator  = options.aggregator
+    local squash_only = options.squash_only
+    local tube_engine = options.tube_engine
+    assert(is_callable(compute), 'options.compute must be callable')
+    assert(is_callable(preload), 'options.preload must be callable')
+    assert(type(aggregator) == 'nil' or is_callable(aggregator),
+           'options.aggregator must be callable or "nil"')
+    assert(type(squash_only) == 'nil' or type(squash_only) == 'boolean',
+           'options.squash_only must be "boolean" or "nil"')
+    assert(type(tube_engine) == 'nil' or type(tube_engine) == 'string',
+           'options.tube_engine must be "string" or "nil"')
+
     local self = setmetatable({
-        fiber = fiber.self(),
-        superstep = 1,
-        compute = compute,
-        in_progress = 0
+        fiber       = fiber.self(),
+        superstep   = 1,
+        compute     = compute,
+        in_progress = 0,
+        -- just in case
+        aggregator  = aggregator,
+        preload     = preload,
+        squash_only = squash_only,
+        tube_engine = tube_engine
     }, {
         __index = pregel_mt
     })
@@ -116,7 +141,8 @@ local pregel_new = function(name, compute, aggregator)
             parts = {1, 'NUM'}
         })
 
-        preload_file(space)
+        local rv = timeit(preload, space)
+        log.info('stat: preload_file_time == %f', rv)
         box.snapshot()
     end)
     self.vertex_pool = vertex.pool_new{
@@ -124,8 +150,16 @@ local pregel_new = function(name, compute, aggregator)
         pregel = self
     }
 
-    self.msg_in  = queue.new('msg_in_'   .. name, aggregator)
-    self.msg_out = queue.new('msg_out_'  .. name, aggregator)
+    self.msg_in  = queue.new('msg_in_'   .. name, {
+        aggregator = aggregator,
+        squash_only = squash_only,
+        engine = tube_engine
+    })
+    self.msg_out = queue.new('msg_out_'  .. name, {
+        aggregator = aggregator,
+        squash_only = squash_only,
+        engine = tube_engine
+    })
     self.space   = box.space['data_' .. name]
 
     self.space:pairs():each(function(tuple)
