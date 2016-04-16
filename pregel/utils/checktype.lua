@@ -34,7 +34,7 @@ end
 local function checkt_table_xc(tbl, types, nvar)
     if type(nvar) == nil then
         nvar = types
-        var = nil
+        tbl = nil
     end
     types = type(types) == 'string' and {types} or types
     checkt_xc(tbl, 'table', nvar, 1)
@@ -46,7 +46,7 @@ end
 
 local function checkt_table(tbl, types)
     types = type(types) == 'string' and {types} or types
-    return checkt(tbl, 'table') and iter(element):reduce(
+    return checkt(tbl, 'table') and iter(tbl):reduce(
         function(acc, x) return (acc or checkt(x, types)) end
     )
 end

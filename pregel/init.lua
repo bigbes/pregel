@@ -25,39 +25,60 @@ local pregel_mt = {
         --     -- fiber.create(vertex_object.compute, vertex_object)
         --     xpcall_tb(vertex_object.compute, vertex_object)
         -- end)
+        --
         -- -- run through all nodes that aren't halted
         -- self.space.index.halt:pairs{0}:enumerate():each(function(k, tuple)
         --     local vertex_object = self.vertex_pool:pop():apply(tuple)
         --     vertex_object.superstep = superstep
         --     -- fiber.create(vertex_object.compute, vertex_object)
         --     vertex_object:compute()
-        -- end)
+        -- end
         log.info('scanning %d objects', self.space:len())
-        self.space:pairs():enumerate():each(function(k, tuple)
-            if tuple[3] == 0 and self.msg_in:len{tuple[1]} == 0 then
-                return
-            end
-            local vertex_object = self.vertex_pool:pop():apply(tuple)
+
+        local function tuple_filter(tuple)
+            local id, halt = tuple:unpack(1, 2)
+            -- if (self.msg_in:len(id) > 0 or halt == false) then
+            --     print('tuple_filter: ', self.msg_in:len(id), halt)
+            -- end
+            return not (self.msg_in:len(id) == 0 and halt == true)
+        end
+
+        local function tuple_process(tuple)
+            local vertex_object = self.vertex_pool:pop(tuple)
             vertex_object.superstep = self.superstep
+            vertex_object:vote_halt(false)
             -- fiber.create(vertex_object.compute, vertex_object)
-            vertex_object:compute()
-        end)
+            local rv = vertex_object:__compute()
+            self.msg_in:delete(vertex_object.__id)
+            return rv
+        end
+
+        local function count_true(acc, val)
+            if val ~= nil then
+                if val == true then acc[1] = acc[1] + 1 end
+                acc[2] = acc[2] + 1
+            end
+            return acc
+        end
+
+        local acc = {0, 0}
+
+        acc = self.space:pairs():filter(tuple_filter):map(tuple_process):reduce(count_true, acc)
+
+        print('accum result', acc[1], acc[2])
+
         if self.vertex_pool.cnt > 0 then
             fiber.sleep(0)
         end
-        -- self.tempspace:pairs{}:enumerate():each(function(k, tuple)
-        --     self.space:replace(tuple)
-        -- end)
-        -- self.tempspace:truncate()
     end,
     run = function(self)
         while true do
-            queue.verify(self.msg_out)
+            -- queue.verify(self.msg_out)
             self:run_superstep()
-            self.msg_in:truncate()
             log.info('stat: in_progress == %d', self.in_progress)
             log.info('stat:   out_queue == %d', self.msg_out:len())
             log.info('stat:    in_queue == %d', self.msg_in:len())
+            self.msg_in:truncate()
             if self.in_progress == 0 and self.msg_out:len() == 0 then
                 break
             end
@@ -65,7 +86,6 @@ local pregel_mt = {
             local tmp = self.msg_out
             self.msg_out = self.msg_in
             self.msg_in = tmp
-            -- move all from tempspace to space
             -- done
             log.info('superstep %d is finished', self.superstep)
             self.superstep = self.superstep + 1
@@ -74,14 +94,18 @@ local pregel_mt = {
     end
 }
 
-local pregel_new = function(name, compute)
+local pregel_new = function(name, compute, aggregator)
     if type(compute) ~= 'function' then
         error('Bad compute function', 2)
+    end
+    if type(aggregator) ~= 'function' and type(aggregator) ~= 'nil' then
+        error('Bad aggregator function', 2)
     end
     local self = setmetatable({
         fiber = fiber.self(),
         superstep = 1,
         compute = compute,
+        in_progress = 0
     }, {
         __index = pregel_mt
     })
@@ -91,14 +115,7 @@ local pregel_new = function(name, compute)
             type = 'HASH',
             parts = {1, 'NUM'}
         })
-        space:create_index('halt', {
-            type = 'TREE',
-            parts = {2, 'NUM'},
-            unique = false
-        })
 
-        queue.new('msg_in_'  .. name) --, { temporary = true })
-        queue.new('msg_out_' .. name) --, { temporary = true })
         preload_file(space)
         box.snapshot()
     end)
@@ -107,22 +124,15 @@ local pregel_new = function(name, compute)
         pregel = self
     }
 
-    self.msg_in  = queue.list['msg_in_' .. name]
-    assert(self.msg_in ~= nil)
-    self.msg_out = queue.list['msg_out_' .. name]
-    assert(self.msg_out ~= nil)
+    self.msg_in  = queue.new('msg_in_'   .. name, aggregator)
+    self.msg_out = queue.new('msg_out_'  .. name, aggregator)
     self.space   = box.space['data_' .. name]
 
-    self.tempspace = box.schema.create_space('data_temporary_' .. name, {
-        temporary = true
-    })
-    self.tempspace:create_index('primary', {
-        type = HASH,
-        parts = {1, 'NUM'}
-    })
-
-    log.info('%d', self.space:len())
-    self.in_progress = self.space:len()
+    self.space:pairs():each(function(tuple)
+        if tuple[2] == false then
+            self.in_progress = self.in_progress + 1
+        end
+    end)
 
     return self
 end

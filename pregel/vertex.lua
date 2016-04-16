@@ -1,85 +1,105 @@
-local fun = require('fun')
+local fun  = require('fun')
+local log  = require('log')
+local json = require('json')
 
-vertex_mt = {
-    apply = function(self, tuple)
-        tuple:pairs():enumerate():each(
-            function(k, v)
-                if k == 1 then
-                    self.id = v
-                elseif k == 2 then
-                    self.__halt = v
-                elseif k == 3 then
-                    self.value = v
-                elseif k == 4 then
-                    self.__edges = v
-                else
-                    assert('unreacheable')
-                end
-            end
-        )
+local vertex_mt = {
+    --[[-- INTERNAL API --]]--
+    __apply = function(self, tuple)
+        self.__modified = false
+        self.__id, self.__halt, self.__value, self.__edges = tuple:unpack()
         return self
     end,
-    set_halt = function(self)
-        if self.__halt ~= 1 then
-            self.__halt = 1
+    __compute = function(self)
+        if type(self.__compute_func) ~= 'function' then
+            error('No compute function is provided')
+        end
+        self:__compute_func()
+        if self.__modified then
+            self.__pregel.space:replace{
+                self.__id, self.__halt, self.__value, self.__edges
+            }
+        end
+        return self.__modified
+    end,
+    __write_solution = function(self)
+        -- ??
+    end,
+    --[[
+    -- PUBLIC API:
+    -- * self:vote_halt
+    -- * self:pairs_edges
+    -- * self:pairs_messages
+    -- * self:send_message
+    -- * self:get_value
+    -- * self:set_value
+    -- * self:get_id
+    --]]
+    vote_halt = function(self, val)
+        if val == nil then
+            val = true
+        end
+        if self.__halt == false and val == true then
+            self.__modified = true
+            self.__halt     = true
             self.__pregel.in_progress = self.__pregel.in_progress - 1
+        elseif self.__halt == true and val == false then
+            self.__modified = true
+            self.__halt     = false
+            self.__pregel.in_progress = self.__pregel.in_progress + 1
         end
     end,
     pairs_edges = function(self)
-        return fun.iter(self.__edges)
+        return fun.wrap(pairs(self.__edges))
     end,
     pairs_messages = function(self)
-        return self.__pregel.msg_in:take_closure(self.id)
+        return self.__pregel.msg_in:pairs(self.__id)
     end,
-    send_message = function(self, send_to, msg)
-        self.__pregel.msg_out:put(send_to, msg)
+    send_message = function(self, receiver, msg)
+        return self.__pregel.msg_out:put(receiver, msg)
     end,
-    compute = function(self)
-        if type(self.__compute) ~= 'function' then
-            error('no compute function')
-        end
-        self:__compute()
-        self.__pregel.space:replace{
-            self.id, self.__halt, self.value, self.__edges
-        }
---         self.__pregel.tempspace:replace{
---             self.id, self.__halt, self.value, self.__edges
---         }
-        self.__pregel.vertex_pool:push(self)
+    get_value = function(self)
+        return self.__value
+    end,
+    set_value = function(self, new)
+        self.__modified = true
+        self.__value = new
+    end,
+    get_id = function(self)
+        return self.__id
     end,
 }
 
 local function vertex_new()
     local self = setmetatable({
-        superstep = 0,
         id = 0,
-        value = 0,
+        superstep = 0,
         -- can't access from inside
+        __modified = false,
         __halt = false,
-        __edges = 1,
+        __edges = nil,
+        __value = 0,
         -- assigned once per vertex
-        __pregel = 0,
-        __compute = 0
+        __pregel = nil,
+        __compute = nil
     }, {
-        __index = vertex_mt,
-        __newindex = function() error("Can't set value to vertex", 2) end
+        __index = vertex_mt
     })
     return self
 end
 
 local vertex_pool_mt = {
-    pop = function(self)
+    pop = function(self, tuple)
         assert(self.cnt >= 0)
         self.cnt = self.cnt + 1
         local vl = table.remove(self.list)
         if vl == nil then
             vl = vertex_new()
-            vl.__compute = self.compute
+            vl.__compute_func = self.compute
             vl.__pregel = self.pregel
         else
             self.len = self.len - 1
         end
-        return vl
+        return vl:__apply(tuple)
     end,
     push = function(self, vertex)
         self.cnt = self.cnt - 1

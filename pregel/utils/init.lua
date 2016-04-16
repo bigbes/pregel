@@ -35,26 +35,28 @@ local syserror = function(...)
     basic_error(err_text, level)
 end
 
-local traceback = function (ldepth)
+local function traceback(ldepth)
     local tb = {}
     local depth = 2 + (ldepth or 1)
     local level = depth
     while true do
         local info = debug.getinfo(level)
-        if info == nil then break end
-        local line, file, what, name = nil, nil, nil, nil
-        if type(info) == 'table' then
-            line = info.currentline or 0
-            file = info.short_src or info.src or 'eval'
-            what = info.what or 'undef'
-            name = info.name
+        if info == nil then
+            break
+        elseif type(info) ~= 'table' then
+            log.error('unsupported `info` type: %s', type(info))
+            break
         end
-        tb[level - depth + 1] = {
+        local line = info.currentline or 0
+        local file = info.short_src or info.src or 'eval'
+        local what = info.what or 'undef'
+        local name = info.name
+        table.insert(tb, {
             line = line,
             file = file,
             what = what,
             name = name
-        }
+        })
         level = level + 1
     end
     return tb
@@ -71,7 +73,7 @@ end
 local function xpcall_tb_cb(err)
     err = err or '<none>'
     log.error("Error catched: %s", err)
-    for f in ipairs(traceback(o)) do
+    for _, f in pairs(traceback()) do
         local name = f.name and fmtstring(" function '%s'", f.name) or ''
         log.error("[%-4s]%s at <%s:%d>", f.what, name, f.file, f.line)
     end
