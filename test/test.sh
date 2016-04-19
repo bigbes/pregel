@@ -6,3 +6,4 @@ tarantool test-3.lua
 tarantool test-4.lua
 tarantool test-5.lua
 tarantool test-6.lua
+tail -n1 *.log

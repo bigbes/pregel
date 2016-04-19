@@ -2,14 +2,13 @@ local fun  = require('fun')
 local log  = require('log')
 local json = require('json')
 
-local vertex_mt = {
-    --[[-- INTERNAL API --]]--
-    __apply = function(self, tuple)
+local vertex_private_mt = {
+    apply = function(self, tuple)
         self.__modified = false
         self.__id, self.__halt, self.__value, self.__edges = tuple:unpack()
         return self
     end,
-    __compute = function(self)
+    compute = function(self)
         if type(self.__compute_func) ~= 'function' then
             error('No compute function is provided')
         end
@@ -21,9 +20,16 @@ local vertex_mt = {
         end
         return self.__modified
     end,
-    __write_solution = function(self)
-        -- ??
+    write_solution = function(self)
+        if type(self.__write_solution_func) ~= 'function' then
+            error('No write_solution function is provided')
+        end
+        return self:__write_solution_func()
     end,
+}
+
+local vertex_mt = {
+    --[[-- INTERNAL API --]]--
     --[[
     -- PUBLIC API:
     -- * self:vote_halt
@@ -89,44 +95,43 @@ end
 
 local vertex_pool_mt = {
     pop = function(self, tuple)
-        assert(self.cnt >= 0)
-        self.cnt = self.cnt + 1
-        local vl = table.remove(self.list)
+        assert(self.count >= 0)
+        self.count = self.count + 1
+        local vl = table.remove(self.container)
         if vl == nil then
             vl = vertex_new()
             vl.__compute_func = self.compute
+            vl.__write_solution_func = self.write_solution
             vl.__pregel = self.pregel
-        else
-            self.len = self.len - 1
         end
-        return vl:__apply(tuple)
+        return vertex_private_mt.apply(vl, tuple)
     end,
     push = function(self, vertex)
-        self.cnt = self.cnt - 1
-        assert(self.cnt >= 0)
-        if self.len == self.max then
+        self.count = self.count - 1
+        assert(self.count >= 0)
+        if #self.container == self.maximum_count then
             return
         end
-        table.insert(self.list, vertex)
-        self.len = self.len + 1
+        table.insert(self.container, vertex)
     end
 }
 
 local function vertex_pool_new(cfg)
     cfg = cfg or {}
     return setmetatable({
-        cnt = 0,
-        len = 0,
-        list = {},
-        max = 100,
-        pregel = cfg.pregel,
-        compute = cfg.compute
+        count          = 0,
+        container      = {},
+        maximum_count  = 100,
+        pregel         = cfg.pregel,
+        compute        = cfg.compute,
+        write_solution = cfg.write_solution
     }, {
         __index = vertex_pool_mt
     })
 end
 
 return {
+    vertex_private_mt = vertex_private_mt,
     new = vertex_new,
     pool_new = vertex_pool_new
 }

@@ -86,17 +86,6 @@ local function main(options)
     end)
 end
 
-if is_main() then
-    main({
-        compute = graph_max_process,
-        aggregator = math.max,
-        preload = preload_from_file('data/soc-Epinions1.txt'),
-        squash_only = false
-    })
-
-    os.exit(0)
-end
-
 return {
     main = main,
     graph_max_process = graph_max_process,
