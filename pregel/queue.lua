@@ -38,10 +38,10 @@ local tube_space_mt = {
     put = function(self, receiver, message)
         assert(receiver ~= nil)
         assert(message  ~= nil)
-        if self.aggregator ~= nil and self.squash_only == false then
+        if self.combiner ~= nil and self.squash_only == false then
             local rv = message
             for _, msg in self:pairs(receiver) do
-                rv = self.aggregator(rv, msg)
+                rv = self.combiner(rv, msg)
             end
             self:delete(receiver)
             message = rv
@@ -83,14 +83,14 @@ local tube_space_mt = {
         setmetatable(self, nil)
     end,
     squash = function(self)
-        if self.aggregator ~= nil and self.squash_only == true then
+        if self.combiner ~= nil and self.squash_only == true then
             for receiver in self:receiver_closure() do
                 local rv = nil
                 for _, v in self:pairs(receiver) do
                     if rv == nil then
                         rv = v
                     else
-                        rv = self.aggregator(rv, v)
+                        rv = self.combiner(rv, v)
                     end
                 end
                 self:delete(receiver)
@@ -119,10 +119,10 @@ local tube_table_mt = {
         assert(receiver ~= nil)
         assert(message  ~= nil)
 
-        if self.aggregator ~= nil and self.squash_only == false then
+        if self.combiner ~= nil and self.squash_only == false then
             local rv = message
             for _, msg in self:pairs(receiver) do
-                rv = self.aggregator(rv, msg)
+                rv = self.combiner(rv, msg)
             end
             self:delete(receiver)
             message = rv
@@ -163,14 +163,14 @@ local tube_table_mt = {
         setmetatable(self, nil)
     end,
     squash = function(self)
-        if self.aggregator ~= nil and self.squash_only == true then
+        if self.combiner ~= nil and self.squash_only == true then
             for receiver in self:receiver_closure() do
                 local rv = nil
                 for _, v in self:pairs(receiver) do
                     if rv == nil then
                         rv = v
                     else
-                        rv = self.aggregator(rv, v)
+                        rv = self.combiner(rv, v)
                     end
                 end
                 self:delete(receiver)
@@ -203,9 +203,9 @@ local function tube_new(name, options)
            'options must be "table" or "nil"')
     options = options or {}
 
-    local aggregator = options.aggregator
-    assert(type(aggregator) == 'nil' or is_callable(aggregator),
-           'options.aggregator must be callable or "nil"')
+    local combiner = options.combiner
+    assert(type(combiner) == 'nil' or is_callable(combiner),
+           'options.combiner must be callable or "nil"')
 
     local squash_only = options.squash_only
     assert(type(squash_only) == 'nil' or type(squash_only) == 'boolean',
@@ -218,11 +218,11 @@ local function tube_new(name, options)
     local self = rawget(tube_list, name)
     if self == nil then
         self = {
-            name = name,
-            engine = engine,
-            aggregator = aggregator,
+            name        = name,
+            engine      = engine,
+            combiner    = combiner,
             squash_only = squash_only,
-            stats = collections.defaultdict(0)
+            stats       = collections.defaultdict(0)
         }
 
         if engine == 'table' then

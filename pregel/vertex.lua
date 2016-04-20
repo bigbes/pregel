@@ -9,9 +9,6 @@ local vertex_private_mt = {
         return self
     end,
     compute = function(self)
-        if type(self.__compute_func) ~= 'function' then
-            error('No compute function is provided')
-        end
         self:__compute_func()
         if self.__modified then
             self.__pregel.space:replace{
@@ -21,15 +18,11 @@ local vertex_private_mt = {
         return self.__modified
     end,
     write_solution = function(self)
-        if type(self.__write_solution_func) ~= 'function' then
-            error('No write_solution function is provided')
-        end
         return self:__write_solution_func()
     end,
 }
 
 local vertex_mt = {
-    --[[-- INTERNAL API --]]--
     --[[
     -- PUBLIC API:
     -- * self:vote_halt
@@ -77,16 +70,17 @@ local vertex_mt = {
 
 local function vertex_new()
     local self = setmetatable({
-        id = 0,
-        superstep = 0,
+        superstep      = 0,
         -- can't access from inside
-        __modified = false,
-        __halt = false,
-        __edges = nil,
-        __value = 0,
+        __id           = 0,
+        __modified     = false,
+        __halt         = false,
+        __edges        = nil,
+        __value        = 0,
         -- assigned once per vertex
-        __pregel = nil,
-        __compute = nil
+        __pregel       = nil,
+        __compute_func = nil,
+        __write_solution_func = nil
     }, {
         __index = vertex_mt
     })

@@ -106,15 +106,18 @@ local pregel_new = function(name, options)
            'options must be "table" or "nil"')
     options = options or {}
 
-    local compute     = options.compute
-    local preload     = options.preload
-    local aggregator  = options.aggregator
-    local squash_only = options.squash_only
-    local tube_engine = options.tube_engine
+    local compute        = options.compute
+    local preload        = options.preload
+    local combiner       = options.combiner
+    local write_solution = options.write_solution
+    local squash_only    = options.squash_only
+    local tube_engine    = options.tube_engine
     assert(is_callable(compute), 'options.compute must be callable')
     assert(is_callable(preload), 'options.preload must be callable')
-    assert(type(aggregator) == 'nil' or is_callable(aggregator),
-           'options.aggregator must be callable or "nil"')
+    assert(type(combiner) == 'nil' or is_callable(combiner),
+           'options.combiner must be callable or "nil"')
+    assert(type(write_solution) == 'nil' or is_callable(write_solution),
+           'options.write_solution must be callable or "nil"')
     assert(type(squash_only) == 'nil' or type(squash_only) == 'boolean',
            'options.squash_only must be "boolean" or "nil"')
     assert(type(tube_engine) == 'nil' or type(tube_engine) == 'string',
@@ -126,7 +129,7 @@ local pregel_new = function(name, options)
         compute     = compute,
         in_progress = 0,
         -- just in case
-        aggregator  = aggregator,
+        combiner    = combiner,
         preload     = preload,
         squash_only = squash_only,
         tube_engine = tube_engine
@@ -150,14 +153,14 @@ local pregel_new = function(name, options)
     }
 
     self.msg_in  = queue.new('msg_in_'   .. name, {
-        aggregator = aggregator,
+        combiner    = combiner,
         squash_only = squash_only,
-        engine = tube_engine
+        engine      = tube_engine
     })
     self.msg_out = queue.new('msg_out_'  .. name, {
-        aggregator = aggregator,
+        combiner    = combiner,
         squash_only = squash_only,
-        engine = tube_engine
+        engine      = tube_engine
     })
     self.space   = box.space['data_' .. name]
 
