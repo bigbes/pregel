@@ -1,5 +1,6 @@
 #/usr/bin/env bash
 set -v
+
 tarantool test-1.lua
 tarantool test-2.lua
 tarantool test-3.lua

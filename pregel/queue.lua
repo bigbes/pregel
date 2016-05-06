@@ -8,7 +8,7 @@ local is_callable = require('pregel.utils').is_callable
 
 local tube_list
 
-local tube_space_mt = {
+local tube_space_methods = {
     pairs = function(self, receiver)
         assert(receiver ~= nil)
         local fun, param, state = self.space.index.receiver:pairs(receiver)
@@ -47,8 +47,7 @@ local tube_space_mt = {
             message = rv
         end
         self.stats[receiver] = self.stats[receiver] + 1
-        local rv = self.space:auto_increment{receiver, message}
-        return rv
+        return self.space:auto_increment{receiver, message}
     end,
     len = function(self, receiver)
         local val = nil
@@ -100,7 +99,7 @@ local tube_space_mt = {
     end
 }
 
-local tube_table_mt = {
+local tube_table_methods = {
     pairs = function(self, receiver)
         assert(receiver ~= nil)
         return pairs(self.container[receiver])
@@ -229,7 +228,7 @@ local function tube_new(name, options)
             self.container = collections.defaultdict(function(key)
                 return {}
             end)
-            self = setmetatable(self, { __index = tube_table_mt })
+            self = setmetatable(self, { __index = tube_table_methods })
         elseif engine == 'space' then
             local space = box.space['pregel_tube_' .. name]
 
@@ -251,7 +250,7 @@ local function tube_new(name, options)
                 end)
             end
             self.space = space
-            self = setmetatable(self, { __index = tube_space_mt })
+            self = setmetatable(self, { __index = tube_space_methods })
         else
             assert(false)
         end
