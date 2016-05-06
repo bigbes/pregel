@@ -3,21 +3,22 @@
 local fio = require('fio')
 local fun = require('fun')
 local log = require('log')
+local uri = require('uri')
 local yaml = require('yaml')
 local fiber = require('fiber')
 
 local queue  = require('pregel.queue')
 local vertex = require('pregel.vertex')
 
-local vertex_compute = vertex.vertex_private_mt.compute
-local vertex_write_solution = vertex.vertex_private_mt.write_solution
+local vertex_compute = vertex.vertex_private_methods.compute
+local vertex_write_solution = vertex.vertex_private_methods.write_solution
 
 local fmtstring   = string.format
 local timeit      = require('pregel.utils').timeit
 local xpcall_tb   = require('pregel.utils').xpcall_tb
 local is_callable = require('pregel.utils').is_callable
 
-local pregel_mt = {
+local pregel_methods = {
     run_superstep = function(self)
         local function tuple_filter(tuple)
             local id, halt = tuple:unpack(1, 2)
@@ -134,7 +135,7 @@ local pregel_new = function(name, options)
         squash_only = squash_only,
         tube_engine = tube_engine
     }, {
-        __index = pregel_mt
+        __index = pregel_methods
     })
     box.once('pregel_load-' .. name, function()
         local space = box.schema.create_space('data_' .. name)

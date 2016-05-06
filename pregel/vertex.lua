@@ -2,7 +2,7 @@ local fun  = require('fun')
 local log  = require('log')
 local json = require('json')
 
-local vertex_private_mt = {
+local vertex_private_methods = {
     apply = function(self, tuple)
         self.__modified = false
         self.__id, self.__halt, self.__value, self.__edges = tuple:unpack()
@@ -22,7 +22,7 @@ local vertex_private_mt = {
     end,
 }
 
-local vertex_mt = {
+local vertex_methods = {
     --[[
     -- PUBLIC API:
     -- * self:vote_halt
@@ -82,12 +82,12 @@ local function vertex_new()
         __compute_func = nil,
         __write_solution_func = nil
     }, {
-        __index = vertex_mt
+        __index = vertex_methods
     })
     return self
 end
 
-local vertex_pool_mt = {
+local vertex_pool_methods = {
     pop = function(self, tuple)
         assert(self.count >= 0)
         self.count = self.count + 1
@@ -98,7 +98,7 @@ local vertex_pool_mt = {
             vl.__write_solution_func = self.write_solution
             vl.__pregel = self.pregel
         end
-        return vertex_private_mt.apply(vl, tuple)
+        return vertex_private_methods.apply(vl, tuple)
     end,
     push = function(self, vertex)
         self.count = self.count - 1
@@ -120,12 +120,12 @@ local function vertex_pool_new(cfg)
         compute        = cfg.compute,
         write_solution = cfg.write_solution
     }, {
-        __index = vertex_pool_mt
+        __index = vertex_pool_methods
     })
 end
 
 return {
-    vertex_private_mt = vertex_private_mt,
+    vertex_private_methods = vertex_private_methods,
     new = vertex_new,
     pool_new = vertex_pool_new
 }

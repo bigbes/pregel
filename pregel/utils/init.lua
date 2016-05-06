@@ -21,7 +21,7 @@ local error = function(...)
     basic_error(err_text, level)
 end
 
-local syserror = function(...)
+local function syserror(...)
     local args = {...}
     local level = 1
     if type(args[1]) == 'number' then
@@ -62,7 +62,7 @@ local function traceback(ldepth)
     return tb
 end
 
-local lazy_func = function(func, ...)
+local function lazy_func(func, ...)
     checkt_xc(func, 'function', 'function', 2)
     local arg = {...}
     return function()
@@ -79,7 +79,7 @@ local function xpcall_tb_cb(err)
     end
 end
 
-local xpcall_tb = function(func, ...)
+local function xpcall_tb(func, ...)
     return xpcall(lazy_func(func, ...), xpcall_tb_cb)
 end
 
@@ -116,8 +116,30 @@ local function is_main()
     return debug.getinfo(2).what == "main" and pcall(debug.getlocal, 5, 1) == false
 end
 
+local function random(x, y)
+    while true do
+        if x == nil then
+            local rv = math.random()
+            if rv >= 0 and rv <= 1 then
+                return rv
+            end
+        elseif y == nil then
+            local rv = math.random(x)
+            if rv >= 1 and rv <= x then
+                return rv
+            end
+        else
+            local rv = math.random(x, y)
+            if rv >= x and rv <= y then
+                return rv
+            end
+        end
+    end
+end
+
 return {
     error = error,
+    random = random,
     syserror = syserror,
     traceback = traceback,
     lazy_func = lazy_func,
