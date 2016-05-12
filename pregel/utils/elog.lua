@@ -6,11 +6,13 @@ local errno = require('errno')
 local elog_global = nil
 local elog_list = {}
 
-local error = require('migrate.utils').error
-local syserror = require('migrate.utils').syserror
-local traceback = require('migrate.utils').traceback
+local error = require('pregel.utils').error
+local syserror = require('pregel.utils').syserror
+local traceback = require('pregel.utils').traceback
 
-local ct = require('migrate.utils.checktype')
+local ct = require('pregel.utils.checktype')
+
+local strict = require('pregel.utils.strict')
 
 local checkt_xc = ct.checkt_xc
 
@@ -67,7 +69,7 @@ local function convert_level(level)
 end
 
 local function elog_traceback(self, level)
-    level = convert_level(leve)
+    level = convert_level(level)
     if self.level > level then return end
     local tb = traceback(1)
     for _, f in ipairs(traceback()) do

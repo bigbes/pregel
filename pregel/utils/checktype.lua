@@ -1,6 +1,8 @@
 local fun = require('fun')
 local iter, lor, reduce = fun.iter, fun.operator.lor, fun.reduce
 
+local strict = require('pregel.utils.strict')
+
 local fmtstring = string.format
 
 local function checkt_xc(var, types, nvar, lvl)
@@ -51,9 +53,9 @@ local function checkt_table(tbl, types)
     )
 end
 
-return {
+return strict.strictify({
     checkt_xc = checkt_xc,
     checkt = checkt,
     checkt_table_xc = checkt_table_xc,
     checkt_table = checkt_table
-}
+})

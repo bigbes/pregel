@@ -13,6 +13,7 @@ local timeit      = require('pregel.utils').timeit
 local is_main     = require('pregel.utils').is_main
 local xpcall_tb   = require('pregel.utils').xpcall_tb
 local defaultdict = require('pregel.utils.collections').defaultdict
+local strict      = require('pregel.utils.strict')
 
 -- Loader for list of graph edges
 local function preload_from_file(filename)
@@ -176,9 +177,9 @@ local function main(options)
     end)
 end
 
-return {
-    main = main,
-    graph_max_process = graph_max_process,
-    preload_from_file = preload_from_file,
+return strict.strictify({
+    main                      = main,
+    graph_max_process         = graph_max_process,
+    preload_from_file         = preload_from_file,
     preload_from_file_chunked = preload_from_file_chunked
-}
+})

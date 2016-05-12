@@ -1,3 +1,5 @@
+local strict = require('pregel.utils.strict')
+
 local function shallow(orig)
     local orig_type = type(orig)
     local copy = orig
@@ -22,7 +24,7 @@ local function deep(orig)
     return copy
 end
 
-return {
+return strict.strictify({
     shallow = shallow,
     deep = deep
-}
+})

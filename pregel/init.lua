@@ -7,7 +7,7 @@ local uri = require('uri')
 local yaml = require('yaml')
 local fiber = require('fiber')
 
-local queue  = require('pregel.queue')
+local queue  = require('pregel.local_queue')
 local vertex = require('pregel.vertex')
 
 local vertex_compute = vertex.vertex_private_methods.compute
@@ -17,6 +17,7 @@ local fmtstring   = string.format
 local timeit      = require('pregel.utils').timeit
 local xpcall_tb   = require('pregel.utils').xpcall_tb
 local is_callable = require('pregel.utils').is_callable
+local strict = require('pregel.utils.strict')
 
 local pregel_methods = {
     run_superstep = function(self)
@@ -70,7 +71,7 @@ local pregel_methods = {
             return vertex_write_solution(vertex_object)
         end
 
-        acc = self.space:pairs():filter(filter):each(tuple_write_solution)
+        local acc = self.space:pairs():filter(filter):each(tuple_write_solution)
     end,
 
     run = function(self)
@@ -174,6 +175,6 @@ local pregel_new = function(name, options)
     return self
 end
 
-return {
+return strict.strictify({
     new = pregel_new
-}
+})

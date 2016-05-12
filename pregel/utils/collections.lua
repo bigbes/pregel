@@ -1,3 +1,5 @@
+local strict = require('pregel.utils.strict')
+
 local function defaultdict_index(factory)
     return function(self, key)
         if type(factory) == 'function' then
@@ -15,7 +17,7 @@ local function defaultdict(factory)
     })
 end
 
-function readonly_table(table)
+local function readonly_table(table)
     return setmetatable({}, {
         __index = table,
         __newindex = function(table, key, value)
@@ -25,7 +27,7 @@ function readonly_table(table)
     });
 end
 
-return {
+return strict.strictify({
     defaultdict = defaultdict,
     rotable = readonly_table
-}
+})

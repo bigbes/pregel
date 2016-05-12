@@ -7,7 +7,7 @@ local fun = require('fun')
 local tap = require('tap')
 local json = require('json')
 local yaml = require('yaml')
-local queue = require("pregel.queue")
+local queue = require("pregel.local_queue")
 
 local xpcall_tb = require('pregel.utils').xpcall_tb
 

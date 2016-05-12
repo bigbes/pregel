@@ -1,6 +1,8 @@
 local common = require('common')
 local master = require('pregel.master')
 
+local loader = require('pregel.loader')
+
 local xpcall_tb = require('pregel.utils').xpcall_tb
 
 box.cfg{
@@ -17,12 +19,13 @@ local master = master.new('test', {
         'localhost:3306',
     },
     compute = common.graph_max_process,
-    preload = common.preload_from_file('../data/soc-Epinions1.txt'),
+    preload = loader.graph_edges_f,
+    preload_args = '../data/soc-Epinions-custom-bi.txt',
     aggregator = math.max,
     squash_only = false
 })
 
 -- xpcall_tb(master.start, master)
 master:start()
-
--- os.exit(0)
+xpcall_tb(master.preload, master)
+os.exit(0)

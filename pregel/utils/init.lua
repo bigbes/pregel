@@ -1,6 +1,7 @@
 local log = require('log')
 local errno = require('errno')
 
+local strict = require('pregel.utils.strict')
 local checkt_xc = require('pregel.utils.checktype').checkt_xc
 
 local basic_error = error
@@ -63,7 +64,6 @@ local function traceback(ldepth)
 end
 
 local function lazy_func(func, ...)
-    checkt_xc(func, 'function', 'function', 2)
     local arg = {...}
     return function()
         return func(unpack(arg))
@@ -137,7 +137,7 @@ local function random(x, y)
     end
 end
 
-return {
+return strict.strictify({
     error = error,
     random = random,
     syserror = syserror,
@@ -147,5 +147,4 @@ return {
     timeit = timeit,
     is_callable = is_callable,
     is_main = is_main
-}
-
+})
