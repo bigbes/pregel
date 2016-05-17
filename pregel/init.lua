@@ -7,7 +7,7 @@ local uri = require('uri')
 local yaml = require('yaml')
 local fiber = require('fiber')
 
-local queue  = require('pregel.local_queue')
+local queue  = require('pregel.queue')
 local vertex = require('pregel.vertex')
 
 local vertex_compute = vertex.vertex_private_methods.compute
@@ -138,6 +138,7 @@ local pregel_new = function(name, options)
     }, {
         __index = pregel_methods
     })
+
     box.once('pregel_load-' .. name, function()
         local space = box.schema.create_space('data_' .. name)
         space:create_index('primary', {
@@ -149,10 +150,11 @@ local pregel_new = function(name, options)
         log.info('stat: preload_file_time == %f', rv)
         box.snapshot()
     end)
-    self.vertex_pool = vertex.pool_new{
+
+    self.vertex_pool = vertex.pool_new({
         compute = compute,
         pregel = self
-    }
+    })
 
     self.msg_in  = queue.new('msg_in_'   .. name, {
         combiner    = combiner,

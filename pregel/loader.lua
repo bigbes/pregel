@@ -1,5 +1,5 @@
-local fio = require('fio')
-local log = require('log')
+local fio  = require('fio')
+local log  = require('log')
 local json = require('json')
 local yaml = require('yaml')
 
@@ -25,19 +25,19 @@ local function loader_methods(master)
     return {
         -- add, only if not exists.
         add_vertex   = function(self, id, name, value)
-            master.mpool:by_key(id):put('vertex.add', {id, name, value})
+            master.mpool:by_id(id):put('vertex.add', {id, name, value})
         end,
         -- no conflict resolving, reset state to new
         store_vertex = function(self, id, name, value)
-            master.mpool:by_key(id):put('vertex.store', {id, name, value})
+            master.mpool:by_id(id):put('vertex.store', {id, name, value})
         end,
         -- no conflict resolving, may be dups in output.
         store_edge   = function(self, src, dest, value)
-            master.mpool:by_key(src):put('edge.store', {src, {dest, value}})
+            master.mpool:by_id(src):put('edge.store', {src, {dest, value}})
         end,
         -- no conflict resolving, may be dups in output.
         store_edges_batch   = function(self, src, list)
-            master.mpool:by_key(src):put('edge.store', {src, unpack(list)})
+            master.mpool:by_id(src):put('edge.store', {src, unpack(list)})
         end,
         add_vertex_edges      = function(self, id, name, value, list)
             self:add_vertex(id, name, value)
@@ -88,7 +88,7 @@ local function loader_graph_edges_file(master, file)
                 else
                     if section == 1 then
                         local id, name, value = line:match("(%d+) '([^']+)' (%d+)")
-                        id = tonumber(id)
+                        id, value = tonumber(id), tonumber(value)
                         graph[id] = {id, false, name, value, {}}
                     elseif section == 2 then
                         local v1, v2, val = line:match("(%d+) (%d+) (%d+)")
@@ -155,7 +155,7 @@ local function loader_graph_edges_chunked_file(master, args)
                     else
                         if section == 1 then
                             local id, name, value = line:match("(%d+) '([^']+)' (%d+)")
-                            id = tonumber(id)
+                            id, value = tonumber(id), tonumber(value)
                             graph[id] = {id, false, name, value, {}}
                         elseif section == 2 then
                             local v1, v2, val = line:match("(%d+) (%d+) (%d+)")

@@ -77,6 +77,7 @@ local function xpcall_tb_cb(err)
         local name = f.name and fmtstring(" function '%s'", f.name) or ''
         log.error("[%-4s]%s at <%s:%d>", f.what, name, f.file, f.line)
     end
+    return err
 end
 
 local function xpcall_tb(func, ...)

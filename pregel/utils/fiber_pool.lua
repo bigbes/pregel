@@ -10,7 +10,6 @@ local strict = require('pregel.utils.strict')
 --                              OLD FIBER POOL                                --
 -- ========================================================================== --
 
---[[--
 local fiber_pool_list = defaultdict(function()
     return {}
 end)
@@ -39,7 +38,7 @@ local function fiber_pool_handler(self, fun)
 end
 
 local function fiber_pool_wait(self)
-    log.info("fiber_pool.wait(%s): begin", self)
+    log.debug("fiber_pool.wait(%s): begin", self)
 
     fiber.yield()
 
@@ -53,7 +52,7 @@ local function fiber_pool_wait(self)
         self.channel_out:get()
     end
 
-    log.info("fiber_pool.wait(%s): done", self)
+    log.debug("fiber_pool.wait(%s): done", self)
 end
 
 local function free_fiber_pool(q)
@@ -107,12 +106,12 @@ local function new_fiber_pool(fun, workers)
     local rv = table.remove(list)
     return rv or create_fiber_pool(fun, workers)
 end
---]]--
 
 -- ========================================================================== --
 --                              NEW FIBER POOL                                --
 -- ========================================================================== --
 
+--[[--
 -- fiber_pool implementation
 local function fiber_pool_handler(self, fid)
     fiber.name('fiber_pool/handler')
@@ -201,11 +200,12 @@ local function new_fiber_pool(count)
         return fiber.create(fiber_pool_handler, self, fid)
     end):totable()
 end
+--]]--
 
 -- ========================================================================== --
 --                              NEW FIBER POOL                                --
 -- ========================================================================== --
 
 return strict.strictify({
---     new = new_fiber_pool,
+     new = new_fiber_pool,
 })

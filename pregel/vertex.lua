@@ -5,14 +5,17 @@ local json = require('json')
 local vertex_private_methods = {
     apply = function(self, tuple)
         self.__modified = false
-        self.__id, self.__halt, self.__value, self.__edges = tuple:unpack()
+        self.__id, self.__halt, self.__name,
+            self.__value, self.__edges = tuple:unpack()
         return self
     end,
     compute = function(self)
         self:__compute_func()
         if self.__modified then
             self.__pregel.space:replace{
-                self.__id, self.__halt, self.__value, self.__edges
+                self.__id, self.__halt,
+                self.__name, self.__value,
+                self.__edges
             }
         end
         return self.__modified
@@ -48,13 +51,24 @@ local vertex_methods = {
         end
     end,
     pairs_edges = function(self)
-        return fun.wrap(pairs(self.__edges))
+        local last = 0
+        return function(pos)
+            last = last + 1
+            local edge = self.__edges[last]
+            if edge == nil then
+                return nil
+            end
+            return last, edge[1], edge[2]
+        end
     end,
     pairs_messages = function(self)
-        return self.__pregel.msg_in:pairs(self.__id)
+        return self.__pregel.mqueue:pairs(self.__id)
     end,
     send_message = function(self, receiver, msg)
-        return self.__pregel.msg_out:put(receiver, msg)
+        self.__pregel.mpool:by_id(receiver):put(
+                'message.deliver',
+                {receiver, msg, self.__id}
+        )
     end,
     get_value = function(self)
         return self.__value
@@ -73,6 +87,7 @@ local function vertex_new()
         superstep      = 0,
         -- can't access from inside
         __id           = 0,
+        __name         = '',
         __modified     = false,
         __halt         = false,
         __edges        = nil,

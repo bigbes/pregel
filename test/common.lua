@@ -143,12 +143,13 @@ local function preload_from_file_chunked(filename, chunk_size)
 end
 
 local function inform_neighbors(self, val)
-    for neighbor in ipairs(self.__edges) do
+    for id, neighbor, weight in self:pairs_edges() do
         self:send_message(neighbor, val)
     end
 end
 
 local function graph_max_process(self)
+    -- log.info('superstep: %s', self.superstep)
     if self.superstep == 1 then
         inform_neighbors(self, self:get_value())
     elseif self.superstep < 30 then
