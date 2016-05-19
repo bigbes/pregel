@@ -174,7 +174,8 @@ local mpool_mt = {
     __index = {
         by_id = function(self, key)
             key = (type(key) == 'number' and key or digest.crc32(key))
-            return self.buckets[1 + digest.guava(key, self.bucket_cnt)]
+            local bucket_id = 1 + digest.guava(key, self.bucket_cnt)
+            return self.buckets[bucket_id]
         end,
         flush = function(self)
             for _, bucket in ipairs(self.buckets) do

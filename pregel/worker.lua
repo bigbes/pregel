@@ -38,7 +38,10 @@ local info_functions = setmetatable({
         return instance:nd_vertex_store(args)
     end,
     ['edge.store']        = function(instance, args)
-        return instance:nd_edge_store(args)
+        return instance:nd_edge_store(args[1], args[2], args[3])
+    end,
+    ['edge.store.batch']  = function(instance, args)
+        return instance:nd_edge_store_batch(args[1], args[2])
     end,
     ['snapshot']          = function(instance, args)
         return box.snapshot()
@@ -97,7 +100,7 @@ local function deliver_msg(name, msg, args)
             return 1
         end)
         if stat == false then
-            error(err)
+            error(tostring(err))
         end
     end
 end
@@ -116,7 +119,7 @@ local function deliver_batch(name, msgs)
         return cnt
     end)
     if stat == false then
-        error(err)
+        error(tostring(err))
     end
 end
 
@@ -197,15 +200,24 @@ local worker_mt = {
             local id, name, value = unpack(args)
             self.space:replace{id, false, name, value, {}}
         end,
-        nd_edge_store = function(self, args)
-            local id = table.remove(args, 1)
-            local tuple = self.space:get(id)
+        nd_edge_store = function(self, from, to, value)
+            local tuple = self.space:get(from)
             if tuple == nil then
-                tuple = {id, false, yaml.NULL, yaml.NULL, {}}
+                tuple = {from, false, yaml.NULL, yaml.NULL, {}}
             else
                 tuple = tuple:totable()
             end
-            tuple[5] = fun.chain(tuple[5], args):totable()
+            table.insert(tuple[5], {to, value})
+            self.space:replace(tuple)
+        end,
+        nd_edge_store_batch = function(self, from, edges)
+            local tuple = self.space:get(from)
+            if tuple == nil then
+                tuple = {from, false, yaml.NULL, yaml.NULL, {}}
+            else
+                tuple = tuple:totable()
+            end
+            tuple[5] = fun.chain(tuple[5], edges):totable()
             self.space:replace(tuple)
         end,
         add_aggregator = function(self, name, opts)
@@ -220,9 +232,10 @@ local worker_new = function(name, options)
     -- parse workers
     local worker_uris = options.workers or {}
 
-    local compute        = options.compute
-    local combiner       = options.combiner
-    local master_uri     = options.master
+    local compute     = options.compute
+    local combiner    = options.combiner
+    local master_uri  = options.master
+    local pool_size   = options.pool_size or 1000
     assert(is_callable(compute), 'options.compute must be callable')
     assert(type(combiner) == 'nil' or is_callable(combiner),
            'options.combiner must be callable or "nil"')
@@ -232,7 +245,9 @@ local worker_new = function(name, options)
         name        = name,
         workers     = worker_uris,
         master_uri  = master_uri,
-        mpool       = mpool.new(name, worker_uris),
+        mpool       = mpool.new(name, worker_uris, {
+            msg_count = pool_size
+        }),
         aggregators = {},
         in_progress = 0
     }, worker_mt)

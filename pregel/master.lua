@@ -42,7 +42,7 @@ local function deliver_msg(msg, args)
     end)
 
     if stat == false then
-        error(err)
+        error(tostring(err))
     end
 end
 
@@ -104,15 +104,16 @@ local master_mt = {
 -- }
 local master_new = function(name, options)
     local connections = options.connections
-
-    -- parse workers
-    local workers = options.workers or {}
+    local workers     = options.workers or {}
+    local pool_size   = options.pool_size or 1000
 
     local self = setmetatable({
         name         = name,
         preload_func = nil,
         workers      = workers,
-        mpool        = mpool.new(name, workers),
+        mpool        = mpool.new(name, workers, {
+            msg_count = pool_size
+        }),
         aggregators  = {}
     }, master_mt)
 

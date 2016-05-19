@@ -1,3 +1,5 @@
+local log = require('log')
+
 local ploader = require('pregel.loader')
 local pmaster = require('pregel.master')
 local pworker = require('pregel.worker')
@@ -5,20 +7,8 @@ local pworker = require('pregel.worker')
 local xpcall_tb = require('pregel.utils').xpcall_tb
 
 local worker, port_offset = arg[0]:match('(%a+)-(%d+)')
-assert(port_offset ~= nil, 'bad worker name')
 
 port_offset = port_offset or 0
-
-box.cfg{
-    wal_mode = 'none',
-    listen = 'localhost:' .. tostring(3301 + port_offset),
-    background = true
-    logger_nonblock = false
-}
-
-box.schema.user.grant('guest', 'read,write,execute', 'universe', nil, {
-    if_not_exists = true
-})
 
 local function inform_neighbors(self, val)
     for id, neighbor, weight in self:pairs_edges() do
@@ -32,6 +22,12 @@ local function graph_max_process(self)
     elseif self.superstep < 30 then
         local modified = false
         for _, msg in self:pairs_messages() do
+            -- if type(self:get_value()) ~= type(msg) then
+            --     log.info('============================================')
+            --     log.info('bad types "%s" "%s"', tostring(self:get_value()), tostring(msg))
+            --     log.info('bad types "%s" "%s"', type(self:get_value()), type(msg))
+            --     log.info('============================================')
+            -- end
             if self:get_value() < msg then
                 self:set_value(msg)
                 modified = true
@@ -56,16 +52,16 @@ local common_cfg = {
     combiner     = math.max,
     preload      = ploader.graph_edges_f,
     preload_args = '../data/soc-Epinions-custom-bi.txt',
-    -- preload      = ploader.graph_edges_cf,
-    -- preload_args = '/Users/bigbes/src/work/pregel-data/actual/soc-pokec-relationshit-custom-bi.txt',
-    squash_only  = false
+    -- preload_args = '/Users/blikh/src/work/pregel-data/actual/soc-pokec-relationshit-custom-bi.txt',
+    squash_only  = false,
+    pool_size    = 1000
 }
 
 if worker == 'worker' then
     box.cfg{
         wal_mode = 'none',
         listen = 'localhost:' .. tostring(3301 + port_offset),
-        background = true
+        background = true,
         logger_nonblock = false
     }
 else
@@ -76,7 +72,9 @@ else
     }
 end
 
-box.schema.user.grant('guest', 'read,write,execute', 'universe')
+box.once('bootstrap', function()
+    box.schema.user.grant('guest', 'read,write,execute', 'universe')
+end)
 
 if worker == 'worker' then
     worker = pworker.new('test', common_cfg)
@@ -84,8 +82,10 @@ else
     xpcall_tb(function()
         local master = pmaster.new('test', common_cfg)
         master:wait_up()
-        master:preload()
-        master.mpool:send_wait('snapshot')
+        if arg[1] == 'load' then
+            master:preload()
+            master.mpool:send_wait('snapshot')
+        end
         master:start()
     end)
     os.exit(0)
