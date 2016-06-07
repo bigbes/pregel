@@ -10,12 +10,9 @@ yaml.cfg{
 local pregel      = require('pregel')
 local strict      = require('pregel.utils.strict')
 
-local fpool       = require('pregel.utils.fiber_pool')
-
 local fmtstring   = string.format
 local random      = require('pregel.utils').random
 local is_main     = require('pregel.utils').is_main
-local defaultdict = require('pregel.utils.collections').defaultdict
 local timeit      = require('pregel.utils').timeit
 local xpcall_tb   = require('pregel.utils').xpcall_tb
 local is_callable = require('pregel.utils').is_callable
@@ -24,33 +21,25 @@ local table_clear = require('table.clear')
 
 local function loader_methods(master)
     return {
-        -- add, only if not exists.
-        add_vertex   = function(self, id, name, value)
-            master.mpool:by_id(id):put('vertex.add', {id, name, value})
-        end,
         -- no conflict resolving, reset state to new
-        store_vertex = function(self, id, name, value)
-            master.mpool:by_id(id):put('vertex.store', {id, name, value})
+        store_vertex          = function(self, vertex)
+            master.mpool:by_id(id):put('vertex.store', vertex)
         end,
         -- no conflict resolving, may be dups in output.
-        store_edge   = function(self, src, dest, value)
-            master.mpool:by_id(src):put('edge.store', {src, dest, value})
+        store_edge            = function(self, src, dest, value)
+            master.mpool:by_id(src):put('edge.store', {src {dest, value}})
         end,
         -- no conflict resolving, may be dups in output.
-        store_edges_batch   = function(self, src, list)
-            master.mpool:by_id(src):put('edge.store.batch', {src, list})
+        store_edges_batch     = function(self, src, list)
+            master.mpool:by_id(src):put('edge.store', {src, list})
         end,
-        add_vertex_edges      = function(self, id, name, value, list)
-            self:add_vertex(id, name, value)
-            self:store_edges_batch(id, list)
-        end,
-        store_vertex_edges    = function(self, id, name, value, list)
-            self:store_vertex(id, name, value)
-            self:store_edges_batch(id, list)
+        store_vertex_edges    = function(self, vertex, list)
+            self:store_vertex(vertex)
+            self:store_edges_batch(vertex, list)
         end,
         flush                 = function(self)
             master.mpool:flush()
-        end
+        end,
     }
 end
 
@@ -84,6 +73,8 @@ local function loader_graph_edges_file(master, file)
         local current_id = -1
         local current_edges = {}
 
+        local vertices = {}
+
         while true do
             buf = buf .. f:read(4096)
             if #buf == 0 then
@@ -92,7 +83,7 @@ local function loader_graph_edges_file(master, file)
             for line in buf:gmatch("[^\n]+\n") do
                 if line:sub(1, 1) == '#' then
                     section = section + 1
-                    self:flush()
+                    -- self:flush()
                 else
                     if count_gc == 1000000 then
                         count_gc = 0
@@ -103,17 +94,22 @@ local function loader_graph_edges_file(master, file)
                     if section == 1 then
                         local id, name, value = line:match("(%d+) '([^']+)' (%d+)")
                         id, value = tonumber(id), tonumber(value)
-                        self:store_vertex(id, name, value)
+                        local id_new = self:store_vertex({
+                            id = id, value = value, name = name
+                        })
+                        vertices[id] = id_new
                     elseif section == 2 then
+                        print('section 2')
                         local v1, v2, val = line:match("(%d+) (%d+) (%d+)")
                         v1, v2 = tonumber(v1), tonumber(v2)
                         if v1 == current_id and count ~= 1000 then
                             count = count + 1
-                            table.insert(current_edges, {v2, val})
+                            -- table.insert(current_edges, {v2, val})
+                            table.insert(current_edges, {vertices[v2], val})
                         else
                             count = 0
                             if #current_edges ~= 0 then
-                                self:store_edges_batch(v1, current_edges)
+                                self:store_edges_batch(vertices[v1], current_edges)
                             end
                             current_id = v1
                             current_edges = {{v2, val}}

@@ -20,7 +20,6 @@ local mpool      = require('pregel.mpool')
 local timeit      = require('pregel.utils').timeit
 local xpcall_tb   = require('pregel.utils').xpcall_tb
 local is_callable = require('pregel.utils').is_callable
-local fiber_pool  = require('pregel.utils.fiber_pool')
 local error       = require('pregel.utils').error
 
 local vertex_compute        = vertex.vertex_private_methods.compute
@@ -31,17 +30,11 @@ local workers = {}
 local RECONNECT_AFTER = 0.5
 
 local info_functions = setmetatable({
-    ['vertex.add']        = function(instance, args)
-        return instance:nd_vertex_add(args)
-    end,
     ['vertex.store']      = function(instance, args)
         return instance:nd_vertex_store(args)
     end,
     ['edge.store']        = function(instance, args)
-        return instance:nd_edge_store(args[1], args[2], args[3])
-    end,
-    ['edge.store.batch']  = function(instance, args)
-        return instance:nd_edge_store_batch(args[1], args[2])
+        return instance:nd_edge_store(args[1], args[2])
     end,
     ['snapshot']          = function(instance, args)
         return box.snapshot()
@@ -71,7 +64,7 @@ local info_functions = setmetatable({
     end,
     ['count']             = function(instance, args)
         instance.in_progress = 0
-        instance.space:pairs():each(function(tuple)
+        instance.data_space:pairs():each(function(tuple)
             if tuple[2] == false then
                 instance.in_progress = instance.in_progress + 1
             end
@@ -92,16 +85,18 @@ local function deliver_msg(name, msg, args)
         end
         workers[name].master:wait_connected()
     else
-        local stat, err = xpcall_tb(function()
+        local rv = {xpcall_tb(function()
             local op = info_functions[msg]
             local instance = workers[name]
             assert(instance, 'no instance found')
-            op(instance, args)
-            return 1
-        end)
-        if stat == false then
-            error(tostring(err))
+            return op(instance, args)
+        end)}
+        local status = table.remove(rv, 1)
+        if status == false then
+            local errmsg = tostring(rv[1])
+            error(errmsg)
         end
+        return unpack(rv)
     end
 end
 
@@ -109,14 +104,10 @@ local function deliver_batch(name, msgs)
     local stat, err = xpcall_tb(function()
         local instance = workers[name]
         assert(instance)
-        local cnt = 0
         for _, msg in ipairs(msgs) do
-            local message, args = msg[1], msg[2]
-            local op = info_functions[message]
-            op(instance, args)
-            cnt = cnt + 1
+            local op = info_functions[msg[1]](instance, msg[2])
         end
-        return cnt
+        return #msgs
     end)
     if stat == false then
         error(tostring(err))
@@ -142,8 +133,9 @@ local worker_mt = {
 
             log.info('starting superstep %d', superstep)
 
-            self.space:pairs():filter(tuple_filter)
-                              :each(tuple_process)
+            self.data_space:pairs()
+                           :filter(tuple_filter)
+                           :each(tuple_process)
 
             -- can't reach, for now
             while self.vertex_pool.count > 0 do
@@ -151,7 +143,6 @@ local worker_mt = {
             end
 
             self.mpool:flush()
-            fiber.sleep(1)
 
             log.info('ending superstep %d', superstep)
             return 'ok'
@@ -182,43 +173,30 @@ local worker_mt = {
                 v:inform_master()
             end
 
-            -- assert(self.mqueue_next:len() == 0)
-            -- assert(self.mqueue:len() ~= 0)
-
             -- TODO: send aggregator's (local) data back to master
             return 'ok'
         end,
-        nd_vertex_add = function(self, args)
-            local id, name, value = unpack(args)
-            local tuple = self.space:get(id)
-            if tuple == nil or tuple[3] == nil then
-                local edges = tuple and tuple[5] or {}
-                tuple = {id, false, name, value, edges}
+        nd_vertex_store = function(self, vertex)
+            log.info('store vertex %s', json.encode(vertex))
+            local key = {self.obtain_name(vertex)}
+            local id  = self.mpool:id(key)
+            while self.name_space:count(id) > 0 do
+                id = self.mpool:next_id(id)
             end
+            -- log.info("%d - %s - %s", id, json.encode(key), json.encode(vertex))
+            self.name_space:replace{id, unpack(key)}
+            self.data_space:replace{id, false, vertex, {}}
+            return id
         end,
-        nd_vertex_store = function(self, args)
-            local id, name, value = unpack(args)
-            self.space:replace{id, false, name, value, {}}
-        end,
-        nd_edge_store = function(self, from, to, value)
-            local tuple = self.space:get(from)
+        nd_edge_store = function(self, from, edges)
+            local tuple = self.data_space:get(from)
             if tuple == nil then
-                tuple = {from, false, yaml.NULL, yaml.NULL, {}}
-            else
-                tuple = tuple:totable()
-            end
-            table.insert(tuple[5], {to, value})
-            self.space:replace(tuple)
-        end,
-        nd_edge_store_batch = function(self, from, edges)
-            local tuple = self.space:get(from)
-            if tuple == nil then
-                tuple = {from, false, yaml.NULL, yaml.NULL, {}}
+                tuple = {from, false, yaml.NULL, {}}
             else
                 tuple = tuple:totable()
             end
             tuple[5] = fun.chain(tuple[5], edges):totable()
-            self.space:replace(tuple)
+            self.data_space:replace(tuple)
         end,
         add_aggregator = function(self, name, opts)
             assert(self.aggregators[name] == nil)
@@ -228,15 +206,33 @@ local worker_mt = {
     }
 }
 
+-- obtain_name is something, that'll convert tuple/value to key:
+-- function(...)
+--   if select('#', ...) == 1 and type(select(1, ...)) == 'cdata' then
+--     return <convert from tuple: (id, key_part_1, key_part_2, ...) to key>
+--   end
+--   return <convert from value to key>
+-- end
+--
+-- returned object must have 'serialize' method, that'll return array with
+-- key parts (field key_parts) and have '__eq' method
+
 local worker_new = function(name, options)
     -- parse workers
     local worker_uris = options.workers or {}
-
     local compute     = options.compute
     local combiner    = options.combiner
     local master_uri  = options.master
     local pool_size   = options.pool_size or 1000
-    assert(is_callable(compute), 'options.compute must be callable')
+    local key_parts   = options.key_parts or {'STR'}
+    local obtain_name = options.obtain_name
+    local is_delayed  = options.delayed_push
+    if is_delayed == nil then
+        is_delayed = false
+    end
+
+    assert(is_callable(obtain_name),     'options.obtain_name must be callable')
+    assert(is_callable(compute),         'options.compute must be callable')
     assert(type(combiner) == 'nil' or is_callable(combiner),
            'options.combiner must be callable or "nil"')
     assert(type(master_uri) == 'string', 'options.master must be string')
@@ -246,10 +242,12 @@ local worker_new = function(name, options)
         workers     = worker_uris,
         master_uri  = master_uri,
         mpool       = mpool.new(name, worker_uris, {
-            msg_count = pool_size
+            msg_count  = pool_size,
+            is_delayed = is_delayed
         }),
         aggregators = {},
-        in_progress = 0
+        in_progress = 0,
+        obtain_name = obtain_name
     }, worker_mt)
 
     box.session.su('guest')
@@ -258,6 +256,21 @@ local worker_new = function(name, options)
         space:create_index('primary', {
             type = 'TREE',
             parts = {1, 'NUM'}
+        })
+        local len = #key_parts
+        local parts = {}
+        for pos, itype in ipairs(key_parts) do
+            table.insert(parts, pos + 1)
+            table.insert(parts, itype)
+        end
+        space = box.schema.create_space('name_' .. name)
+        space:create_index('primary', {
+            type = 'HASH',
+            parts = {1, 'NUM'}
+        })
+        space:create_index('name', {
+            type = 'HASH',
+            parts = parts
         })
     end)
 
@@ -276,8 +289,10 @@ local worker_new = function(name, options)
         pregel = self
     }
     box.session.su('admin')
-    self.space  = box.space['data_' .. name]
+    self.data_space  = box.space['data_' .. name]
+    self.name_space  = box.space['name_' .. name]
     self.master = remote.new(master_uri, {
+        wait_connected  = false,
         reconnect_after = RECONNECT_AFTER
     })
     self:add_aggregator('__in_progress', {

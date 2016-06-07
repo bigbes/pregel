@@ -1,0 +1,15 @@
+add_subdirectory(avro)
+
+install(FILES aggregator.lua DESTINATION ${TARANTOOL_INSTALL_LUADIR}/pregel)
+install(FILES init.lua       DESTINATION ${TARANTOOL_INSTALL_LUADIR}/pregel)
+install(FILES loader.lua     DESTINATION ${TARANTOOL_INSTALL_LUADIR}/pregel)
+install(FILES master.lua     DESTINATION ${TARANTOOL_INSTALL_LUADIR}/pregel)
+install(FILES mpool.lua      DESTINATION ${TARANTOOL_INSTALL_LUADIR}/pregel)
+install(FILES queue.lua      DESTINATION ${TARANTOOL_INSTALL_LUADIR}/pregel)
+install(FILES topology.lua   DESTINATION ${TARANTOOL_INSTALL_LUADIR}/pregel)
+install(FILES vertex.lua     DESTINATION ${TARANTOOL_INSTALL_LUADIR}/pregel)
+install(FILES worker.lua     DESTINATION ${TARANTOOL_INSTALL_LUADIR}/pregel)
+
+install(FILES utils/init.lua        DESTINATION ${TARANTOOL_INSTALL_LUADIR}/pregel/utils)
+install(FILES utils/collections.lua DESTINATION ${TARANTOOL_INSTALL_LUADIR}/pregel/utils)
+install(FILES utils/strict.lua      DESTINATION ${TARANTOOL_INSTALL_LUADIR}/pregel/utils)

@@ -10,6 +10,10 @@ local worker, port_offset = arg[0]:match('(%a+)-(%d+)')
 
 port_offset = port_offset or 0
 
+local function obtain_name(value)
+    return value.name
+end
+
 local function inform_neighbors(self, val)
     for id, neighbor, weight in self:pairs_edges() do
         self:send_message(neighbor, val)
@@ -47,6 +51,12 @@ local common_cfg = {
         'localhost:3303',
         'localhost:3304',
         'localhost:3305',
+--[[--
+        'localhost:3306',
+        'localhost:3307',
+        'localhost:3308',
+        'localhost:3309',
+--]]--
     },
     compute      = graph_max_process,
     combiner     = math.max,
@@ -54,7 +64,9 @@ local common_cfg = {
     preload_args = '../data/soc-Epinions-custom-bi.txt',
     -- preload_args = '/Users/blikh/src/work/pregel-data/actual/soc-pokec-relationshit-custom-bi.txt',
     squash_only  = false,
-    pool_size    = 1000
+    pool_size    = 10000,
+    delayed_push = false,
+    obtain_name  = obtain_name
 }
 
 if worker == 'worker' then

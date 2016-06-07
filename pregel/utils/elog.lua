@@ -10,11 +10,9 @@ local error = require('pregel.utils').error
 local syserror = require('pregel.utils').syserror
 local traceback = require('pregel.utils').traceback
 
-local ct = require('pregel.utils.checktype')
-
 local strict = require('pregel.utils.strict')
 
-local checkt_xc = ct.checkt_xc
+local checkt_xc = require('pregel.utils.checktype').checkt_xc
 
 local iter = require('fun').iter
 
@@ -117,8 +115,8 @@ local elog_mt = {
 }
 
 local function elog_init(cfg)
-    ct.checkt_xc(cfg.path, 'string', 'cfg.path', 2)
-    ct.checkt_xc(cfg.level, {'number', 'nil'}, 'cfg.level', 2)
+    checkt_xc(cfg.path, 'string', 'cfg.path', 2)
+    checkt_xc(cfg.level, {'number', 'nil'}, 'cfg.level', 2)
     cfg.level = cfg.level or 30
     local instance = {
         path  = cfg.path,
@@ -147,7 +145,7 @@ return setmetatable({
             elog_global = elog_global or elog_init(name or {})
             return elog_global
         end
-        ct.checkt_xc(name, 'string', 'name')
+        checkt_xc(name, 'string', 'name')
         elog_list['name'] = elog_list['name'] or elog_init(opts or {})
         return elog_list['name']
     end

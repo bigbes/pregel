@@ -2,50 +2,63 @@ local fun    = require('fun')
 local log    = require('log')
 local json   = require('json')
 local yaml   = require('yaml')
+local clock  = require('clock')
 local fiber  = require('fiber')
 local digest = require('digest')
 local remote = require('net.box')
 
-local table       = require('table')
-local table_new   = require('table.new')
-local table_clear = require('table.clear')
+local table         = require('table')
+local table_new     = require('table.new')
+local table_clear   = require('table.clear')
 
-local strict      = require('pregel.utils.strict')
+local strict        = require('pregel.utils.strict')
 
-local xpcall_tb = require('pregel.utils').xpcall_tb
+local xpcall_tb     = require('pregel.utils').xpcall_tb
+local log_traceback = require('pregel.utils').log_traceback
 
 local RECONNECT_AFTER = 5
 local INFINITY = 9223372036854775808
 
+local function bench_monotonic(fun, ...)
+    local start_time = clock.monotonic()
+    local res = {0, fun(...)}
+    res[1] = clock.monotonic() - start_time
+    return res
+end
+
+local crc32 = digest.crc32.new()
+
+local function guava_name(name, server_cnt)
+    if type(name) == 'table' then
+        for _, el in ipairs(name) do
+            crc32:update(el)
+        end
+        name = crc32:result()
+        crc32:clear()
+    elseif type(name) ~= 'number' then
+        name = digest.crc32(name)
+    end
+    return 1 + digest.guava(name, server_cnt)
+end
+
 local function pusher_handler(id)
     local function handler_tmp(self)
-        fiber.self():name(string.format('pusher_handler-%02d', id))
+        local overall = 0
         local id = id
+        -- construct and set fiber name
+        local fiber_name = (self.is_local == true and 'local' or 'remote')
+        fiber_name = string.format('%6s_pusher_handler-%02d', fiber_name, id)
+        fiber.self():name(fiber_name)
+
+        log.info('start pusher_handler fiber')
         while true do
-            fiber.sleep(INFINITY)
             if self.count > 0 then
-                -- Constructs batch from messages
-                local messages
-                if self.count < self.max_count then
-                    messages = table_new(self.count, 0)
-                    for i = 1, self.count do
-                        messages[i] = self.msg_pool[i]
-                    end
-                else
-                    messages = self.msg_pool
+                self:flush()
+                if self.is_local == true then
+                    fiber.yield()
                 end
-                self.count = 0
-                -- Send batch to client
-                self.connection:eval(
-                    'return require("pregel.worker").deliver_batch(...)',
-                    self.name, messages
-                )
-                -- Wakeup every fiber, that waits for an answer
-                while true do
-                    local f = table.remove(self.waiting_list)
-                    if f == nil then break end
-                    f:wakeup()
-                end
+            else
+                fiber.sleep(0.01)
             end
         end
     end
@@ -55,54 +68,160 @@ local function pusher_handler(id)
     end
 end
 
-local bucket_mt = {
-    __index = {
-        put = function(self, msg, args)
-            while self.count == self.max_count do
-                table.insert(self.waiting_list, fiber.self())
-                self.worker:wakeup()
-                fiber.sleep(INFINITY)
-            end
-            self.count = self.count + 1
-            self.msg_pool[self.count][1] = msg
-            self.msg_pool[self.count][2] = args
-        end,
-        send = function(self, msg, args)
-            log.info('bucket:send - instance "%s", message "%s", args <%s>',
-                     self.name, msg, json.encode(args))
-            self.connection:eval(
-                'return require("pregel.worker").deliver(...)',
-                self.name, msg, args
-            )
-        end
-    }
+local bucket_common_methods = {
+    send = function(self, msg, args)
+        log.info('bucket:send - instance "%s", message "%s", args <%s>',
+                    self.name, msg, json.encode(args))
+        return self.connection:eval(
+            'return require("pregel.worker").deliver(...)',
+            self.name, msg, args
+        )
+    end,
 }
 
-local function bucket_new(id, name, srv, msg_count)
+local bucket_instant_methods = {
+    put = function(self, msg, args)
+        while self.count == self.max_count do
+            table.insert(self.waiting_list, fiber.self())
+            fiber.sleep(INFINITY)
+        end
+        self.count = self.count + 1
+        if self.msg_pool[self.count] == nil then
+            self.msg_pool[self.count] = table_new(3, 0)
+        end
+        self.msg_pool[self.count][1] = msg
+        self.msg_pool[self.count][2] = args
+    end,
+    flush = function(self)
+        -- Construct tuple with batch (for sending to client)
+        -- Dirty hack to avoid some stupid errors (regarding first
+        -- yield, when waiting for right state for net.box)
+        local msgs = fun.iter(self.msg_pool):take(self.count):totable()
+        if self.is_local == false then
+            msgs = box.tuple.new(msgs)
+        end
+        -- Wakeup every fiber, that waits for an empty queue
+        while true do
+            local f = table.remove(self.waiting_list)
+            if f == nil then break end
+            f:wakeup()
+        end
+        self.count = 0
+        self.connection:eval(
+            'return require("pregel.worker").deliver_batch(...)',
+            self.name, msgs
+        )
+    end,
+    start = function(self)
+        self.worker = fiber.create(pusher_handler(self.id), self)
+    end
+}
+
+local bucket_delayed_methods = {
+    put = function(self, msg, args)
+        local max = self.space.index[0]:max()
+        max = max and max[3] + 1 or 1
+        self.space:put{msg, args, max}
+        self.count = self.count + 1
+    end,
+    flush = function(self)
+        -- log_traceback()
+        local last_key = nil
+        local iterator = box.index.GT
+        while true do
+            local msgs = self.space:select(last_key, {
+                iterator = iterator,
+                limit == self.max_count
+            })
+            local msgs_no = #msgs
+            if msgs_no == 0 then
+                break
+            end
+            local rv = bench_monotonic(self.connection.eval,
+                self.connection,
+                'return require("pregel.worker").deliver_batch(...)',
+                self.name, msgs
+            )
+            log.info("let's flush %010.6f", rv[1])
+            last_key = msgs[msgs_no][3]
+        end
+        self.count = 0
+    end,
+    start = function(self)
+        self.space_name = string.format('pregel_mpool_%s_%02d',
+                                        self.name, self.id)
+        local space = box.space[self.space_name]
+        if space == nil then
+            space = box.schema.create_space(self.space_name)
+            space:create_index('primary', {
+                type = 'TREE',
+                parts = {3, 'NUM'}
+            })
+        end
+        self.space = space
+    end
+}
+
+local bucket_instant_mt = {
+    __index = (function()
+        local result = {}
+        for k, v in pairs(bucket_common_methods)  do result[k] = v end
+        for k, v in pairs(bucket_instant_methods) do result[k] = v end
+        return result
+    end)(),
+    __new   = function(self)
+        self.msg_pool  = table_new(self.max_count, 0)
+        fun.range(self.max_count):each(function(id)
+            self.msg_pool[id] = table_new(3, 0)
+        end)
+    end,
+}
+
+local bucket_delayed_mt = {
+    __index = (function()
+        local result = {}
+        for k, v in pairs(bucket_common_methods)  do result[k] = v end
+        for k, v in pairs(bucket_delayed_methods) do result[k] = v end
+        return result
+    end)(),
+    __new   = function(self)
+    end,
+}
+
+local function bucket_new(id, name, srv, options)
     local conn = remote.new(srv, {
         reconnect_after = RECONNECT_AFTER,
         wait_connected  = true
     })
-    -- if conn:eval("return box.info.server.uuid") == box.info.server.uuid then
-    --     conn = remote.self
-    -- end
+    local is_local = false
+    local uuid = conn:eval("return box.info.server.uuid")
+    if uuid == box.info.server.uuid then
+        conn:close()
+        conn = remote.self
+        is_local = true
+    end
 
-    local self = setmetatable({
+    options = options or {}
+    local msg_count  = options.msg_count or 1000
+    local is_delayed = options.is_delayed
+    if is_delayed == nil then is_delayed = false end
+
+    local self = {
+        id           = id,
         uri          = srv,
         name         = name,
+        uuid         = uuid,
         count        = 0,
-        max_count    = msg_count,
-        worker       = nil,
-        msg_pool     = table_new(msg_count, 0),
         connection   = conn,
         waiting_list = {},
-    }, bucket_mt)
+        is_local     = is_local,
+        is_delayed   = is_delayed,
+        max_count    = msg_count,
+    }
 
-    self.worker = fiber.create(pusher_handler(id), self)
-
-    fun.range(msg_count):each(function(id)
-        self.msg_pool[id] = table_new(3, 0)
-    end)
+    local mt = is_delayed and bucket_delayed_mt or bucket_instant_mt
+    mt.__new(self)
+    setmetatable(self, mt)
 
     return self
 end
@@ -113,18 +232,13 @@ local function waitpool_handler(id, bucket)
         local id     = id
         local bucket = bucket
         while true do
-            local rv = self.channel_in:get()
-            if rv == false then
-                error('error')
-            end
-            local status = true
-            local result = ''
-            bucket:send(self.msg, self.args)
-            -- local status, result = pcall(bucket.send, bucket, self.msg, self.args)
+            local status = self.channel_in:get()
             if status == false then
-                log.error('Error, while executing message: %s', result)
-                table.insert(self.errors, result)
+                error('failed to get message from queue')
             end
+
+            self.rval[id] = bench_monotonic(bucket.send, bucket,
+                                            self.msg, self.args)
             self.channel_out:put(status)
         end
     end
@@ -136,7 +250,8 @@ end
 
 local waitpool_mt = {
     __call = function(self, msg, args)
-        self.msg = msg
+        self.rval = {}
+        self.msg  = msg
         self.args = args
         table_clear(self.errors)
         for i = 1, self.fpool_cnt do
@@ -151,6 +266,7 @@ local waitpool_mt = {
                 error('error, while sending message')
             end
         end
+        return self.rval
     end,
 }
 
@@ -172,22 +288,37 @@ end
 
 local mpool_mt = {
     __index = {
-        by_id = function(self, key)
-            key = (type(key) == 'number' and key or digest.crc32(key))
-            local bucket_id = 1 + digest.guava(key, self.bucket_cnt)
-            return self.buckets[bucket_id]
+        id = function(self, name)
+            return guava_name(name, self.bucket_cnt)
+        end,
+        by_id = function(self, name)
+            return self.buckets[guava_name(name, self.bucket_cnt)]
+        end,
+        next_id = function(self, id)
+            local bucket_id = guava_name(id, self.bucket_cnt)
+            while true do
+                id = id + 1
+                if guava_name(id, self.bucket_cnt) == bucket_id then
+                    log.info('next_id is %d', id)
+                    return id
+                end
+            end
         end,
         flush = function(self)
             for _, bucket in ipairs(self.buckets) do
                 if bucket.count > 0 then
-                    bucket.worker:wakeup()
+                    bucket:flush()
                 end
             end
-            fiber.yield()
         end,
         send_wait = function(self, message, args)
-            self.waitpool(message, args)
-        end
+            return self.waitpool(message, args)
+        end,
+        send = function(self, message, args)
+            for _, bucket in ipairs(self.buckets) do
+                bucket:put(message, args)
+            end
+        end,
     }
 }
 
@@ -195,16 +326,32 @@ local function mpool_new(name, servers, options)
     options = options or {}
     local msg_count = options.msg_count or 1000
 
+    local is_delayed = options.is_delayed
+    if is_delayed == nil then is_delayed = false end
+
     local self = setmetatable({
         name       = name,
-        may_wakeup = true,
         buckets    = {},
         bucket_cnt = 0,
+        is_delayed = is_delayed,
+        space      = space,
     }, mpool_mt)
 
     for k, server in ipairs(servers) do
-        table.insert(self.buckets, bucket_new(k, name, server, msg_count))
+        table.insert(self.buckets, bucket_new(k, name, server, {
+            is_delayed = is_delayed,
+            msg_count = msg_count
+        }))
         self.bucket_cnt = self.bucket_cnt + 1
+    end
+
+    -- normalize position of servers and their ID, then finish execution
+    table.sort(self.buckets, function(b1, b2) return b1.uuid < b2.uuid end)
+    for k, bucket in ipairs(self.buckets) do
+        -- assign new id based on sorting
+        bucket.id = k
+        -- start everythin using new id
+        bucket:start()
     end
 
     self.waitpool = waitpool_new(self)
@@ -213,5 +360,5 @@ local function mpool_new(name, servers, options)
 end
 
 return strict.strictify({
-    new = mpool_new
+    new = mpool_new,
 })

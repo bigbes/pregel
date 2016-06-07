@@ -2,7 +2,6 @@ local log = require('log')
 local errno = require('errno')
 
 local strict = require('pregel.utils.strict')
-local checkt_xc = require('pregel.utils.checktype').checkt_xc
 
 local basic_error = error
 local fmtstring   = string.format
@@ -61,6 +60,14 @@ local function traceback(ldepth)
         level = level + 1
     end
     return tb
+end
+
+local function log_traceback(ldepth)
+    ldepth = ldepth or 2
+    for _, f in pairs(traceback()) do
+        local name = f.name and fmtstring(" function '%s'", f.name) or ''
+        log.info("[%-4s]%s at <%s:%d>", f.what, name, f.file, f.line)
+    end
 end
 
 local function lazy_func(func, ...)
@@ -139,13 +146,14 @@ local function random(x, y)
 end
 
 return strict.strictify({
-    error = error,
-    random = random,
-    syserror = syserror,
-    traceback = traceback,
-    lazy_func = lazy_func,
-    xpcall_tb = xpcall_tb,
-    timeit = timeit,
-    is_callable = is_callable,
-    is_main = is_main
+    error         = error,
+    random        = random,
+    syserror      = syserror,
+    traceback     = traceback,
+    log_traceback = log_traceback,
+    lazy_func     = lazy_func,
+    xpcall_tb     = xpcall_tb,
+    timeit        = timeit,
+    is_callable   = is_callable,
+    is_main       = is_main
 })

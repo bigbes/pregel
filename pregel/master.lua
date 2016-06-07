@@ -3,7 +3,10 @@ local log   = require('log')
 local uri   = require('uri')
 local json  = require('json')
 local yaml  = require('yaml')
+local clock = require('clock')
 local fiber = require('fiber')
+
+local is_callable = require('pregel.utils').is_callable
 
 yaml.cfg{
     encode_load_metatables = true,
@@ -13,9 +16,6 @@ yaml.cfg{
 
 local mpool      = require('pregel.mpool')
 local aggregator = require('pregel.aggregator')
-
-local pool       = require('pregel.utils.connpool')
-local fiber_pool = require('pregel.utils.fiber_pool')
 
 local xpcall_tb = require('pregel.utils').xpcall_tb
 
@@ -53,11 +53,13 @@ local master_mt = {
         end,
         start = function (self)
             log.info('master:start(): begin')
-            local connections_no = #self.mpool.buckets
             local superstep = 1
             while true do
                 log.info('master:start(): superstep %d start', superstep)
-                self.mpool:send_wait('superstep', superstep)
+                local result = self.mpool:send_wait('superstep', superstep)
+                for _, v in ipairs(result) do
+                    log.info('superstep took %010.6f seconds', v[1])
+                end
                 -- default all aggregators
                 for k, v in pairs(self.aggregators) do
                     v:make_default()
@@ -96,16 +98,22 @@ local master_mt = {
     }
 }
 
+--
 -- servers = {
 --     'login:password@host1:port1',
 --     'login:password@host2:port2',
 --     'login:password@host3:port3',
 --     'login:password@host4:port4',
 -- }
+--
 local master_new = function(name, options)
     local connections = options.connections
     local workers     = options.workers or {}
     local pool_size   = options.pool_size or 1000
+    local key_parts   = options.key_parts or {'STR'}
+    local obtain_name = options.obtain_name
+
+    assert(is_callable(obtain_name),      'options.obtain_name must be callable')
 
     local self = setmetatable({
         name         = name,
@@ -114,6 +122,8 @@ local master_new = function(name, options)
         mpool        = mpool.new(name, workers, {
             msg_count = pool_size
         }),
+        key_parts    = key_parts,
+        obtain_name  = obtain_name,
         aggregators  = {}
     }, master_mt)
 

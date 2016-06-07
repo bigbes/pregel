@@ -5,17 +5,15 @@ local json = require('json')
 local vertex_private_methods = {
     apply = function(self, tuple)
         self.__modified = false
-        self.__id, self.__halt, self.__name,
-            self.__value, self.__edges = tuple:unpack()
+        self.__name     = nil
+        self.__id, self.__halt, self.__value, self.__edges = tuple:unpack()
         return self
     end,
     compute = function(self)
         self:__compute_func()
         if self.__modified then
-            self.__pregel.space:replace{
-                self.__id, self.__halt,
-                self.__name, self.__value,
-                self.__edges
+            self.__pregel.data_space:replace{
+                self.__id, self.__halt, self.__value, self.__edges
             }
         end
         return self.__modified
@@ -26,16 +24,16 @@ local vertex_private_methods = {
 }
 
 local vertex_methods = {
-    --[[
-    -- PUBLIC API:
-    -- * self:vote_halt
-    -- * self:pairs_edges
-    -- * self:pairs_messages
-    -- * self:send_message
-    -- * self:get_value
-    -- * self:set_value
-    -- * self:get_id
-    --]]
+    --[[--
+    -- | Base API
+    -- * self:vote_halt      ([val = true])
+    -- * self:pairs_edges    ()
+    -- * self:pairs_messages ()
+    -- * self:send_message   (neighb, val)
+    -- * self:get_value      ()
+    -- * self:set_value      (val)
+    -- * self:get_id         ()
+    --]]--
     vote_halt = function(self, val)
         if val == nil then
             val = true
@@ -78,8 +76,88 @@ local vertex_methods = {
         self.__value = new
     end,
     get_id = function(self)
-        return self.__id
+        if self.__name == nil then
+            self.__name = self.__pregel.obtain_name(
+                self.__pregel.name_space:get(self.__id)
+            )
+        end
+        return self.__id, self.__name
     end,
+    --[[--
+    -- | Topology mutation API
+    -- -- where src/dest may be id/name.
+    -- * self:add_vertex     (name, value)
+    -- * self:add_edge       ([src = self:get_id(), ]dest, value)
+    -- * self:delete_vertex  (src[, vertices = true])
+    -- * self:delete_edge    ([src = self:get_id(), ]dest)
+    --]]--
+    --[[--
+    add_vertex = function(self, name, value)
+        local id = self.__pregel.free_id + 1
+        if id == self.__pregel.free_id_max + 1 then
+            local min, max = self.__pregel:eval(
+                'return require("pregel.master").deliver(...)',
+                'aggregator.get_next_range', nil
+            )
+            self.__pregel.free_id = min
+            self.__pregel.free_id_max = max
+        end
+        self.__pregel.free_id = id
+        self.__pregel.mpool:by_id(id):put('vertex.add', {id, name, value})
+    end,
+    append_edge = function(self, src, dest, value)
+        if type(src) == 'string'  then assert(false) end
+        if value == nil then
+            value = dest
+            dest = src
+            table.insert(self.__edges, {dest, value})
+        end
+        if type(dest) == 'string' then assert(false) end
+        self.__pregel.mpool:by_id(src):put('edge.append', {src, dest, value})
+    end,
+    store_edge = function(self, src, dest, value)
+        if type(src) == 'string'  then assert(false) end
+        if value == nil then
+            value = dest
+            dest = src
+            local changed = false
+            for k, edge in ipairs(self.__edges) do
+                if edge[1] == dest then
+                    edge[2] = value
+                    changed = true
+                    break
+                end
+            end
+            if not changed then
+                table.insert(self.__edges, {dest, value})
+            end
+        end
+        if type(dest) == 'string' then assert(false) end
+        self.__pregel.mpool:by_id(src):put('edge.store', {src, dest, value})
+    end,
+    delete_vertex = function(self, vertice, edges)
+        if edges == 'nil' and vertice == 'nil'
+        if type(vertice) == 'string' then assert(false) end
+        self.__pregel.mpool:by_id(id):put('vertex.delete', {id, name, value})
+    end,
+    delete_edge = function(self, src, dest)
+        if type(src) == 'string'  then assert(false) end
+        if dest == nil then
+            dest = src
+            local pos = {}
+            for k, edge in ipairs(self.__edges) do
+                if edge[1] == dest then
+                    table.insert(pos, k)
+                end
+            end
+            for _, dest in ipairs(pos) do
+                table.remove(self.__edges, dest)
+            end
+        end
+        if type(dest) == 'string' then assert(false) end
+        self.__pregel.mpool:by_id(src):put('edge.delete', {src, dest, value})
+    end
+    --]]--
 }
 
 local function vertex_new()
@@ -87,7 +165,7 @@ local function vertex_new()
         superstep      = 0,
         -- can't access from inside
         __id           = 0,
-        __name         = '',
+        __name         = nil,
         __modified     = false,
         __halt         = false,
         __edges        = nil,
