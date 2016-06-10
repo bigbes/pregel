@@ -49,14 +49,6 @@ lua_avro_push_value(lua_State *L, avro_value_t *value, bool should_decref)
  */
 
 static int
-lua_return_avro_error(lua_State *L)
-{
-	lua_pushnil(L);
-	lua_pushstring(L, avro_strerror());
-	return 2;
-}
-
-static int
 lua_avro_error(lua_State *L)
 {
 	lua_pushstring(L, avro_strerror());

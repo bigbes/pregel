@@ -15,6 +15,7 @@ local ACC = require('avro.constants')
 -- Copy a bunch of public functions from the submodules.
 
 return {
+--[[
     ArraySchema  = AS.ArraySchema,
     EnumSchema   = AS.EnumSchema,
     FixedSchema  = AS.FixedSchema,
@@ -40,7 +41,7 @@ return {
     map          = AS.map,
     record       = AS.record,
     union        = AS.union,
-
+]]--
     ResolvedReader   = AC.ResolvedReader,
     ResolvedWriter   = AC.ResolvedWriter,
     open             = AC.open,
@@ -48,7 +49,7 @@ return {
     raw_encode_value = AC.raw_encode_value,
     raw_value        = AC.raw_value,
     wrapped_value    = AC.wrapped_value,
-
+--[[
     get_wrapper_class = AW.get_wrapper_class,
     set_wrapper_class = AW.set_wrapper_class,
     Wrapper           = AW.Wrapper,
@@ -60,7 +61,7 @@ return {
     ScalarValue       = AW.ScalarValue,
     StringValue       = AW.StringValue,
     UnionValue        = AW.UnionValue,
-
+]]--
     STRING  = ACC.STRING,
     BYTES   = ACC.BYTES,
     INT     = ACC.INT,

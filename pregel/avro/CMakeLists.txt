@@ -4,7 +4,7 @@ if (APPLE)
         "${CMAKE_SHARED_LINKER_FLAGS} -undefined suppress -flat_namespace")
 endif(APPLE)
 
-add_library(avro-legacy SHARED avro/legacy.c)
+add_library(avro-legacy SHARED legacy.c)
 set_target_properties(avro-legacy
         PROPERTIES
             PREFIX ""

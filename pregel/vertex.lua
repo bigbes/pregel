@@ -83,6 +83,12 @@ local vertex_methods = {
         end
         return self.__id, self.__name
     end,
+    get_aggregation = function(self, name)
+        return self.__pregel(name)
+    end,
+    set_aggregation = function(self, name, value)
+       self.__pregel(name, value)
+    end,
     --[[--
     -- | Topology mutation API
     -- -- where src/dest may be id/name.
