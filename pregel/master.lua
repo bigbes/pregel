@@ -90,6 +90,10 @@ local master_mt = {
             self.mpool:flush()
             self.mpool:send_wait('count')
         end,
+        preload_on_workers = function(self)
+            self.mpool:send_wait('preload')
+            self.mpool:send_wait('count')
+        end,
         add_aggregator = function(self, name, opts)
             assert(self.aggregators[name] == nil)
             self.aggregators[name] = aggregator.new(name, self, opts)
@@ -127,14 +131,18 @@ local master_new = function(name, options)
         aggregators  = {}
     }, master_mt)
 
-    local preload = options.preload
+    local preload = options.master_preload
     if type(preload) == 'function' then
         preload = preload(self, options.preload_args)
     elseif type(preload) == 'table' then
         preload = preload
     else
-        assert(false, 'expected "function"/"table", got ' .. type(options.preload))
+        assert(false,
+            string.format('<preload> expected "function"/"table", got %s',
+                          type(options.master_preload))
+        )
     end
+    self.preload_func = preload
 
     self:add_aggregator('__in_progress', {
         internal = true,
@@ -150,7 +158,6 @@ local master_new = function(name, options)
         end,
     })
 
-    self.preload_func = preload
     master = self
 
     return self

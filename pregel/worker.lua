@@ -69,6 +69,9 @@ local info_functions = setmetatable({
                 instance.in_progress = instance.in_progress + 1
             end
         end)
+    end,
+    ['preload']          = function(instance)
+        instance:preload()
     end
 }, {
     __index = function(self, op)
@@ -177,24 +180,13 @@ local worker_mt = {
             return 'ok'
         end,
         nd_vertex_store = function(self, vertex)
-            log.info('store vertex %s', json.encode(vertex))
-            local key = {self.obtain_name(vertex)}
-            local id  = self.mpool:id(key)
-            while self.name_space:count(id) > 0 do
-                id = self.mpool:next_id(id)
-            end
-            -- log.info("%d - %s - %s", id, json.encode(key), json.encode(vertex))
-            self.name_space:replace{id, unpack(key)}
+            local id = self.obtain_name(vertex)
             self.data_space:replace{id, false, vertex, {}}
-            return id
         end,
         nd_edge_store = function(self, from, edges)
             local tuple = self.data_space:get(from)
-            if tuple == nil then
-                tuple = {from, false, yaml.NULL, {}}
-            else
-                tuple = tuple:totable()
-            end
+            assert(tuple, 'absence of vertex')
+            tuple = tuple:totable()
             tuple[5] = fun.chain(tuple[5], edges):totable()
             self.data_space:replace(tuple)
         end,
@@ -203,20 +195,14 @@ local worker_mt = {
             self.aggregators[name] = aggregator.new(name, self, opts)
             return self
         end,
+        preload = function(self)
+            self.preload_func(self.mpool.self_idx, self.mpool.bucket_cnt)
+            self.mpool:flush()
+        end
     }
 }
 
--- obtain_name is something, that'll convert tuple/value to key:
--- function(...)
---   if select('#', ...) == 1 and type(select(1, ...)) == 'cdata' then
---     return <convert from tuple: (id, key_part_1, key_part_2, ...) to key>
---   end
---   return <convert from value to key>
--- end
---
--- returned object must have 'serialize' method, that'll return array with
--- key parts (field key_parts) and have '__eq' method
-
+-- obtain_name is a function, that'll convert value to key (string)
 local worker_new = function(name, options)
     -- parse workers
     local worker_uris = options.workers or {}
@@ -224,7 +210,6 @@ local worker_new = function(name, options)
     local combiner    = options.combiner
     local master_uri  = options.master
     local pool_size   = options.pool_size or 1000
-    local key_parts   = options.key_parts or {'STR'}
     local obtain_name = options.obtain_name
     local is_delayed  = options.delayed_push
     if is_delayed == nil then
@@ -238,39 +223,36 @@ local worker_new = function(name, options)
     assert(type(master_uri) == 'string', 'options.master must be string')
 
     local self = setmetatable({
-        name        = name,
-        workers     = worker_uris,
-        master_uri  = master_uri,
-        mpool       = mpool.new(name, worker_uris, {
+        name         = name,
+        workers      = worker_uris,
+        master_uri   = master_uri,
+        preload_func = nil,
+        mpool        = mpool.new(name, worker_uris, {
             msg_count  = pool_size,
             is_delayed = is_delayed
         }),
-        aggregators = {},
-        in_progress = 0,
-        obtain_name = obtain_name
+        aggregators  = {},
+        in_progress  = 0,
+        obtain_name  = obtain_name
     }, worker_mt)
+
+    local preload = options.worker_preload
+    if type(preload) == 'function' then
+        preload = preload(self, options.preload_args)
+    elseif type(preload) ~= 'table' then
+        assert(false,
+            string.format('<preload> expected "function"/"table", got %s',
+                          type(options.master_preload))
+        )
+    end
+    self.preload_func = preload
 
     box.session.su('guest')
     box.once('pregel_load-' .. name, function()
         local space = box.schema.create_space('data_' .. name)
         space:create_index('primary', {
             type = 'TREE',
-            parts = {1, 'NUM'}
-        })
-        local len = #key_parts
-        local parts = {}
-        for pos, itype in ipairs(key_parts) do
-            table.insert(parts, pos + 1)
-            table.insert(parts, itype)
-        end
-        space = box.schema.create_space('name_' .. name)
-        space:create_index('primary', {
-            type = 'HASH',
-            parts = {1, 'NUM'}
-        })
-        space:create_index('name', {
-            type = 'HASH',
-            parts = parts
+            parts = {1, 'STR'}
         })
     end)
 
@@ -290,7 +272,6 @@ local worker_new = function(name, options)
     }
     box.session.su('admin')
     self.data_space  = box.space['data_' .. name]
-    self.name_space  = box.space['name_' .. name]
     self.master = remote.new(master_uri, {
         wait_connected  = false,
         reconnect_after = RECONNECT_AFTER

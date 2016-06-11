@@ -35,7 +35,7 @@ local tube_space_methods = {
             return nil
         end
     end,
-    put = function(self, receiver, message, from)
+    put = function(self, receiver, message)
         assert(receiver ~= nil)
         assert(message  ~= nil)
         if self.combiner ~= nil and self.squash_only == false then
@@ -47,7 +47,7 @@ local tube_space_methods = {
             message = rv
         end
         self.stats[receiver] = self.stats[receiver] + 1
-        return self.space:auto_increment{receiver, message, from}
+        return self.space:auto_increment{receiver, message}
     end,
     len = function(self, receiver)
         local val = nil
@@ -114,7 +114,7 @@ local tube_table_methods = {
             return key
         end
     end,
-    put = function(self, receiver, message, from)
+    put = function(self, receiver, message)
         assert(receiver ~= nil)
         assert(message  ~= nil)
 

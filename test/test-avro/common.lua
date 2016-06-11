@@ -8,13 +8,13 @@ local clock = require('clock')
 local fiber = require('fiber')
 local digest = require('digest')
 
-local ploader = require('pregel.loader')
 local pmaster = require('pregel.master')
 local pworker = require('pregel.worker')
-
-local algo      = require('algo')
 local avro      = require('pregel.avro')
 local xpcall_tb = require('pregel.utils').xpcall_tb
+
+local algo         = require('algo')
+local avro_loaders = require('avro_loaders')
 
 --[[------------------------------------------------------------------------]]--
 --[[--------------------------------- Utils --------------------------------]]--
@@ -65,6 +65,8 @@ local dataSetKeys            = {'vid', 'email', 'okid', 'vkid'}
 -- config keys
 local FEATURES_LIST          = "features.list"
 local TASKS_CONFIG_HDFS_PATH = "tasks.config.hdfs.path"
+local DATASET_PATH           = '/Users/blikh/src/work/pregel-data/tarantool-test'
+
 -- other
 local SUFFIX_TRAIN           = "train"
 local SUFFIX_TEST            = "test"
@@ -103,81 +105,6 @@ do
     })
 end
 
-
-local function avro_loader(master, path)
-    local function loader(self)
-        local avro_files = fio.glob(path .. '/*.avro'); table.sort(avro_files)
-        for _, filename in ipairs(avro_files) do
-            log.info('processing %s', filename)
-            local avro_file = avro.open(filename)
-            local count = 0
-            local begin_time = clock.time()
-            while true do
-                local line = avro_file:read_raw()
-                if line == nil then break end
-                assert(line:type() == avro.RECORD and
-                       line:schema_name() == 'KeyValuePair')
-                local key_object = {}
-                local fea_object = {}
-                -- parse key
-                do
-                    local key = line:get('key')
-                    assert(key ~= nil and
-                          key:type() == avro.RECORD and
-                          key:schema_name() == 'User')
-                    for _, v in ipairs{'okid', 'email', 'vkid'} do
-                        local obj = key:get(v)
-                        assert(obj:type() == avro.UNION)
-                        local obj_value = obj:get():get()
-                        key_object[v] = obj_value
-                    end
-                    -- set category
-                    local category = key:get('category')
-                    assert(category ~= nil and
-                           category:type() == avro.UNION)
-                    local category_value = category:get()
-                    -- local category_value = category:get('int')
-                    key_object.category = category_value:get()
-                    -- set vid
-                    local vid = key:get('vid')
-                    assert(vid ~= nil and
-                           vid:type() == avro.STRING)
-                    local vid_value = vid:get()
-                    key_object.vid = vid_value
-                end
-                -- parse value
-                do
-                    local val = line:get('value')
-                    assert(val:type() == avro.RECORD and
-                           val:schema_name() == 'SparseFeatureVector')
-                    local features = val:get('features')
-                    assert(features ~= nil and
-                           features:type() == avro.ARRAY)
-                    for index, feature in features:iterate() do
-                        assert(feature ~= nil and
-                               feature:type() == avro.RECORD and
-                               feature:schema_name() == 'Feature')
-                        local fid  = feature:get('feature_id'):get()
-                        fid = tonumber(fid:match('SVD_(%d+)')) + 1
-                        local fval = feature:get('value'):get():get()
-                        local tst  = feature:get('timestamp')
-                        assert(tst == nil, 'timestamp is not nil')
-                        fea_object[fid] = {fval, tst}
-                    end
-                end
-                self:store_vertex{key = key_object, features = fea_object}
-                line:release()
-                count = count + 1
-            end
-            log.info('done processing %d values in %.3f seconds',
-                     count, clock.time() - begin_time)
-            avro_file:close()
-            fiber.yield()
-        end
-    end
-    return ploader.new(master, loader)
-end
-
 --[[------------------------------------------------------------------------]]--
 --[[----------------------------- Worker Context ---------------------------]]--
 --[[------------------------------------------------------------------------]]--
@@ -193,8 +120,9 @@ do
     local predictionReportSamplingProb = GDParams['p.report.prediction']
     local calibrationBucketPercents    = GDParams['calibration.bucket.percents']
 
-    local fd = io.open('express_prediction_config.json')
-    local input = json.decode(fd:read())
+    local fd = io.open(fio.pathjoin(DATASET_PATH, 'express_prediction_config.json'))
+    assert(fd)
+    local input = json.decode(fd:read('*a'))
     fd:close()
 
     for _, task_config in ipairs(input) do
@@ -730,44 +658,66 @@ local function computeGradientDescent(vertex)
     local vtype = vertex:get_value().vtype
 
     if vtype == task_type.MASTER then
-        setmetatable(self, node_master_mt)
+        setmetatable(vertex, node_master_mt)
     elseif vtype == task_type.TASK then
-        if self:get_superstep() == 0 then
+        if vertex:get_superstep() == 0 then
             return
         end
-        setmetatable(self, node_task_mt)
-    elseif vtype == task_type.DATA then
-        setmetatable(self, node_data_mt)
+        setmetatable(vertex, node_task_mt)
     else
-        assert(false)
+        setmetatable(vertex, node_data_mt)
     end
-    self:compute_new()
+    vertex:compute_new()
+    setmetatable(vertex, vertex_mt)
+end
+
+local function obtain_type(name)
+    return string.match('(%a+):(%w*)')
+end
+
+local function obtain_name(value)
+    if value.vtype == MASTER_VERTEX_TYPE then
+        return 'MASTER:'
+    elseif value.vtype == TASK_VERTEX_TYPE then
+        return ('%s:%s'):format(TASK_VERTEX_TYPE, value.name)
+    end
+    for _, name in ipairs(dataSetKeys) do
+        local key_value = value.key[name]
+        if key_value ~= nil and
+           type(key_value) == 'string' and
+           #key_value > 0 then
+            return ('%s:%s'):format(name, key_value)
+        end
+    end
+    assert(false)
 end
 
 local worker, port_offset = arg[0]:match('(%a+)-(%d+)')
 port_offset = port_offset or 0
 
 local common_cfg = {
-    master       = 'localhost:3301',
-    workers      = {
+    master         = 'localhost:3301',
+    workers        = {
         'localhost:3302',
         'localhost:3303',
         'localhost:3304',
         'localhost:3305',
     },
-    compute      = computeGradientDescent,
-    combiner     = math.max,
-    preload      = ploader.graph_edges_f,
-    preload_args = '../data/soc-Epinions-custom-bi.txt',
-    squash_only  = false,
-    pool_size    = 10000,
-    delayed_push = false,
-    obtain_name  = obtain_name
+    compute        = computeGradientDescent,
+    combiner       = nil,
+    master_preload = avro_loaders.master,
+    worker_preload = avro_loaders.worker,
+    preload_args   = DATASET_PATH,
+    squash_only    = false,
+    pool_size      = 250,
+    delayed_push   = false,
+    obtain_name    = obtain_name
 }
 
 if worker == 'worker' then
     box.cfg{
         wal_mode = 'none',
+        slab_alloc_arena = 2,
         listen = 'localhost:' .. tostring(3301 + port_offset),
         background = true,
         logger_nonblock = false
@@ -791,10 +741,11 @@ else
         local master = pmaster.new('test', common_cfg)
         master:wait_up()
         if arg[1] == 'load' then
-            master:preload()
-            master.mpool:send_wait('snapshot')
+            -- master:preload()
+            master:preload_on_workers()
+            -- master.mpool:send_wait('snapshot')
         end
-        master:start()
+        -- master:start()
     end)
     os.exit(0)
 end

@@ -19,36 +19,37 @@ local is_callable = require('pregel.utils').is_callable
 
 local table_clear = require('table.clear')
 
-local function loader_methods(master)
+local function loader_methods(instance)
     return {
         -- no conflict resolving, reset state to new
         store_vertex          = function(self, vertex)
-            master.mpool:by_id(id):put('vertex.store', vertex)
+            local id = instance.obtain_name(vertex)
+            instance.mpool:by_id(id):put('vertex.store', vertex)
         end,
         -- no conflict resolving, may be dups in output.
         store_edge            = function(self, src, dest, value)
-            master.mpool:by_id(src):put('edge.store', {src {dest, value}})
+            instance.mpool:by_id(src):put('edge.store', {src {dest, value}})
         end,
         -- no conflict resolving, may be dups in output.
         store_edges_batch     = function(self, src, list)
-            master.mpool:by_id(src):put('edge.store', {src, list})
+            instance.mpool:by_id(src):put('edge.store', {src, list})
         end,
         store_vertex_edges    = function(self, vertex, list)
             self:store_vertex(vertex)
             self:store_edges_batch(vertex, list)
         end,
         flush                 = function(self)
-            master.mpool:flush()
+            instance.mpool:flush()
         end,
     }
 end
 
-local function loader_new(master, loader)
+local function loader_new(instance, loader)
     assert(is_callable(loader), 'options.loader must be callable')
     return setmetatable({
     }, {
         __call  = loader,
-        __index = loader_methods(master)
+        __index = loader_methods(instance)
     })
 end
 

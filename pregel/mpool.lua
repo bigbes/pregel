@@ -131,7 +131,7 @@ local bucket_delayed_methods = {
         while true do
             local msgs = self.space:select(last_key, {
                 iterator = iterator,
-                limit == self.max_count
+                limit = self.max_count
             })
             local msgs_no = #msgs
             if msgs_no == 0 then
@@ -335,6 +335,7 @@ local function mpool_new(name, servers, options)
         bucket_cnt = 0,
         is_delayed = is_delayed,
         space      = space,
+        self_idx   = 0,
     }, mpool_mt)
 
     for k, server in ipairs(servers) do
@@ -346,10 +347,15 @@ local function mpool_new(name, servers, options)
     end
 
     -- normalize position of servers and their ID, then finish execution
-    table.sort(self.buckets, function(b1, b2) return b1.uuid < b2.uuid end)
-    for k, bucket in ipairs(self.buckets) do
+    table.sort(self.buckets, function(b1, b2)
+        return b1.uuid < b2.uuid
+    end)
+    for idx, bucket in ipairs(self.buckets) do
+        if bucket.connection == remote.self then
+            self.self_idx = idx
+        end
         -- assign new id based on sorting
-        bucket.id = k
+        bucket.id = idx
         -- start everythin using new id
         bucket:start()
     end

@@ -2,10 +2,16 @@ local fun  = require('fun')
 local log  = require('log')
 local json = require('json')
 
+--[[--
+-- Tuple structure:
+-- <id>    - string <TODO: maybe it's better to give ability to user decide>
+-- <halt>  - <MP_BOOL>
+-- <value> - <MP_ANY>
+-- <edges> - <MP_ARRAY of <'id', MP_ANY>>
+--]]--
 local vertex_private_methods = {
     apply = function(self, tuple)
         self.__modified = false
-        self.__name     = nil
         self.__id, self.__halt, self.__value, self.__edges = tuple:unpack()
         return self
     end,
@@ -26,26 +32,23 @@ local vertex_private_methods = {
 local vertex_methods = {
     --[[--
     -- | Base API
-    -- * self:vote_halt      ([val = true])
-    -- * self:pairs_edges    ()
-    -- * self:pairs_messages ()
-    -- * self:send_message   (neighb, val)
-    -- * self:get_value      ()
-    -- * self:set_value      (val)
-    -- * self:get_id         ()
+    -- * self:vote_halt       ([is_halted = true])
+    -- * self:pairs_edges     ()
+    -- * self:pairs_messages  ()
+    -- * self:send_message    (receiver_id, value)
+    -- * self:get_value       ()
+    -- * self:set_value       (value)
+    -- * self:get_id          ()
+    -- * self:get_superstep   ()
+    -- * self:get_aggragation (name)
+    -- * self:set_aggregation (name, value)
     --]]--
-    vote_halt = function(self, val)
-        if val == nil then
-            val = true
-        end
-        if self.__halt == false and val == true then
+    vote_halt = function(self, is_halted)
+        if is_halted == nil then is_halted = true end
+        if self.__halt ~= is_halted then
             self.__modified = true
-            self.__halt     = true
-            self.__pregel.in_progress = self.__pregel.in_progress - 1
-        elseif self.__halt == true and val == false then
-            self.__modified = true
-            self.__halt     = false
-            self.__pregel.in_progress = self.__pregel.in_progress + 1
+            self.__halt = is_halted
+            self.__pregel.in_progress = self.__pregel.in_progress + (is_halted and -1 or 1)
         end
     end,
     pairs_edges = function(self)
@@ -65,7 +68,7 @@ local vertex_methods = {
     send_message = function(self, receiver, msg)
         self.__pregel.mpool:by_id(receiver):put(
                 'message.deliver',
-                {receiver, msg, self.__id}
+                {receiver, msg}
         )
     end,
     get_value = function(self)
@@ -76,12 +79,10 @@ local vertex_methods = {
         self.__value = new
     end,
     get_id = function(self)
-        if self.__name == nil then
-            self.__name = self.__pregel.obtain_name(
-                self.__pregel.name_space:get(self.__id)
-            )
-        end
-        return self.__id, self.__name
+        return self.__id
+    end,
+    get_superstep = function(self)
+        return self.__superstep
     end,
     get_aggregation = function(self, name)
         return self.__pregel(name)
@@ -98,87 +99,29 @@ local vertex_methods = {
     -- * self:delete_edge    ([src = self:get_id(), ]dest)
     --]]--
     --[[--
-    add_vertex = function(self, name, value)
-        local id = self.__pregel.free_id + 1
-        if id == self.__pregel.free_id_max + 1 then
-            local min, max = self.__pregel:eval(
-                'return require("pregel.master").deliver(...)',
-                'aggregator.get_next_range', nil
-            )
-            self.__pregel.free_id = min
-            self.__pregel.free_id_max = max
-        end
-        self.__pregel.free_id = id
-        self.__pregel.mpool:by_id(id):put('vertex.add', {id, name, value})
+    add_vertex = function(self, value)
     end,
-    append_edge = function(self, src, dest, value)
-        if type(src) == 'string'  then assert(false) end
-        if value == nil then
-            value = dest
-            dest = src
-            table.insert(self.__edges, {dest, value})
-        end
-        if type(dest) == 'string' then assert(false) end
-        self.__pregel.mpool:by_id(src):put('edge.append', {src, dest, value})
-    end,
-    store_edge = function(self, src, dest, value)
-        if type(src) == 'string'  then assert(false) end
-        if value == nil then
-            value = dest
-            dest = src
-            local changed = false
-            for k, edge in ipairs(self.__edges) do
-                if edge[1] == dest then
-                    edge[2] = value
-                    changed = true
-                    break
-                end
-            end
-            if not changed then
-                table.insert(self.__edges, {dest, value})
-            end
-        end
-        if type(dest) == 'string' then assert(false) end
-        self.__pregel.mpool:by_id(src):put('edge.store', {src, dest, value})
+    add_edge = function(self, src, dest, value)
     end,
     delete_vertex = function(self, vertice, edges)
-        if edges == 'nil' and vertice == 'nil'
-        if type(vertice) == 'string' then assert(false) end
-        self.__pregel.mpool:by_id(id):put('vertex.delete', {id, name, value})
     end,
     delete_edge = function(self, src, dest)
-        if type(src) == 'string'  then assert(false) end
-        if dest == nil then
-            dest = src
-            local pos = {}
-            for k, edge in ipairs(self.__edges) do
-                if edge[1] == dest then
-                    table.insert(pos, k)
-                end
-            end
-            for _, dest in ipairs(pos) do
-                table.remove(self.__edges, dest)
-            end
-        end
-        if type(dest) == 'string' then assert(false) end
-        self.__pregel.mpool:by_id(src):put('edge.delete', {src, dest, value})
     end
     --]]--
 }
 
 local function vertex_new()
     local self = setmetatable({
-        superstep      = 0,
         -- can't access from inside
-        __id           = 0,
-        __name         = nil,
-        __modified     = false,
-        __halt         = false,
-        __edges        = nil,
-        __value        = 0,
+        __superstep           = 0,
+        __id                  = 0,
+        __modified            = false,
+        __halt                = false,
+        __edges               = nil,
+        __value               = 0,
         -- assigned once per vertex
-        __pregel       = nil,
-        __compute_func = nil,
+        __pregel              = nil,
+        __compute_func        = nil,
         __write_solution_func = nil
     }, {
         __index = vertex_methods
