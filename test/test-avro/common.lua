@@ -717,7 +717,7 @@ local common_cfg = {
 if worker == 'worker' then
     box.cfg{
         wal_mode = 'none',
-        slab_alloc_arena = 2,
+        slab_alloc_arena = 1,
         listen = 'localhost:' .. tostring(3301 + port_offset),
         background = true,
         logger_nonblock = false

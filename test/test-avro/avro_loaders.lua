@@ -1,4 +1,5 @@
 local fio = require('fio')
+local fun = require('fun')
 local log = require('log')
 local fiber = require('fiber')
 local clock = require('clock')
@@ -183,14 +184,17 @@ end
 local function worker_avro_loader(worker, path)
     local function loader(self, current_idx, worker_count)
         local avro_path  = fio.pathjoin(path, '*.avro')
-        local avro_files = fio.glob(avro_path);
+        local avro_files = fun.iter(fio.glob(avro_path)):filter(function(filename)
+            local avrofile_no = tonumber(filename:match('part%-m%-(%d+).avro'))
+            if avrofile_no % worker_count == current_idx - 1 then
+                return true
+            end
+            return false
+        end):totable()
         table.sort(avro_files)
         log.info('%d found files found in path %s', #avro_files, avro_path)
         for idx, filename in ipairs(avro_files) do
-            local avrofile_no = tonumber(filename:match('part%-m%-(%d+).avro'))
-            if avrofile_no % worker_count == current_idx - 1 then
-                process_avro_file(self, filename)
-            end
+            process_avro_file(self, filename)
         end
     end
     return ploader.new(worker, loader)
