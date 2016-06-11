@@ -302,7 +302,7 @@ static const luaL_Reg schema_methods[] = {
 };
 
 int
-luaopen_avro_legacy(lua_State *L)
+luaopen_pregel_avro_legacy(lua_State *L)
 {
 	/* AvroSchema metatable */
 

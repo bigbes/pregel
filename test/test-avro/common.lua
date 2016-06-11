@@ -65,7 +65,8 @@ local dataSetKeys            = {'vid', 'email', 'okid', 'vkid'}
 -- config keys
 local FEATURES_LIST          = "features.list"
 local TASKS_CONFIG_HDFS_PATH = "tasks.config.hdfs.path"
-local DATASET_PATH           = '/Users/blikh/src/work/pregel-data/tarantool-test'
+-- local DATASET_PATH           = '/Users/blikh/src/work/pregel-data/tarantool-test'
+local DATASET_PATH           = '/home/taransible/tarantool-test'
 
 -- other
 local SUFFIX_TRAIN           = "train"
@@ -695,14 +696,15 @@ end
 local worker, port_offset = arg[0]:match('(%a+)-(%d+)')
 port_offset = port_offset or 0
 
+local function generate_worker_uri(cnt)
+	return fun.range(cnt or 4):map(function(k)
+		return 'localhost:' .. tostring(3301 + k)
+	end):totable()
+end
+
 local common_cfg = {
     master         = 'localhost:3301',
-    workers        = {
-        'localhost:3302',
-        'localhost:3303',
-        'localhost:3304',
-        'localhost:3305',
-    },
+    workers        = generate_worker_uri(8),
     compute        = computeGradientDescent,
     combiner       = nil,
     master_preload = avro_loaders.master,
@@ -717,7 +719,7 @@ local common_cfg = {
 if worker == 'worker' then
     box.cfg{
         wal_mode = 'none',
-        slab_alloc_arena = 1,
+        slab_alloc_arena = 2.5,
         listen = 'localhost:' .. tostring(3301 + port_offset),
         background = true,
         logger_nonblock = false
@@ -743,7 +745,7 @@ else
         if arg[1] == 'load' then
             -- master:preload()
             master:preload_on_workers()
-            -- master.mpool:send_wait('snapshot')
+            master.mpool:send_wait('snapshot')
         end
         -- master:start()
     end)

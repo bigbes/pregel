@@ -5,6 +5,7 @@ if (APPLE)
 endif(APPLE)
 
 add_library(avro-legacy SHARED legacy.c)
+target_link_libraries(avro-legacy avro)
 set_target_properties(avro-legacy
         PROPERTIES
             PREFIX ""

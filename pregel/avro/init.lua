@@ -6,8 +6,8 @@
 -- Please see the COPYING file in this distribution for license details.
 ------------------------------------------------------------------------
 
-local AC  = require('avro.c')
-local ACC = require('avro.constants')
+local AC  = require('pregel.avro.c')
+local ACC = require('pregel.avro.constants')
 -- local AS  = require('avro.schema')
 -- local AW  = require('avro.wrapper')
 

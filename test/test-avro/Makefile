@@ -1,4 +1,5 @@
-tnt_path = /Users/blikh/src/work/tarantool/src/tarantool
+# tnt_path = /Users/blikh/src/work/tarantool/src/tarantool
+tnt_path = tarantool
 tnt_ctl  = `which tarantoolctl`
 
 clean_lr:

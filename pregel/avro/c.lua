@@ -10,8 +10,8 @@ local ffi = require('ffi')
 
 local avro = ffi.load("avro")
 
-local L   = require('avro.legacy')
-local ACC = require('avro.constants')
+local L   = require('pregel.avro.legacy')
+local ACC = require('pregel.avro.constants')
 
 local assert = assert
 local getmetatable = getmetatable
@@ -1417,7 +1417,7 @@ local DataInputFile_mt = {
     }
 }
 
-DataInputFile_mt.__gc = DataInputFile_mt.__indexs.close
+DataInputFile_mt.__gc = DataInputFile_mt.__index.close
 
 LuaAvroDataInputFile = ffi.metatype([[LuaAvroDataInputFile]], DataInputFile_mt)
 
