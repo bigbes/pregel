@@ -17,10 +17,11 @@ local vertex     = require('pregel.vertex')
 local aggregator = require('pregel.aggregator')
 local mpool      = require('pregel.mpool')
 
-local timeit      = require('pregel.utils').timeit
-local xpcall_tb   = require('pregel.utils').xpcall_tb
-local is_callable = require('pregel.utils').is_callable
-local error       = require('pregel.utils').error
+local timeit                = require('pregel.utils').timeit
+local xpcall_tb             = require('pregel.utils').xpcall_tb
+local is_callable           = require('pregel.utils').is_callable
+local error                 = require('pregel.utils').error
+local execute_authorized_mr = require('pregel.utils').execute_authorized_mr
 
 local vertex_compute        = vertex.vertex_private_methods.compute
 local vertex_write_solution = vertex.vertex_private_methods.write_solution
@@ -29,17 +30,34 @@ local workers = {}
 
 local RECONNECT_AFTER = 0.5
 
+local TOPMT_EDGE_DELETE   = 0
+local TOPMT_VERTEX_DELETE = 1
+local TOPMT_VERTEX_STORE  = 2
+local TOPMT_EDGE_STORE    = 3
+
 local info_functions = setmetatable({
-    ['vertex.store']      = function(instance, args)
-        return instance:nd_vertex_store(args)
+    ['vertex.store'] = function(instance, args)
+        return instance:vertex_store(args)
     end,
-    ['edge.store']        = function(instance, args)
-        return instance:nd_edge_store(args[1], args[2])
+    ['edge.store'] = function(instance, args)
+        return instance:edge_store(args[1], args[2])
     end,
-    ['snapshot']          = function(instance, args)
+    ['vertex.store.delayed'] = function(instance, args)
+        return instance:vertex_store_delayed(args)
+    end,
+    ['edge.store.delayed'] = function(instance, args)
+        return instance:edge_store_delayed(args[1], args[2], args[3])
+    end,
+    ['vertex.delete.delayed'] = function(instance, args)
+        return instance:vertex_delete_delayed(args[1])
+    end,
+    ['edge.delete.delayed'] = function(instance, args)
+        return instance:edge_delete_delayed(args[1], args[2])
+    end,
+    ['snapshot'] = function(instance, args)
         return box.snapshot()
     end,
-    ['message.deliver']   = function(instance, args)
+    ['message.deliver'] = function(instance, args)
         -- args[1] - sent to
         -- args[2] - sent value
         -- args[3] - sent from
@@ -50,19 +68,19 @@ local info_functions = setmetatable({
         -- args[2] - aggregator new value
         instance.aggregators[args[1]].value = args[2]
     end,
-    ['superstep.before']  = function(instance)
+    ['superstep.before'] = function(instance)
         return instance:before_superstep()
     end,
-    ['superstep']         = function(instance, args)
+    ['superstep'] = function(instance, args)
         return instance:run_superstep(args)
     end,
-    ['superstep.after']   = function(instance, args)
+    ['superstep.after'] = function(instance, args)
         return instance:after_superstep(args)
     end,
-    ['test.deliver']      = function(instance, args)
+    ['test.deliver'] = function(instance, args)
         fiber.sleep(10)
     end,
-    ['count']             = function(instance, args)
+    ['count'] = function(instance, args)
         instance.in_progress = 0
         instance.data_space:pairs():each(function(tuple)
             if tuple[2] == false then
@@ -70,7 +88,7 @@ local info_functions = setmetatable({
             end
         end)
     end,
-    ['preload']          = function(instance)
+    ['preload'] = function(instance)
         instance:preload()
     end
 }, {
@@ -166,6 +184,89 @@ local worker_mt = {
                 end)
             end
 
+            local tmspace   = self.topology_mutation_space
+            local tmspacein = self.topology_mutation_space.index.name
+            -- topology mutation part
+            local last_key
+            -- first part  - delete edges
+            -- TODO: conflict resolving if we can't find edge
+            last_key = nil
+            while true do
+                local first = tmspace:select(last_key, {limit=1, iterator='GT'})
+                if first[1] == nil then
+                    break
+                end
+                local src = first[1][3]
+                last_key = {TOPMT_EDGE_STORE, src}
+                first = tmspace:select(last_key)
+                local edge_list = self.data_space:get{src}[4]
+                for idx, tuple in ipairs(first) do
+                    local idx, tmtype, src, dest = tuple:unpack()
+                    for idx, edge in ipairs(edge_list) do
+                        if edge[1] == dest then
+                            table.remove(edge_list, idx)
+                            break
+                        end
+                    end
+                    tmspace:delete(idx)
+                end
+                self.data_space:update(src, {{'=', 4, edge_list}})
+            end
+            -- second part - delete vertices
+            -- TODO: conflict resolving if we can't find vertex
+            local to_delete = {}
+            for tuple in tmspacein:pairs{TOPMT_VERTEX_DELETE} do
+                local idx, tmtype, vertex_name = tuple:unpack()
+                local rv = self.data_space:delete{vertex_name}
+                if rv == nil then
+                    log.error("Can't found tuple, with name '%s'", tuple[3])
+                end
+                table.insert(to_delete, idx)
+            end
+            while true do
+                local idx = table.remove(to_delete)
+                if idx == nil then break end
+                tmspace:delete(idx)
+            end
+            -- third part - add vertices
+            -- TODO: conflict resolving if vertex is already presented
+            for tuple in tmspacein:pairs{TOPMT_VERTEX_STORE} do
+                local idx, tmtype, vertex_name, vertex = tuple:unpack()
+                local edges = {}
+                local edge_list = tmspacein:select{TOPMT_EDGE_STORE, vertex_name}
+                for _, tuple in ipairs(edge_list) do
+                    table.insert(edges, {tuple:unpack(4, 5)})
+                    table.insert(to_delete, tuple[1])
+                end
+                self.data_space:insert{vertex_name, false, vertex, edges}
+                table.insert(to_delete, idx)
+            end
+            while true do
+                local idx = table.remove(to_delete)
+                if idx == nil then break end
+                tmspace:delete(idx)
+            end
+            -- fourth part - add edges
+            -- TODO: conflict resolving if edge is already in list of edges
+            last_key = nil
+            while true do
+                local first = tmspace:select(last_key, {limit=1, iterator='GT'})
+                if first[1] == nil then
+                    break
+                end
+                local src = first[1][3]
+                last_key = {TOPMT_EDGE_STORE, src}
+                local edge_list = tmspace:select(last_key)
+                local edges = {}
+                for _, tuple in ipairs(edge_list) do
+                    table.insert(edges, {tuple:unpack(4, 5)})
+                end
+                edge_list = self.data_space:get{src}[4]
+                edge_list = fun.iter(edge_list):chain(edges):totable()
+                self.data_space:update(src, {{'=', 4, edge_list}})
+            end
+            tmspace:truncate()
+
             -- update internal aggregator values
             self.aggregators['__in_progress'](self.in_progress)
             self.aggregators['__messages'](self.mqueue:len())
@@ -179,17 +280,6 @@ local worker_mt = {
             -- TODO: send aggregator's (local) data back to master
             return 'ok'
         end,
-        nd_vertex_store = function(self, vertex)
-            local id = self.obtain_name(vertex)
-            self.data_space:replace{id, false, vertex, {}}
-        end,
-        nd_edge_store = function(self, from, edges)
-            local tuple = self.data_space:get(from)
-            assert(tuple, 'absence of vertex')
-            tuple = tuple:totable()
-            tuple[5] = fun.chain(tuple[5], edges):totable()
-            self.data_space:replace(tuple)
-        end,
         add_aggregator = function(self, name, opts)
             assert(self.aggregators[name] == nil)
             self.aggregators[name] = aggregator.new(name, self, opts)
@@ -198,7 +288,38 @@ local worker_mt = {
         preload = function(self)
             self.preload_func(self.mpool.self_idx, self.mpool.bucket_cnt)
             self.mpool:flush()
-        end
+        end,
+        vertex_store = function(self, vertex)
+            local id = self.obtain_name(vertex)
+            self.data_space:replace{id, false, vertex, {}}
+        end,
+        edge_store = function(self, from, edges)
+            local tuple = self.data_space:get(from)
+            assert(tuple, 'absence of vertex')
+            tuple = tuple:totable()
+            tuple[5] = fun.chain(tuple[5], edges):totable()
+            self.data_space:replace(tuple)
+        end,
+        vertex_store_delayed = function(self, vertex)
+            self.topology_mutation_space:auto_increment{
+                TOPMT_VERTEX_STORE, self.obtain_name(vertex), vertex
+            }
+        end,
+        edge_store_delayed = function(self, src, dest, value)
+            self.topology_mutation_space:auto_increment{
+                TOPMT_EDGE_STORE, src, dest, value
+            }
+        end,
+        vertex_delete_delayed = function(self, vertex_name)
+            self.topology_mutation_space:auto_increment{
+                TOPMT_VERTEX_DELETE, 2, vertex_name
+            }
+        end,
+        edge_delete_delayed = function(self, src, dest)
+            self.topology_mutation_space:auto_increment{
+                TOPMT_EDGE_DELETE, src, dest
+            }
+        end,
     }
 }
 
@@ -247,38 +368,59 @@ local worker_new = function(name, options)
     end
     self.preload_func = preload
 
-    box.session.su('guest')
-    box.once('pregel_load-' .. name, function()
-        local space = box.schema.create_space('data_' .. name, {
-            format = {
-                [1] = {name = 'id',        type = 'str' },
-                [2] = {name = 'is_halted', type = 'bool'},
-                [3] = {name = 'value',     type = '*'},
-                [4] = {name = 'edges',     type = 'array'}
-            }
+    execute_authorized_mr('guest', function()
+        box.once('pregel_load-' .. name, function()
+            local space = box.schema.create_space('data_' .. name, {
+                format = {
+                    [1] = {name = 'id',        type = 'str' },
+                    [2] = {name = 'is_halted', type = 'bool'},
+                    [3] = {name = 'value',     type = '*'},
+                    [4] = {name = 'edges',     type = 'array'}
+                }
+            })
+            space:create_index('primary', {
+                type = 'TREE',
+                parts = {1, 'STR'},
+            })
+            space = box.schema.create_space('topology_mutation_' .. name, {
+                format = {
+                    [1] = {name = 'id',    type = 'num'},
+                    [2] = {name = 'type',  type = 'num'},
+                    [3] = {name = 'name',  type = 'str'},
+                    [4] = {name = 'dest',  type = '*'  },
+                    [5] = {name = 'value', type = '*'  },
+                }
+            })
+            space:create_index('primary', {
+                type  = 'TREE',
+                parts = {1, 'NUM'}
+            })
+            space:create_index('name', {
+                type   = 'TREE',
+                parts  = {2, 'NUM', 3, 'STR'},
+                unique = false
+            })
+        end)
+
+        self.mqueue = queue.new('mqueue_first_' .. name, {
+            combiner    = combiner,
+            squash_only = squash_only,
+            engine      = tube_engine
         })
-        space:create_index('primary', {
-            type = 'TREE',
-            parts = {1, 'STR'},
+        self.mqueue_next = queue.new('mqueue_second_' .. name, {
+            combiner    = combiner,
+            squash_only = squash_only,
+            engine      = tube_engine
         })
+        self.vertex_pool = vertex.pool_new{
+            compute = compute,
+            pregel = self
+        }
     end)
 
-    self.mqueue = queue.new('mqueue_first_' .. name, {
-        combiner    = combiner,
-        squash_only = squash_only,
-        engine      = tube_engine
-    })
-    self.mqueue_next = queue.new('mqueue_second_' .. name, {
-        combiner    = combiner,
-        squash_only = squash_only,
-        engine      = tube_engine
-    })
-    self.vertex_pool = vertex.pool_new{
-        compute = compute,
-        pregel = self
-    }
-    box.session.su('admin')
-    self.data_space  = box.space['data_' .. name]
+    self.data_space              = box.space['data_' .. name]
+    self.mutation_topology_space = box.space['topology_mutation_' .. name]
+
     self.master = remote.new(master_uri, {
         wait_connected  = false,
         reconnect_after = RECONNECT_AFTER

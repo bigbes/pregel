@@ -17,7 +17,29 @@ local vertex_private_methods = {
     end,
     compute = function(self)
         self:__compute_func()
-        if self.__modified then
+        if self.__modified or #self.edges_add > 0 or #self.edges_del > 0 then
+            while true do
+                local edge = table.remove(self.edges_del)
+                if edge == nil then
+                    break
+                end
+                local idx_to_rm = {}
+                for idx, val in ipairs(self.__edges) do
+                    if val[1] == edge then
+                        table.insert(idx_to_rm, idx)
+                    end
+                end
+                for k = #idx_to_rm, 1 do
+                    table.remove(self.__edges, idx_to_rm[k])
+                end
+            end
+            while true do
+                local edge = table.remove(self.edges_add)
+                if edge == nil then
+                    break
+                end
+                table.insert(self.__edges)
+            end
             self.__pregel.data_space:replace{
                 self.__id, self.__halt, self.__value, self.__edges
             }
@@ -26,6 +48,12 @@ local vertex_private_methods = {
     end,
     write_solution = function(self)
         return self:__write_solution_func()
+    end,
+    add_edge = function(self, dest, value)
+        table.insert(self.edges_add, {dest, value})
+    end,
+    delete_edge = function(self, dest)
+       table.insert(self.edges_del, dest)
     end,
 }
 
@@ -92,22 +120,82 @@ local vertex_methods = {
     end,
     --[[--
     -- | Topology mutation API
-    -- -- where src/dest may be id/name.
-    -- * self:add_vertex     (name, value)
-    -- * self:add_edge       ([src = self:get_id(), ]dest, value)
-    -- * self:delete_vertex  (src[, vertices = true])
+    -- * self:add_vertex     (value)
+    -- * self:add_edge       ([src = self:get_name(), ]dest, value)
+    -- * self:delete_vertex  ([src][, vertices = true])
     -- * self:delete_edge    ([src = self:get_id(), ]dest)
     --]]--
-    --[[--
     add_vertex = function(self, value)
+        assert(value ~= nil, 'value is nil')
+        local name = self.__pregel.obtain_name(value)
+        self.__pregel.mpool:by_id(name):put(
+                'vertex.store.delayed',
+                value
+        )
     end,
     add_edge = function(self, src, dest, value)
+        local delayed = true
+        if value == nil then
+            delayed = false
+            value = dest
+            dest  = src
+            src   = self:get_name()
+        end
+        if value == nil then
+            value = json.NULL
+        end
+        assert(src ~= nil,   'unreachable')
+        assert(dest ~= nil,  'destination is nil')
+        assert(value ~= nil, 'unreachable')
+        if delayed and src == self:get_name() then
+            delayed = false
+        end
+        if not delayed or src == self:get_name() then
+            vertex_private_methods.add_edge(self, dest, value)
+        else
+            self.__pregel.mpool:by_id(src):put(
+                    'edge.store.delayed',
+                    {dest, value}
+            )
+        end
     end,
-    delete_vertex = function(self, vertice, edges)
+    -- deleting of all input edges is NIY
+    -- only complex version can be implemented (full scan)
+    delete_vertex = function(self, vertex_name, edges)
+        if edges == nil then
+            edges       = vertex_name
+            vertex_name = self:get_name()
+        end
+        if edges == nil then
+            edges = false
+        end
+        assert(vertex_name ~= nil, 'unreachable')
+        assert(edges ~= nil,  'unreachable')
+        -- TODO: !!!!!
+        assert(edges == false, 'for now')
+        self.__pregel.mpool:by_id(vertex_name):put(
+                'vertex.delete.delayed',
+                {vertex_name, edges}
+        )
     end,
     delete_edge = function(self, src, dest)
+        local delayed = true
+        if dest == nil then
+            delayed = false
+            dest = src
+            src = self:get_name()
+        end
+        assert(src ~= nil,  'unreachable')
+        assert(dest ~= nil, 'destination is nil')
+        if not delayed or src == self:get_name() then
+            vertex_private_methods.delete_edge(self, dest)
+        else
+            self.__pregel.mpool:by_id(src):put(
+                    'edge.delete.delayed',
+                    {src, dest}
+            )
+        end
     end
-    --]]--
 }
 
 local function vertex_new()

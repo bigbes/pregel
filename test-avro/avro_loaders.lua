@@ -163,7 +163,7 @@ local function process_avro_file(self, filename, cnt_cur, cnt_all)
         local vtype = constants.vertex_type.DATA
         if type(key_object.vid) == 'string' and
            #key_object.vid > 0 and
-           key_object.vid == MASTER_VERTEX_TYPE then
+           key_object.vid == constants.MASTER_VERTEX_TYPE then
             vtype = constants.vertex_type.MASTER
         end
         self:store_vertex{

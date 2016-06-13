@@ -145,15 +145,24 @@ local function random(x, y)
     end
 end
 
+local function execute_authorized_mr(user, fun, ...)
+    local puser = box.session.user()
+    box.session.su(user)
+    local args = {fun(...)}
+    box.session.su(puser)
+    return unpack(args)
+end
+
 return strict.strictify({
-    error         = error,
-    random        = random,
-    syserror      = syserror,
-    traceback     = traceback,
-    log_traceback = log_traceback,
-    lazy_func     = lazy_func,
-    xpcall_tb     = xpcall_tb,
-    timeit        = timeit,
-    is_callable   = is_callable,
-    is_main       = is_main
+    error                 = error,
+    random                = random,
+    syserror              = syserror,
+    traceback             = traceback,
+    log_traceback         = log_traceback,
+    lazy_func             = lazy_func,
+    xpcall_tb             = xpcall_tb,
+    timeit                = timeit,
+    is_callable           = is_callable,
+    is_main               = is_main,
+    execute_authorized_mr = execute_authorized_mr
 })
