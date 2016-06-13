@@ -38,7 +38,7 @@ local dataSetKeys            = {'vid', 'email', 'okid', 'vkid'}
 local FEATURES_LIST          = "features.list"
 local TASKS_CONFIG_HDFS_PATH = "tasks.config.hdfs.path"
 -- local DATASET_PATH        = '/Users/blikh/src/work/pregel-data/tarantool-test'
-local DATASET_PATH           = '/home/taransible/tarantool-test'
+local DATASET_PATH           = '/home/taransible/bigbes-work/pregel-avro-test'
 
 -- other
 local SUFFIX_TRAIN           = "train"
