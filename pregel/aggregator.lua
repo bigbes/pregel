@@ -1,4 +1,5 @@
 local is_callable = require('pregel.utils').is_callable
+local deepcopy    = require('pregel.utils.copy').deep
 
 local aggregator_mt = {
     __index = {
@@ -14,17 +15,21 @@ local aggregator_mt = {
             )
         end,
         make_default = function(self)
-            self.value = self.default
+            if type(self.default) == 'function' then
+                self.value = self.default()
+            else
+                self.value = deepcopy(self.default)
+            end
         end,
         merge_master = function(self, value)
             self.value = self.merge(self.value, value)
         end
     },
-    __call = function(self, val)
-        if type(val) == 'nil' then
+    __call = function(self, value)
+        if type(value) == 'nil' then
             return self.value
         end
-        self.value = self.reduce(self.value, val)
+        self.value = self.reduce(self.value, value)
     end
 }
 

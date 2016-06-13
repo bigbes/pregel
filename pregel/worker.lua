@@ -249,10 +249,17 @@ local worker_new = function(name, options)
 
     box.session.su('guest')
     box.once('pregel_load-' .. name, function()
-        local space = box.schema.create_space('data_' .. name)
+        local space = box.schema.create_space('data_' .. name, {
+            format = {
+                [1] = {name = 'id',        type = 'str' },
+                [2] = {name = 'is_halted', type = 'bool'},
+                [3] = {name = 'value',     type = '*'},
+                [4] = {name = 'edges',     type = 'array'}
+            }
+        })
         space:create_index('primary', {
             type = 'TREE',
-            parts = {1, 'STR'}
+            parts = {1, 'STR'},
         })
     end)
 

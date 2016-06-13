@@ -15,6 +15,8 @@ local xpcall_tb = require('pregel.utils').xpcall_tb
 
 local algo         = require('algo')
 local avro_loaders = require('avro_loaders')
+local constants    = require('constants')
+local utils        = require('utils')
 
 --[[------------------------------------------------------------------------]]--
 --[[--------------------------------- Utils --------------------------------]]--
@@ -28,83 +30,26 @@ end
 --[[--------------------------- Job configuration --------------------------]]--
 --[[------------------------------------------------------------------------]]--
 
--- common constants
-ffi.cdef[[
-    struct gd_task_type {
-        static const int MASTER = 0x00;
-        static const int TASK   = 0x01;
-        static const int DATA   = 0x02;
-    };
-    struct gd_message_command {
-        static const int NONE                = 0x00;
-        static const int FETCH               = 0x01;
-        static const int PREDICT_CALIBRATION = 0x02;
-        static const int PREDICT             = 0x03;
-        static const int TERMINATE           = 0x04;
-    };
-    struct gd_node_status {
-        static const int UNKNOWN  = 0x00;
-        static const int NEW      = 0x01;
-        static const int WORKING  = 0x02;
-        static const int INACTIVE = 0x03;
-    };
-    struct gd_task_phase {
-        static const int SELECTION   = 0x00;
-        static const int TRAINING    = 0x01;
-        static const int CALIBRATION = 0x02;
-        static const int PREDICTION  = 0x03;
-        static const int DONE        = 0x04;
-    };
-]]
-local task_type       = ffi.new('struct gd_task_type')
-local message_command = ffi.new('struct gd_message_command')
-local node_status     = ffi.new('struct gd_node_status')
-local task_phase      = ffi.new('struct gd_task_phase')
+local vertex_type            = constants.vertex_type
+local message_command        = constants.message_command
+local node_status            = constants.node_status
+local task_phase             = constants.task_phase
 -- keys of dataSet
-local dataSetKeys            = {'vid', 'email', 'okid', 'vkid'}
+local dataSetKeys            = constants.dataSetKeys
 -- config keys
-local FEATURES_LIST          = "features.list"
-local TASKS_CONFIG_HDFS_PATH = "tasks.config.hdfs.path"
--- local DATASET_PATH           = '/Users/blikh/src/work/pregel-data/tarantool-test'
-local DATASET_PATH           = '/home/taransible/tarantool-test'
+local FEATURES_LIST          = constants.FEATURES_LIST
+local TASKS_CONFIG_HDFS_PATH = constants.TASKS_CONFIG_HDFS_PATH
+local DATASET_PATH           = constants.DATASET_PATH
 
 -- other
-local SUFFIX_TRAIN           = "train"
-local SUFFIX_TEST            = "test"
-local DISTRIBUTED_GD_GROUP   = "Distributed GD"
-local MISSING_USERS_COUNT    = "Missing users"
-local MASTER_VERTEX_TYPE     = "MASTER"
-local TASK_VERTEX_TYPE       = "TASK"
+local SUFFIX_TRAIN         = constants.SUFFIX_TRAIN
+local SUFFIX_TEST          = constants.SUFFIX_TEST
+local DISTRIBUTED_GD_GROUP = constants.DISTRIBUTED_GD_GROUP
+local MISSING_USERS_COUNT  = constants.MISSING_USERS_COUNT
+local MASTER_VERTEX_TYPE   = constants.MASTER_VERTEX_TYPE
+local TASK_VERTEX_TYPE     = constants.TASK_VERTEX_TYPE
 -- Parameters of gradient descend / algorithm
-local GDParams = nil
-do
-    local __params = {
-        ['max.dataset.size']               = 30000,
-        ['max.gd.iter']                    = 300,
-        ['gd.loss.average.factor']         = 0.2,
-        ['gd.loss.convergence.factor']     = 1e-4,
-        ['train.batch.size']               = 500,
-        ['test.batch.size']                = 300,
-        ['negative.vertices.fraction']     = 0.05,
-        ['n.calibration.vertices']         = 0.2,
-        ['p.report.prediction']            = 10000,
-        -- this should be a divisor of 0
-        ['calibration.bucket.percents']    = 5.0,
-        ['max.predicted.calibrated.value'] = 1000
-    }
-    GDParams = setmetatable({}, {
-        __index = function(self, key)
-            local value = __params[key]
-            if value == nil then
-                error(string.format('undefined constant "%s"', tostring(key)))
-            end
-            return value
-        end,
-        __newindex = function(self, key, val)
-            error('trying to modify read-only table')
-        end
-    })
-end
+local GDParams = constants.GDParams
 
 --[[------------------------------------------------------------------------]]--
 --[[----------------------------- Worker Context ---------------------------]]--
@@ -167,7 +112,7 @@ do
         predictionReportSamplingProb = predictionReportSamplingProb,
     }, {
         __index = {
-            addRandomVertexId  = function(self, vertexId)
+            addRandomVertex = function(self, vertexId)
                 table.insert(self.randomVertexIds, vertexId)
             end,
             iterateRandomVertexIds = function(self)
@@ -208,7 +153,7 @@ end
 
 local node_common_methods = {
     get_status = function(self)
-        return self:get_value().status
+        return self:get_value().status or node_status.UNKNOWN
     end,
     set_status = function(self, status)
         local v = self:get_value()
@@ -235,6 +180,7 @@ local node_common_methods = {
 local node_master_methods = {
     __init = function(self)
         self:set_status(node_status.WORKING)
+        log.info('INITIALIZING MASTER')
     end,
     work = function(self)
         local taskName = self:get_value().name
@@ -244,7 +190,7 @@ local node_master_methods = {
             for name, _ in pairs(wc.taskInputs) do
                 self:add_vertex({
                     name     = taskName,
-                    vtype    = task_type.VERTEX,
+                    vtype    = vertex_type.VERTEX,
                     features = val.features,
                     status   = node_status.NEW
                 })
@@ -266,9 +212,8 @@ local node_task_methods = {
         local taskName = self:get_value().name
         local phase = self:get_phase()
 
-        if false then
-            assert(false)
-        elseif phase == task_phase.SELECTION then
+        if phase == task_phase.SELECTION then
+            log.info('<task node, %s> SELECTION phase', taskName)
             for task in self:iterateDataSet() do
                 local ktype, kname, value = unpack(task)
                 local name = ('%s:%s'):format(ktype, kname)
@@ -282,6 +227,7 @@ local node_task_methods = {
 
             wc:set_phase(task_phase.TRAINING)
         elseif phase == task_phase.TRAINING then
+            log.info('<task node, %s> TRAINING phase', taskName)
             local dsLocalPathPrefix = fio.abspath(
                 string.format('%s_%s', wc.jobID, taskName)
             )
@@ -339,6 +285,7 @@ local node_task_methods = {
 
             wc:set_phase(task_phase.CALIBRATION)
         elseif phase == task_phase.CALIBRATION then
+            log.info('<task node, %s> CALIBRATION phase', taskName)
             local ds = algo.PercentileCounter()
             for _, msg, _ in self:pairs_messages() do
                 ds.addValue(msg.target)
@@ -364,6 +311,7 @@ local node_task_methods = {
 
             wc:set_phase(task_phase.PREDICTION)
         elseif phase == task_phase.PREDICTION then
+            log.info('<task node, %s> PREDICTION phase', taskName)
             log.info("Calibrated data:")
             local n = 1
             for _, msg, _ in self:pairs_messages() do
@@ -378,6 +326,7 @@ local node_task_methods = {
 
             wc:set_phase(task_phase.DONE)
         elseif phase == task_phase.DONE then
+            log.info('<task node, %s> DONE phase', taskName)
             self:vote_halt()
             self:set_status(node_status.INACTIVE)
         else
@@ -477,6 +426,7 @@ local node_task_methods = {
         local obj = json.encode{target, features}
     end,
     iterateDataSet = function(self, name)
+        -- log.info('ITERATION DATASET')
         local dataSetKeys = {
             'vid', 'email', 'okid', 'vkid',
         }
@@ -507,15 +457,15 @@ local crc32 = digest.crc32.new()
 local node_data_methods = {
     __init = function(self)
         local status = self:get_status()
-        local negativeVerticesFraction = GDParams['negative.verices.fraction']
-        if status == node_status.STATUS_NEW then
-            local hash = digest.crc32(self:get_key()) % 1000
+        local negativeVerticesFraction = GDParams['negative.vertices.fraction']
+        if status == node_status.NEW then
+            local hash = digest.crc32(self:get_name()) % 1000
             if hash <= 1000 * negativeVerticesFraction then
                 wc:addRandomVertex(self:get_name())
             end
-            self:set_status(node_status.STATUS_WORKING)
-        elseif status == node_status.STATUS_UNKNOWN then
-            self:set_status(node_status.STATUS_INACTIVE)
+            self:set_status(node_status.WORKING)
+        elseif status == node_status.UNKNOWN then
+            self:set_status(node_status.INACTIVE)
         end
     end,
     work = function(self)
@@ -640,6 +590,11 @@ local function computeGradientDescent(vertex)
         node_data_mt = {
             __index = {}
         }
+        for k, v in pairs(vertex_mt.__index) do
+            node_master_mt.__index[k] = v
+            node_task_mt.__index[k] = v
+            node_data_mt.__index[k] = v
+        end
         for k, v in pairs(node_common_methods) do
             node_master_mt.__index[k] = v
             node_task_mt.__index[k] = v
@@ -658,9 +613,9 @@ local function computeGradientDescent(vertex)
 
     local vtype = vertex:get_value().vtype
 
-    if vtype == task_type.MASTER then
+    if vtype == vertex_type.MASTER then
         setmetatable(vertex, node_master_mt)
-    elseif vtype == task_type.TASK then
+    elseif vtype == vertex_type.TASK then
         if vertex:get_superstep() == 0 then
             return
         end
@@ -672,34 +627,13 @@ local function computeGradientDescent(vertex)
     setmetatable(vertex, vertex_mt)
 end
 
-local function obtain_type(name)
-    return string.match('(%a+):(%w*)')
-end
-
-local function obtain_name(value)
-    if value.vtype == MASTER_VERTEX_TYPE then
-        return 'MASTER:'
-    elseif value.vtype == TASK_VERTEX_TYPE then
-        return ('%s:%s'):format(TASK_VERTEX_TYPE, value.name)
-    end
-    for _, name in ipairs(dataSetKeys) do
-        local key_value = value.key[name]
-        if key_value ~= nil and
-           type(key_value) == 'string' and
-           #key_value > 0 then
-            return ('%s:%s'):format(name, key_value)
-        end
-    end
-    assert(false)
-end
-
 local worker, port_offset = arg[0]:match('(%a+)-(%d+)')
 port_offset = port_offset or 0
 
 local function generate_worker_uri(cnt)
-	return fun.range(cnt or 4):map(function(k)
-		return 'localhost:' .. tostring(3301 + k)
-	end):totable()
+    return fun.range(cnt or 4):map(function(k)
+        return 'localhost:' .. tostring(3301 + k)
+    end):totable()
 end
 
 local common_cfg = {
@@ -713,7 +647,7 @@ local common_cfg = {
     squash_only    = false,
     pool_size      = 250,
     delayed_push   = false,
-    obtain_name    = obtain_name
+    obtain_name    = utils.obtain_name
 }
 
 if worker == 'worker' then
@@ -738,6 +672,20 @@ end)
 
 if worker == 'worker' then
     worker = pworker.new('test', common_cfg)
+    --[[--
+    local space = worker.data_space
+    space:pairs():each(function(tuple)
+        local name, is_halted, value, edges = tuple:unpack(1, 3)
+        local name1, _ = utils.obtain_type(name)
+        if name1:match('MASTER') ~= nil or value.key.vid:match('MASTER') then
+            log.info('found MASTER')
+            value.vtype = vertex_type.MASTER
+            space:replace{name, is_halted, value, edges}
+        end
+    end)
+    log.info('DONE')
+    box.snapshot()
+    --]]--
 else
     xpcall_tb(function()
         local master = pmaster.new('test', common_cfg)
@@ -747,7 +695,7 @@ else
             master:preload_on_workers()
             master.mpool:send_wait('snapshot')
         end
-        -- master:start()
+        master:start()
     end)
     os.exit(0)
 end

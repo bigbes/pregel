@@ -78,7 +78,7 @@ local vertex_methods = {
         self.__modified = true
         self.__value = new
     end,
-    get_id = function(self)
+    get_name = function(self)
         return self.__id
     end,
     get_superstep = function(self)

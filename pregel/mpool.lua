@@ -237,8 +237,10 @@ local function waitpool_handler(id, bucket)
                 error('failed to get message from queue')
             end
 
-            self.rval[id] = bench_monotonic(bucket.send, bucket,
-                                            self.msg, self.args)
+            self.rval[id] = bench_monotonic(bucket.send,
+                                            bucket,
+                                            self.msg,
+                                            self.args)
             self.channel_out:put(status)
         end
     end

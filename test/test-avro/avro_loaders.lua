@@ -7,6 +7,8 @@ local clock = require('clock')
 local pavro = require('pregel.avro')
 local ploader = require('pregel.loader')
 
+local utils = require('utils')
+local constants = require('constants')
 
 --[[--
 -- Avro schema (in JSON representation) is:
@@ -100,8 +102,8 @@ local ploader = require('pregel.loader')
 -- }
 --]]--
 
-local function process_avro_file(self, filename)
-    log.info('processing %s', filename)
+local function process_avro_file(self, filename, cnt_cur, cnt_all)
+    log.info('%03d/%03d processing %s', cnt_cur, cnt_all, filename)
     local avro_file = pavro.open(filename)
     local count = 0
     local begin_time = clock.time()
@@ -158,7 +160,18 @@ local function process_avro_file(self, filename)
                 fea_object[fid] = {fval, tst}
             end
         end
-        self:store_vertex{key = key_object, features = fea_object}
+        local vtype = constants.vertex_type.DATA
+        if type(key_object.vid) == 'string' and
+           #key_object.vid > 0 and
+           key_object.vid == MASTER_VERTEX_TYPE then
+            vtype = constants.vertex_type.MASTER
+        end
+        self:store_vertex{
+            key      = key_object,
+            features = fea_object,
+            vtype    = vtype,
+            status   = constants.node_status.NEW,
+        }
         line:release()
         count = count + 1
     end
@@ -175,7 +188,7 @@ local function master_avro_loader(master, path)
         table.sort(avro_files)
         log.info('%d found files found in path %s', #avro_files, avro_path)
         for idx, filename in ipairs(avro_files) do
-            process_avro_file(self, filename)
+            process_avro_file(self, filename, idx, #avro_files)
         end
     end
     return ploader.new(master, loader)
@@ -194,7 +207,7 @@ local function worker_avro_loader(worker, path)
         table.sort(avro_files)
         log.info('%d found files found in path %s', #avro_files, avro_path)
         for idx, filename in ipairs(avro_files) do
-            process_avro_file(self, filename)
+            process_avro_file(self, filename, idx, #avro_files)
         end
     end
     return ploader.new(worker, loader)

@@ -53,6 +53,7 @@ local master_mt = {
         end,
         start = function (self)
             log.info('master:start(): begin')
+            self.mpool:send_wait('count')
             local superstep = 1
             while true do
                 log.info('master:start(): superstep %d start', superstep)
@@ -88,11 +89,9 @@ local master_mt = {
         preload = function(self)
             self.preload_func()
             self.mpool:flush()
-            self.mpool:send_wait('count')
         end,
         preload_on_workers = function(self)
             self.mpool:send_wait('preload')
-            self.mpool:send_wait('count')
         end,
         add_aggregator = function(self, name, opts)
             assert(self.aggregators[name] == nil)

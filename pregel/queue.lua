@@ -240,7 +240,7 @@ local function tube_new(name, options)
                 })
                 space:create_index('receiver', {
                     type = 'TREE',
-                    parts = {2, 'NUM'},
+                    parts = {2, 'STR'},
                     unique = false
                 })
             else
