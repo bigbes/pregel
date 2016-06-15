@@ -138,25 +138,31 @@ end
 local worker_mt = {
     __index = {
         run_superstep = function(self, superstep)
+            local n_count = 0
+
             local function tuple_filter(tuple)
                 local id, halt = tuple:unpack(1, 2)
                 return not (self.mqueue:len(id) == 0 and halt == true)
             end
-            local function tuple_process(tuple)
+
+            local function tuple_process(acc, tuple)
+                if acc % 10000 == 0 then
+                    fiber.yield()
+                end
                 local vertex_object = self.vertex_pool:pop(tuple)
-                vertex_object.superstep = superstep
+                vertex_object.__superstep = superstep
                 vertex_object:vote_halt(false)
                 local rv = vertex_compute(vertex_object)
                 self.mqueue:delete(vertex_object.__id)
                 self.vertex_pool:push(vertex_object)
-                return rv
+                return acc + 1
             end
 
             log.info('starting superstep %d', superstep)
 
             self.data_space:pairs()
                            :filter(tuple_filter)
-                           :each(tuple_process)
+                           :reduce(tuple_process, 0)
 
             -- can't reach, for now
             while self.vertex_pool.count > 0 do
@@ -169,13 +175,12 @@ local worker_mt = {
             return 'ok'
         end,
         after_superstep = function(self)
-            -- swap message queues
+            -- SWAP MESSAGE QUEUES
             local tmp = self.mqueue
             self.mqueue = self.mqueue_next
             self.mqueue_next = tmp
-            -- TODO: if mqueue_next is not empty, then execute callback on messages
-            -- self.mqueue_next:truncate()
 
+            -- TODO: if mqueue_next is not empty, then execute callback on messages
             local len = self.mqueue_next:len()
             if len > 0 then
                 log.info('left %d messages', len)
@@ -183,30 +188,42 @@ local worker_mt = {
                     log.info('msg %d: %s', id, json.encode(tuple))
                 end)
             end
+            self.mqueue_next:truncate()
 
+            -- TOPOLOGY MUTATION
             local tmspace   = self.topology_mutation_space
             local tmspacein = self.topology_mutation_space.index.name
-            -- topology mutation part
-            local last_key
+            local last_key  = nil
+            log.info('<topology mutation> stats:')
+            log.info('<topology mutation, del_edge>   %d tasks', tmspacein:count(TOPMT_EDGE_DELETE))
+            log.info('<topology mutation, del_vertex> %d tasks', tmspacein:count(TOPMT_VERTEX_DELETE))
+            log.info('<topology mutation, add_vertex> %d tasks', tmspacein:count(TOPMT_VERTEX_STORE))
+            log.info('<topology mutation, add_edge>   %d tasks', tmspacein:count(TOPMT_EDGE_STORE))
             -- first part  - delete edges
             -- TODO: conflict resolving if we can't find edge
             last_key = nil
             while true do
                 local first = tmspace:select(last_key, {limit=1, iterator='GT'})
-                if first[1] == nil then
+                if first[1] == nil or first[1][2] ~= TOPMT_EDGE_DELETE then
                     break
                 end
                 local src = first[1][3]
-                last_key = {TOPMT_EDGE_STORE, src}
+                last_key = {TOPMT_EDGE_DELETE, src}
                 first = tmspace:select(last_key)
                 local edge_list = self.data_space:get{src}[4]
                 for idx, tuple in ipairs(first) do
                     local idx, tmtype, src, dest = tuple:unpack()
+                    local is_deleted = false
                     for idx, edge in ipairs(edge_list) do
                         if edge[1] == dest then
+                            log.info("<topology mutation, del_edge> edge '%s'->'%s': deleted", src, dest)
                             table.remove(edge_list, idx)
+                            is_deleted = true
                             break
                         end
+                    end
+                    if not is_deleted then
+                        log.info("<topology mutation, del_edge> edge '%s'->'%s': not exists", src, dest)
                     end
                     tmspace:delete(idx)
                 end
@@ -215,11 +232,13 @@ local worker_mt = {
             -- second part - delete vertices
             -- TODO: conflict resolving if we can't find vertex
             local to_delete = {}
-            for tuple in tmspacein:pairs{TOPMT_VERTEX_DELETE} do
+            for _, tuple in tmspacein:pairs{TOPMT_VERTEX_DELETE} do
                 local idx, tmtype, vertex_name = tuple:unpack()
                 local rv = self.data_space:delete{vertex_name}
                 if rv == nil then
-                    log.error("Can't found tuple, with name '%s'", tuple[3])
+                    log.error("<topology mutation, del_vertex> vertex '%s': deleted", vertex_name)
+                else
+                    log.error("<topology mutation, del_vertex> vertex '%s': not exists", vertex_name)
                 end
                 table.insert(to_delete, idx)
             end
@@ -229,8 +248,10 @@ local worker_mt = {
                 tmspace:delete(idx)
             end
             -- third part - add vertices
+            -- optimization - add all edges (that needed to be added to those
+            -- vertices) at the same time
             -- TODO: conflict resolving if vertex is already presented
-            for tuple in tmspacein:pairs{TOPMT_VERTEX_STORE} do
+            for _, tuple in tmspacein:pairs{TOPMT_VERTEX_STORE} do
                 local idx, tmtype, vertex_name, vertex = tuple:unpack()
                 local edges = {}
                 local edge_list = tmspacein:select{TOPMT_EDGE_STORE, vertex_name}
@@ -238,7 +259,12 @@ local worker_mt = {
                     table.insert(edges, {tuple:unpack(4, 5)})
                     table.insert(to_delete, tuple[1])
                 end
-                self.data_space:insert{vertex_name, false, vertex, edges}
+                if self.data_space:get{vertex_name} ~= nil then
+                    log.info("<topology mutation, add_vertex> vertex '%s': exists", vertex_name)
+                else
+                    self.data_space:replace{vertex_name, false, vertex, edges}
+                    log.info("<topology mutation, add_vertex> vertex '%s': added", vertex_name)
+                end
                 table.insert(to_delete, idx)
             end
             while true do
@@ -254,16 +280,23 @@ local worker_mt = {
                 if first[1] == nil then
                     break
                 end
+                assert(first[1][2] == TOPMT_EDGE_STORE)
                 local src = first[1][3]
                 last_key = {TOPMT_EDGE_STORE, src}
                 local edge_list = tmspace:select(last_key)
-                local edges = {}
-                for _, tuple in ipairs(edge_list) do
-                    table.insert(edges, {tuple:unpack(4, 5)})
+                local vertex = self.data_space:get{src}
+                if vertex == nil then
+                    log.info("<topology mutation, add_edge> edge '%s'->'*': vertex '%s' doesn't exists", src, src)
+                else
+                    local edges = {}
+                    for _, tuple in ipairs(edge_list) do
+                        local dest, value = tuple:unpack(4, 5)
+                        log.info("<topology mutation, add_edge> edge '%s'->'%s': added", src, dest)
+                        table.insert(edges, {dest, value})
+                    end
+                    edge_list = fun.iter(vertex[4]):chain(edges):totable()
+                    self.data_space:update(src, {{'=', 4, edge_list}})
                 end
-                edge_list = self.data_space:get{src}[4]
-                edge_list = fun.iter(edge_list):chain(edges):totable()
-                self.data_space:update(src, {{'=', 4, edge_list}})
             end
             tmspace:truncate()
 
@@ -301,6 +334,7 @@ local worker_mt = {
             self.data_space:replace(tuple)
         end,
         vertex_store_delayed = function(self, vertex)
+            log.info('got vertex store')
             self.topology_mutation_space:auto_increment{
                 TOPMT_VERTEX_STORE, self.obtain_name(vertex), vertex
             }
@@ -372,9 +406,9 @@ local worker_new = function(name, options)
         box.once('pregel_load-' .. name, function()
             local space = box.schema.create_space('data_' .. name, {
                 format = {
-                    [1] = {name = 'id',        type = 'str' },
-                    [2] = {name = 'is_halted', type = 'bool'},
-                    [3] = {name = 'value',     type = '*'},
+                    [1] = {name = 'id',        type = 'str'  },
+                    [2] = {name = 'is_halted', type = 'bool' },
+                    [3] = {name = 'value',     type = '*'    },
                     [4] = {name = 'edges',     type = 'array'}
                 }
             })
@@ -382,7 +416,9 @@ local worker_new = function(name, options)
                 type = 'TREE',
                 parts = {1, 'STR'},
             })
-            space = box.schema.create_space('topology_mutation_' .. name, {
+        end)
+        box.once('pregel_tm-' .. name, function()
+            local space = box.schema.create_space('topology_mutation_' .. name, {
                 format = {
                     [1] = {name = 'id',    type = 'num'},
                     [2] = {name = 'type',  type = 'num'},
@@ -419,7 +455,9 @@ local worker_new = function(name, options)
     end)
 
     self.data_space              = box.space['data_' .. name]
-    self.mutation_topology_space = box.space['topology_mutation_' .. name]
+    assert(self.data_space ~= nil)
+    self.topology_mutation_space = box.space['topology_mutation_' .. name]
+    assert(self.topology_mutation_space ~= nil)
 
     self.master = remote.new(master_uri, {
         wait_connected  = false,

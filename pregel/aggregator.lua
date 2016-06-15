@@ -1,3 +1,5 @@
+local log         = require('log')
+
 local is_callable = require('pregel.utils').is_callable
 local deepcopy    = require('pregel.utils.copy').deep
 
@@ -38,8 +40,10 @@ local function aggregator_new(name, pregel, opts)
     local internal = opts.internal or false
     local reduce = opts.reduce or (function(k, v) return v end)
     assert(is_callable(reduce), 'options.reduce must be callable')
-    local merge = opts.merge or (function(k, v) return v end)
+    local merge = opts.merge   or opts.reduce
     assert(is_callable(merge), 'options.merge must be callable')
+
+    log.info('<aggregator, %s> creating new aggregator', name)
 
     return setmetatable({
         name       = name,

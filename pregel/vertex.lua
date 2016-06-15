@@ -17,9 +17,11 @@ local vertex_private_methods = {
     end,
     compute = function(self)
         self:__compute_func()
-        if self.__modified or #self.edges_add > 0 or #self.edges_del > 0 then
+        if self.__modified or
+           #self.__edges_add > 0 or
+           #self.__edges_del > 0 then
             while true do
-                local edge = table.remove(self.edges_del)
+                local edge = table.remove(self.__edges_del)
                 if edge == nil then
                     break
                 end
@@ -34,7 +36,7 @@ local vertex_private_methods = {
                 end
             end
             while true do
-                local edge = table.remove(self.edges_add)
+                local edge = table.remove(self.__edges_add)
                 if edge == nil then
                     break
                 end
@@ -50,10 +52,10 @@ local vertex_private_methods = {
         return self:__write_solution_func()
     end,
     add_edge = function(self, dest, value)
-        table.insert(self.edges_add, {dest, value})
+        table.insert(self.__edges_add, {dest, value})
     end,
     delete_edge = function(self, dest)
-       table.insert(self.edges_del, dest)
+       table.insert(self.__edges_del, dest)
     end,
 }
 
@@ -113,10 +115,10 @@ local vertex_methods = {
         return self.__superstep
     end,
     get_aggregation = function(self, name)
-        return self.__pregel(name)
+        return self.__pregel.aggregators[name]()
     end,
     set_aggregation = function(self, name, value)
-       self.__pregel(name, value)
+        return self.__pregel.aggregators[name](value)
     end,
     --[[--
     -- | Topology mutation API
@@ -210,7 +212,9 @@ local function vertex_new()
         -- assigned once per vertex
         __pregel              = nil,
         __compute_func        = nil,
-        __write_solution_func = nil
+        __write_solution_func = nil,
+        __edges_del           = {},
+        __edges_add           = {},
     }, {
         __index = vertex_methods
     })

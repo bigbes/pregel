@@ -5,18 +5,40 @@ local log = require('log')
 local json = require('json')
 local yaml = require('yaml')
 local clock = require('clock')
+local errno = require('errno')
 local fiber = require('fiber')
 local digest = require('digest')
 
-local pmaster = require('pregel.master')
-local pworker = require('pregel.worker')
+local pmaster   = require('pregel.master')
+local pworker   = require('pregel.worker')
 local avro      = require('pregel.avro')
+
 local xpcall_tb = require('pregel.utils').xpcall_tb
+local deepcopy  = require('pregel.utils.copy').deep
 
 local algo         = require('algo')
 local avro_loaders = require('avro_loaders')
 local constants    = require('constants')
 local utils        = require('utils')
+
+local worker, port_offset = arg[0]:match('(%a+)-(%d+)')
+port_offset = port_offset or 0
+
+if worker == 'worker' then
+    box.cfg{
+        wal_mode = 'none',
+        slab_alloc_arena = 2.5,
+        listen = 'localhost:' .. tostring(3301 + port_offset),
+        background = true,
+        logger_nonblock = false
+    }
+else
+    box.cfg{
+        wal_mode = 'none',
+        listen = 'localhost:' .. tostring(3301 + port_offset),
+        logger_nonblock = false
+    }
+end
 
 --[[------------------------------------------------------------------------]]--
 --[[--------------------------------- Utils --------------------------------]]--
@@ -42,14 +64,14 @@ local TASKS_CONFIG_HDFS_PATH = constants.TASKS_CONFIG_HDFS_PATH
 local DATASET_PATH           = constants.DATASET_PATH
 
 -- other
-local SUFFIX_TRAIN         = constants.SUFFIX_TRAIN
-local SUFFIX_TEST          = constants.SUFFIX_TEST
-local DISTRIBUTED_GD_GROUP = constants.DISTRIBUTED_GD_GROUP
-local MISSING_USERS_COUNT  = constants.MISSING_USERS_COUNT
-local MASTER_VERTEX_TYPE   = constants.MASTER_VERTEX_TYPE
-local TASK_VERTEX_TYPE     = constants.TASK_VERTEX_TYPE
+local SUFFIX_TRAIN           = constants.SUFFIX_TRAIN
+local SUFFIX_TEST            = constants.SUFFIX_TEST
+local DISTRIBUTED_GD_GROUP   = constants.DISTRIBUTED_GD_GROUP
+local MISSING_USERS_COUNT    = constants.MISSING_USERS_COUNT
+local MASTER_VERTEX_TYPE     = constants.MASTER_VERTEX_TYPE
+local TASK_VERTEX_TYPE       = constants.TASK_VERTEX_TYPE
 -- Parameters of gradient descend / algorithm
-local GDParams = constants.GDParams
+local GDParams               = constants.GDParams
 
 --[[------------------------------------------------------------------------]]--
 --[[----------------------------- Worker Context ---------------------------]]--
@@ -67,37 +89,46 @@ do
     local calibrationBucketPercents    = GDParams['calibration.bucket.percents']
 
     local fd = io.open(fio.pathjoin(DATASET_PATH, 'express_prediction_config.json'))
-    assert(fd)
+    assert(fd, "Can't open file for reading")
     local input = json.decode(fd:read('*a'))
+    assert(input, "Bad input")
     fd:close()
+
+    local function check_file(fname)
+        local file = fio.open(fname, {'O_RDONLY'})
+        if file == nil then
+            local errstr = "Can't open file '%s' for reading: %s [errno %d]"
+            errstr = string.format(errstr, fname, errno.strerror(), errno())
+            error(errstr)
+        end
+        file:close()
+    end
 
     for _, task_config in ipairs(input) do
         local name  = task_config['name']
         local input = task_config['input']
         for _, deployment in ipairs(task_config['deployment']) do
-            local key = table.concat({name, deployment['user_id_type']}, ':')
+            local key = ('%s:%s'):format(name, deployment['user_id_type'])
             taskDeploymentConfigs[key] = deployment
         end
+        taskPhases[name] = task_phase.SELECTION
+        taskDataSet[name] = fio.pathjoin(DATASET_PATH, input)
+        check_file(taskDataSet[name])
+        log.info("<worker_context> Added config for '%s'", name)
     end
 
-    local dataSetKeysTypes = {
-        {'email',    'string'},
-        {'okid',     'string'},
-        {'vkid',     'string'},
-        {'category', 'int'   }
-    }
+    local dataSetKeysTypes = {'email', 'okid', 'vkid'}
 
     local function processDataSet(input)
-        local output = fun.iter(dataSetKeysTypes):map(function(field)
-            local fname = field[1]
-            local ftype = field[2]
+        local category = input.category and input.category.int
+        local output = fun.iter(dataSetKeysTypes):map(function(fname)
             if input[fname] ~= nil then
-                return fname, input[fname][ftype]
+                return {fname, input[fname].string, category}
             end
         end):totable()
         local vid = input['vid']
         if vid and #vid > 0 then
-            output['vid'] = vid
+            table.insert(output, {'vid', vid, category})
         end
         return output
     end
@@ -122,30 +153,53 @@ do
                 self.taskPhases[name] = phase
             end,
             getTaskPhase = function(self, name)
-                return self.taskPhases[name] or task_phase.UNKNOWN
+                return self.taskPhases[name] or task_phase.SELECTION
             end,
             iterateDataSet = function(self, name)
-                local n    = 0
-                local file = fio.open(self.taskDataSet[name])
-                local line = ''
+                local file  = fio.open(self.taskDataSet[name], {'O_RDONLY'})
+                local line  = ''
+                local errstr = "Can't open file '%s' for reading: %s [errno %d]"
+                errstr = string.format(errstr, self.taskDataSet[name],
+                                       errno.strerror(), errno())
+                assert(file ~= nil, errstr)
                 local function iterator()
                     while true do
+                        local input
                         if line:find('\n') == nil then
                             local rv = file:read(65536)
-                            if rv == nil then
-                                assert(false)
+                            if #rv == 0 then
+                                file:close()
                                 return nil
+                            else
+                                line = line .. rv
                             end
-                            line = line .. rv
                         else
-                            local input, line = line:match('([^\n]*)\n(.*)')
+                            input, line = line:match('([^\n]*)\n(.*)')
                             input = json.decode(input)
-                            n = n + 1
-                            return n, processDataSet(input)
+                            return processDataSet(input)
                         end
                     end
                 end
                 return iterator, nil
+            end,
+            addAggregators = function(self, instance)
+                log.info("<worker_context> Adding aggregators")
+                for taskName, _ in pairs(self.taskPhases) do
+                    instance:add_aggregator(taskName, {
+                        default = {
+                            name     = nil,
+                            command  = message_command.NONE,
+                            target   = 0.0,
+                            features = {}
+                        },
+                        merge   = function(old, new)
+                            if old == nil or new.command > old.command then
+                                return deepcopy(new)
+                            end
+                        end
+                    })
+                end
+                return instance
             end
         }
     })
@@ -180,17 +234,17 @@ local node_common_methods = {
 local node_master_methods = {
     __init = function(self)
         self:set_status(node_status.WORKING)
-        log.info('INITIALIZING MASTER')
+        log.info('<MASTER> Initializing')
     end,
     work = function(self)
-        local taskName = self:get_value().name
+        local val = self:get_value()
 
         if self:get_superstep() == 1 then
-            local val = self:get_value()
-            for name, _ in pairs(wc.taskInputs) do
+            for name, _ in pairs(wc.taskPhases) do
+                log.info('<MASTER> Adding task vertex %s', name)
                 self:add_vertex({
-                    name     = taskName,
-                    vtype    = vertex_type.VERTEX,
+                    name     = name,
+                    vtype    = vertex_type.TASK,
                     features = val.features,
                     status   = node_status.NEW
                 })
@@ -203,20 +257,47 @@ local node_master_methods = {
 
 local node_task_methods = {
     __init = function(self)
+        local taskName = self:get_value().name
+        log.info('<task node, %s> Initializing', taskName)
         if self:get_status() == node_status.NEW then
             self:set_status(node_status.WORKING)
         end
+        local space_name = string.format('task_node_%s_data_set', taskName)
+        if box.space[space_name] == nil then
+            local space = box.schema.create_space(space_name, {
+                format = {
+                    [1] = {name = 'id',           type = 'num'  },
+                    [2] = {name = 'task_name',    type = 'str'  },
+                    [3] = {name = 'target_round', type = 'num'  },
+                    [4] = {name = 'suffix',       type = 'str'  },
+                    [5] = {name = 'target',       type = 'num'  },
+                    [6] = {name = 'features',     type = 'array'},
+                }
+            })
+            space:create_index('primary', {
+                type  = 'TREE',
+                parts = {1, 'NUM'}
+            })
+            space:create_index('name', {
+                type  = 'TREE',
+                parts = {2, 'STR', 3, 'NUM', 4, 'STR'},
+                unique = false
+            })
+        end
+        self.dataSetSpace = box.space[space_name]
     end,
     work = function(self)
-        local value = self:get_value()
+        local value    = self:get_value()
         local taskName = self:get_value().name
-        local phase = self:get_phase()
+        local phase    = wc:getTaskPhase(taskName)
 
         if phase == task_phase.SELECTION then
+
             log.info('<task node, %s> SELECTION phase', taskName)
-            for task in self:iterateDataSet() do
+            for task in self:iterateDataSet(taskName) do
                 local ktype, kname, value = unpack(task)
                 local name = ('%s:%s'):format(ktype, kname)
+                log.info('<iterateDataSet, %s> send_message to <%s>', taskName, name)
                 self:send_message(name, {
                     sender   = self:get_name(),
                     command  = message_command.FETCH,
@@ -224,21 +305,18 @@ local node_task_methods = {
                     features = {}
                 })
             end
+            log.info('<task node, %s> SELECTION phase done', taskName)
 
-            wc:set_phase(task_phase.TRAINING)
+            wc:setTaskPhase(taskName, task_phase.TRAINING)
         elseif phase == task_phase.TRAINING then
+
             log.info('<task node, %s> TRAINING phase', taskName)
-            local dsLocalPathPrefix = fio.abspath(
-                string.format('%s_%s', wc.jobID, taskName)
-            )
-            log.info('setting data set LOCAL_PATH for task %s to %s',
-                     taskName, dsLocalPathPrefix)
 
             local testVerticesFraction = GDParams['test.vertices.fraction']
             log.info('Test vertices fraction %f', testVerticesFraction)
 
-            local n, recordCounts = self:saveDataSetToLocalTempFiles(
-                taskName, dsLocalPathPrefix, testVerticesFraction
+            local n, recordCounts = self:saveDataSetToLocalSpace(
+                taskName, testVerticesFraction
             )
             if n == 0 then
                 log.warn('Master didn\'t receive any messages, so no training occured')
@@ -250,7 +328,7 @@ local node_task_methods = {
             local trainBatchSize = GDParams['train.batch.size']
             local testBatchSize  = GDParams['test.batch.size']
             local maxIter        = GDParams['max.gd.iter']
-            local alpha          = GDParams['gd.loss.average.factor']
+            local alpha          = GDParams['gd.loss.averaging.factor']
             local epsilon        = GDParams['gd.loss.convergence.factor']
 
             local params = self:train(taskName, recordCounts, d, maxIter,
@@ -283,8 +361,9 @@ local node_task_methods = {
             end
             log.info('sent %d calibration messages. Waiting for response')
 
-            wc:set_phase(task_phase.CALIBRATION)
+            wc:setTaskPhase(taskName, task_phase.CALIBRATION)
         elseif phase == task_phase.CALIBRATION then
+
             log.info('<task node, %s> CALIBRATION phase', taskName)
             local ds = algo.PercentileCounter()
             for _, msg, _ in self:pairs_messages() do
@@ -309,8 +388,9 @@ local node_task_methods = {
                      taskName, json.encode(broadcast))
             self:set_aggregation(taskName, broadcast)
 
-            wc:set_phase(task_phase.PREDICTION)
+            wc:setTaskPhase(taskName, task_phase.PREDICTION)
         elseif phase == task_phase.PREDICTION then
+
             log.info('<task node, %s> PREDICTION phase', taskName)
             log.info("Calibrated data:")
             local n = 1
@@ -324,10 +404,12 @@ local node_task_methods = {
                 return
             end
 
-            wc:set_phase(task_phase.DONE)
+            wc:setTaskPhase(taskName, task_phase.DONE)
         elseif phase == task_phase.DONE then
+
             log.info('<task node, %s> DONE phase', taskName)
             self:vote_halt()
+
             self:set_status(node_status.INACTIVE)
         else
             assert(false)
@@ -346,8 +428,8 @@ local node_task_methods = {
         end
         return parametersWithCalibration
     end,
-    train = function(self, taskName, recordCounts, dim, maxIter, trainBatchSize,
-                     testBatchSize, alpha, epsilon)
+    train = function(self, taskName, recordounts, dim, maxIter,
+                     trainBatchSize, testBatchSize, alpha, epsilon)
         log.info('Initializing Gradient descent for task %s', taskName)
         log.info(' - train batch size %d', trainBatchSize)
         log.info(' - test batch size %d', testBatchSize)
@@ -359,77 +441,121 @@ local node_task_methods = {
         local parameters = gd:initialize(dim)
         log.info('initialized model parameters to %s', json.encode(parameters))
 
-        local readerMap = {}
-        local stat, err = pcall(function()
-            for dsLocalPath, recordCount in pairs(recordCounts) do
-                if recordCount > 0 then
-                    -- TODO: port line 343
-                else
-                    error(
-                        string.format('No records in file %s. Failing the task',
-                                      dsLocalPath)
-                    )
+        local trainAverageLoss = nil
+        local testAverageLoss  = nil
+
+        for nIter = 1, maxIter, 1 do
+            local trainBatchLoss = 0.0
+            local testBatchLoss  = 0.0
+            local trainBatchGradient = fun.duplicate(0.0):take(300):totable()
+            local last = self.dataSetSpace:select(nil, {limit=1})[1]
+            while true do
+                if last == nil then
+                    break
                 end
-                -- TODO: port lines 348-409
+                local target, suffix = last:unpack(3, 4)
+                local isTrain = (suffix == 'train')
+                local batchSize = isTrain and trainBatchSize or testBatchSize
+                --
+                while batchSize > 0 do
+                    self.dataSetSpace.index.name:pairs{taskName, target, suffix}
+                                                :take(batchSize)
+                                                :any(function(tuple)
+                        local target, features = last:unpack(5, 6)
+                        local lg = gd:lossAndGradient(target, features, parameters)
+                        if isTrain then
+                            trainBatchLoss = trainBatchLoss + lg[1] / trainBatchSize
+                            for i = 1, #trainBatchGradient, 1 do
+                                trainBatchGradient[i - 1] = trainBatchGradient[i - 1] + lg[i]
+                            end
+                        else
+                            testBatchLoss = testBatchLoss + lg[1] / testBatchSize
+                        end
+                        batchSize = batchSize - 1
+                        return batchSize > 0
+                    end)
+                end
+                --
+                -- self:removeDataSetLocalSpace(taskName, target, suffix)
+                last = self.dataSetSpace:select({taskName, target, suffix}, {
+                    iterator = 'GT',
+                    limit = 1
+                })[1]
             end
-        end)
-        for _, dsLocalPath in ipairs(recordCounts) do
-            self:removeDataSetLocalTempFile(taskName, dsLocalPath)
-        end
-        if stat == false then
-            error(err)
+
+            if trainAverageLoss == nil then
+                trainAverageLoss = trainBatchLoss
+            else
+                trainAverageLoss = (1 - alpha) * trainAverageLoss +
+                                         alpha * trainBatchLoss
+            end
+
+            if testAverageLoss == nil then
+                testAverageLoss = testBatchLoss
+            else
+                local tal = (1 - alpha) * testAverageLoss +
+                                  alpha * testBatchLoss
+                if math.abs(testAverageLoss - tal) < epsilon then
+                    log.info('<task node, %s> GD converged on iteration %d',
+                             taskName, nIter)
+                    break
+                end
+                testAverageLoss = tal
+            end
+
+            parameters = gd:update(nIter, parameters, trainBatchGradient)
+            log.info('<task node, %s> GD OUTPUT on iteration %d:', taskName, nIter)
+            log.info('<task node, %s> trainBatchLoss - %f, testBatchLoss - %f',
+                     trainBatchLoss, testBatchLoss)
+            log.info('<task node, %s> trainAverageLoss - %f, testAverageLoss - %f',
+                     trainAverageLoss, testAverageLoss)
         end
 
-        log.info('Finihsed GD, new parameters: %s', json.encode(parameters))
+        local in_one_line = 10
+        log.info('<task node, %s> Finihsed GD, new parameters', taskName)
+        for i = 1, math.ceil(#parameters)/in_one_line, 1 do
+            local ln = fun.iter(parameters):skip((i - 1) * in_one_line):take(in_one_line):totable()
+            log.info('<task node, %s> %d: %s', taskName, i, json.encode(ln))
+        end
+
+        self.dataSetSpace:truncate()
         return parameters
     end,
-    saveDataSetToLocalTempFiles = function(self, taskName, dsLocalPathPrefix,
-                                           testVerticesFraction)
-        log.info('<%s> Saving data to temp files using prefix %s',
-                 taskName, dsLocalPathPrefix)
+    saveDataSetToLocalSpace = function(self, taskName, testVerticesFraction)
+        log.info('<task node, %s> Saving data to space %s',
+                 taskName, self.dataSetSpace.name)
 
-        local writerMap = {}
-        local recordCounts = {}
+        local cnt = 0
 
         for _, msg in self:pairs_messages() do
             local target = math_round(msg.target)
             local suffix = math.random() < testVerticesFraction and SUFFIX_TEST or SUFFIX_TRAIN
-            local dsLocalPath = ('%s_%d_%s'):format(dsLocalPathPrefix, target, suffix)
 
-            if writerMap[dsLocalPath] == nil then
-                writerMap[dsLocalPath] = fio.open(dsLocalPath, {'O_WRONLY'})
-                assert(writerMap[dsLocalPath] ~= nil)
-                recordCounts[dsLocalPath] = 0
-            end
-            local fd = writerMap[dsLocalPath]
-            fd:write(self:datumToJson(msg.target, msg.features))
-            fd:write('\n')
-            recordCounts[dsLocalPath] = recordCounts[dsLocalPath] + 1
+            self.dataSetSpace:auto_increment{taskName, target, suffix, msg.target, msg.features}
+            cnt = cnt + 1
         end
-        for dsLocalPath, fd in pairs(recordCounts) do
-            log.info('<%s> Written data set file: %s -> %d',
-                     taskName, dsLocalPath, recordCounts[dsLocalPath])
-            fd:close()
+        for _, tuple in self.dataSetSpace.index.name:pairs(taskName) do
+            local target, suffix = tuple:unpack(3, 4)
+            local cnt = self.dataSetSpace.index.name:count(taskName, target, suffix)
+            log.info('<task node, %s> Written data set: %s_%d_%s -> %d',
+                     taskName, taskName, target, suffix, cnt)
         end
 
-        return recordCounts
+        return cnt
     end,
-    removeDataSetLocalTempFiles = function(self, taskName, dsLocalPath)
-        log.info('<%s> Removing temporary file %s', taskName, dsLocalPath)
-        fio.delete(dsLocalPath)
-        log.info('<%s> Removed temporary file %s', taskName, dsLocalPath)
-    end,
-    jsonToDatum = function(self, line)
-        return unpack(json.decode(line))
-    end,
-    datumToJson = function(self, target, features)
-        local obj = json.encode{target, features}
+    removeDataSetLocalSpace = function(self, taskName, target, suffix)
+        log.info('<task node, %s> Removing all records for %s_%d_%s',
+                 taskName, taskName, target, suffix)
+        local to_remove = self.dataSetSpace:pairs{taskName, target, suffix}
+                                           :map(function(tuple)
+            return tuple[1]
+        end):totable()
+        fun.iter(to_remove):each(function(id)
+            self.dataSetSpace:delete(id)
+        end)
+        log.info('<task node, %s> Removed %d records', #to_remove)
     end,
     iterateDataSet = function(self, name)
-        -- log.info('ITERATION DATASET')
-        local dataSetKeys = {
-            'vid', 'email', 'okid', 'vkid',
-        }
         local iter_func = wc:iterateDataSet(name)
         local last_item = {}
         local category  = 1
@@ -439,12 +565,6 @@ local node_task_methods = {
                 if last_item == nil then
                     return
                 end
-                category = last_item['category']
-                last_item = fun.iter(dataSetKeys):map(function(key)
-                    if last_item[key] ~= nil then
-                        return { key, last_item[key], category }
-                    end
-                end):totable()
             end
             return table.remove(last_item)
         end
@@ -456,6 +576,7 @@ local crc32 = digest.crc32.new()
 
 local node_data_methods = {
     __init = function(self)
+        -- log.info('<data node> Initializing %s', self:get_name())
         local status = self:get_status()
         local negativeVerticesFraction = GDParams['negative.vertices.fraction']
         if status == node_status.NEW then
@@ -472,14 +593,18 @@ local node_data_methods = {
         for _, msg in self:pairs_messages() do
             -- return feature vector to master
             if msg.command == message_command.FETCH then
+                log.info('<data node, %s> processing command FETCH',
+                         self:get_name())
                 self:send_message(msg.sender, {
                     sender   = self:get_name(),
                     command  = message_command.NONE,
                     target   = msg.target,
-                    features = self:get_features()
+                    features = self:get_value().features
                 })
             -- compute raw prediction and return to master
             elseif msg.command == message_command.PREDICT_CALIBRATION then
+                log.info('<data node, %s> processing command PREDICT_CALIBRATION',
+                         self:get_name())
                 local prediction = self:predictRaw(msg.features)
                 self:send_message(msg.sender, {
                     sender   = self:get_name(),
@@ -501,6 +626,7 @@ local node_data_methods = {
 
             -- predict and save
             if msg.command == message_command.PREDICT then
+                log.info('<data node, %s> processing command PREDICT from aggregator', self:get_name())
                 isPredictionPhase = true
                 local calibratedPrediction = self:predictCalibrated(
                     msg.features,
@@ -627,9 +753,6 @@ local function computeGradientDescent(vertex)
     setmetatable(vertex, vertex_mt)
 end
 
-local worker, port_offset = arg[0]:match('(%a+)-(%d+)')
-port_offset = port_offset or 0
-
 local function generate_worker_uri(cnt)
     return fun.range(cnt or 4):map(function(k)
         return 'localhost:' .. tostring(3301 + k)
@@ -650,28 +773,13 @@ local common_cfg = {
     obtain_name    = utils.obtain_name
 }
 
-if worker == 'worker' then
-    box.cfg{
-        wal_mode = 'none',
-        slab_alloc_arena = 2.5,
-        listen = 'localhost:' .. tostring(3301 + port_offset),
-        background = true,
-        logger_nonblock = false
-    }
-else
-    box.cfg{
-        wal_mode = 'none',
-        listen = 'localhost:' .. tostring(3301 + port_offset),
-        logger_nonblock = false
-    }
-end
-
 box.once('bootstrap', function()
     box.schema.user.grant('guest', 'read,write,execute', 'universe')
 end)
 
 if worker == 'worker' then
     worker = pworker.new('test', common_cfg)
+    wc:addAggregators(worker)
     --[[--
     local space = worker.data_space
     space:pairs():each(function(tuple)
@@ -689,12 +797,33 @@ if worker == 'worker' then
 else
     xpcall_tb(function()
         local master = pmaster.new('test', common_cfg)
+        wc:addAggregators(master)
         master:wait_up()
         if arg[1] == 'load' then
             -- master:preload()
             master:preload_on_workers()
+            --[[--
+            master.mpool:by_id('MASTER:'):put('vertex.store', {
+                key = {vid = 'MASTER', category = 0},
+                features = fun.range(300):map(function()
+                    return 0.0
+                end):totable(),
+                vtype =  constants.vertex_type.MASTER,
+                status = constants.node_status.NEW
+            })
+            master.mpool:flush()
+            --]]--
             master.mpool:send_wait('snapshot')
         end
+        master.mpool:by_id('MASTER:'):put('vertex.store', {
+            key      = {vid = 'MASTER', category = 0},
+            features = fun.range(300):map(function()
+                return 0.0
+            end):totable(),
+            vtype    = constants.vertex_type.MASTER,
+            status   = constants.node_status.NEW
+        })
+        master.mpool:flush()
         master:start()
     end)
     os.exit(0)

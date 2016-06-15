@@ -53,13 +53,14 @@ do
     local __params = {
         ['max.dataset.size']               = 30000,
         ['max.gd.iter']                    = 300,
-        ['gd.loss.average.factor']         = 0.2,
+        ['gd.loss.averaging.factor']       = 0.2,
         ['gd.loss.convergence.factor']     = 1e-4,
         ['train.batch.size']               = 500,
         ['test.batch.size']                = 300,
-        ['negative.vertices.fraction']     = 0.05,
-        ['n.calibration.vertices']         = 0.2,
-        ['p.report.prediction']            = 10000,
+        ['negative.vertices.fraction']     = 0.2,
+        ['test.vertices.fraction']         = 0.05,
+        ['n.calibration.vertices']         = 10000,
+        ['p.report.prediction']            = 1e-3,
         -- this should be a divisor of 0
         ['calibration.bucket.percents']    = 5.0,
         ['max.predicted.calibrated.value'] = 1000

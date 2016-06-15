@@ -7,7 +7,7 @@ yaml.cfg{
     encode_use_tostring = true
 }
 
-local pregel      = require('pregel')
+-- local pregel      = require('pregel')
 local strict      = require('pregel.utils.strict')
 
 local fmtstring   = string.format
