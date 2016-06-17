@@ -1,4 +1,16 @@
-local fun = require('fun')
+local fun  = require('fun')
+local log  = require('log')
+local json = require('json')
+
+local dup  = fun.duplicate
+
+local function math_round(fnum)
+    return (fnum % 1 >= 0.5) and math.ceil(fnum) or math.floor(fnum)
+end
+
+local function scalar_product(x, y)
+    return fun.iter(x):zip(y):map(function(l, r) return l * r end):sum()
+end
 
 local function ConstantLearningRate_new(c)
     c = c or 0.01
@@ -7,18 +19,10 @@ local function ConstantLearningRate_new(c)
     }, {
         __index = {
             rate = function(self, iteration, parameters)
-                return fun.range(1, #parameters):zip(
-                    fun.duplicate(self.c)
-                ):tomap()
+                return fun.range(1, #parameters):zip(dup(self.c)):tomap()
             end,
         }
     })
-end
-
-local function common_dot(self, x, y)
-    return fun.iter(x):zip(y):reduce(function(acc, l, r)
-        return acc + l * r
-    end, 0.0)
 end
 
 local function HingeLoss_new()
@@ -26,22 +30,18 @@ local function HingeLoss_new()
         __index = {
             valueAndGradient = function(self, t, x, parameters)
                 local result = nil
-                local y = self:dot(x, parameters)
+                local y = scalar_product(x, parameters)
                 if t * y < 1 then
-                    result = fun.range(2, #result + 1)
-                                :zip(x)
-                                :zip(fun.duplicate(t))
+                    result = fun.range(2, #x + 1)
+                                :zip(x, dup(t))
                                 :map(function(x_i, t) return -1 * t * x_i end)
                                 :tomap()
                     result[1] = 1 - t * y
                 else
-                    result = fun.range(1, #result + 1)
-                                :zip(fun.duplicate(0.0))
-                                :tomap()
+                    result = fun.range(1, #parameters + 1):zip(dup(0)):tomap()
                 end
                 return result
             end,
-            dot = common_dot
         }
     })
 end
@@ -51,16 +51,15 @@ local function L2_new()
         __index = {
             valueAndGradient = function(self, t, x, parameters)
                 local result = nil
-                local y = self:dot(x, parameters)
-                result = fun.range(2, #result + 1)
+                local y = scalar_product(x, parameters)
+                result = fun.range(2, #x + 1)
                             :zip(parameters)
                             :map(function(idx, p_i) return idx, p_i * 2 end)
                             :tomap()
-                result[1] = self:dot(parameters, parameters)
-                result[1] = result[1] - (parameters[0] * parameters[0])
+                result[1] = scalar_product(parameters, parameters)
+                result[1] = result[1] - (parameters[1] * parameters[1])
                 return result
             end,
-            dot = common_dot
         }
     })
 end
@@ -76,15 +75,15 @@ local function RegularizedLoss_new(loss, regularizer, lambda)
                 local lossResult         = self.loss:valueAndGradient(t, x, parameters)
                 local regularizerResult  = self.regularizer:valueAndGradient(t, x, parameters)
 
-                local result = fun.iter(lossResult):zip(regularizerResult)
-                                                   :zip(fun.duplicate(self.lambda))
-                                                   :map(function(l, r, lambda)
-                    return l + lambda * r
+                local result = nil
+                result = fun.iter(lossResult)
+                            :zip(regularizerResult, dup(self.lambda))
+                            :map(function(l, r, lmbd)
+                    return l + lmbd * r
                 end):totable()
 
                 return result
             end,
-            dot = common_dot
         }
     })
 end
@@ -98,11 +97,11 @@ local function GradientDescent_new(loss, lr)
     }, {
         __index = {
             lossAndGradient = function(self, t, x, parameters)
-                self.loss:valueAndGradient(t, x, parameters)
+                return self.loss:valueAndGradient(t, x, parameters)
             end,
             update = function(self, iteration, parameters, gradient)
                 local rate = self.learningRate:rate(iteration, parameters)
-                local updated = fun.iter(parameters):zip(rate):zip(gradient)
+                local updated = fun.iter(parameters):zip(rate, gradient)
                                    :map(function(p, r, g) return p - r * g end)
                                    :totable()
                 return updated
@@ -119,7 +118,7 @@ end
 
 local function PercentileCounter_new(window_size)
     if window_size == nil then
-        window_size = math.pow(2, 31)
+        window_size = math.pow(2, 30)
     end
     return setmetatable({
         window_size = window_size,
@@ -129,6 +128,7 @@ local function PercentileCounter_new(window_size)
         __index = {
             addValue = function(self, new)
                 -- pop random element from table
+                local isInserted = false
                 if self.n == self.window_size then
                     table.remove(self.values, math.random(self.n))
                     self.n = self.n - 1
@@ -136,19 +136,20 @@ local function PercentileCounter_new(window_size)
                 -- insert element in the right position
                 for idx, val in ipairs(self.values) do
                     if val > new then
-                        table.insert(self, new, idx)
-                        self.n = self.n + 1
+                        table.insert(self.values, new, idx)
+                        isInserted = true
                         break
                     end
                 end
+                if not isInserted then
+                    table.insert(self.values, new)
+                end
+                self.n = self.n + 1
             end,
             getPercentile = function(self, p)
-                p = (p * self.n / 100)
-                if p % 1 >= 0.5 then
-                    p = math.ceil(p)
-                else
-                    p = math.floor(p)
-                end
+                -- log.info('<PercentileCounter:getPercentile> %d, %f', self.n, p)
+                local p = math_round(p * self.n / 100)
+                -- log.info('<PercentileCounter:getPercentile> %d -> %s', p, tostring(self.values[p]))
                 return self.values[p]
             end,
             getN = function(self)

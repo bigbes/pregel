@@ -40,12 +40,24 @@ else
     }
 end
 
+box.schema.user.grant('guest', 'read,write,execute', 'universe', nil, {
+    if_not_exists = true
+})
+
 --[[------------------------------------------------------------------------]]--
 --[[--------------------------------- Utils --------------------------------]]--
 --[[------------------------------------------------------------------------]]--
 
 local function math_round(fnum)
     return (fnum % 1 >= 0.5) and math.ceil(fnum) or math.floor(fnum)
+end
+
+local function log_features(prefix, features, in_one_line)
+    in_one_line = in_one_line or 7
+    for i = 1, math.ceil(#features/in_one_line) do
+        local ln = fun.iter(features):drop((i - 1) * in_one_line):take(in_one_line):totable()
+        log.info('<%s> %d: %s', prefix, i, json.encode(ln))
+    end
 end
 
 --[[------------------------------------------------------------------------]]--
@@ -102,6 +114,7 @@ do
             error(errstr)
         end
         file:close()
+        return fname
     end
 
     for _, task_config in ipairs(input) do
@@ -112,26 +125,10 @@ do
             taskDeploymentConfigs[key] = deployment
         end
         taskPhases[name] = task_phase.SELECTION
-        taskDataSet[name] = fio.pathjoin(DATASET_PATH, input)
-        check_file(taskDataSet[name])
         log.info("<worker_context> Added config for '%s'", name)
     end
 
     local dataSetKeysTypes = {'email', 'okid', 'vkid'}
-
-    local function processDataSet(input)
-        local category = input.category and input.category.int
-        local output = fun.iter(dataSetKeysTypes):map(function(fname)
-            if input[fname] ~= nil then
-                return {fname, input[fname].string, category}
-            end
-        end):totable()
-        local vid = input['vid']
-        if vid and #vid > 0 then
-            table.insert(output, {'vid', vid, category})
-        end
-        return output
-    end
 
     wc = setmetatable({
         randomVertexIds              = randomVertexIds,
@@ -156,10 +153,24 @@ do
                 return self.taskPhases[name] or task_phase.SELECTION
             end,
             iterateDataSet = function(self, name)
-                local file  = fio.open(self.taskDataSet[name], {'O_RDONLY'})
+                local function processDataSet(input)
+                    local category = input.category and input.category.int
+                    local output = fun.iter(dataSetKeysTypes):map(function(fname)
+                        if input[fname] ~= nil then
+                            return {fname, input[fname].string, category}
+                        end
+                    end):totable()
+                    local vid = input['vid']
+                    if vid and #vid > 0 then
+                        table.insert(output, {'vid', vid, category})
+                    end
+                    return output
+                end
+
+                local file  = fio.open(self.taskDataSet[name][1], {'O_RDONLY'})
                 local line  = ''
                 local errstr = "Can't open file '%s' for reading: %s [errno %d]"
-                errstr = string.format(errstr, self.taskDataSet[name],
+                errstr = string.format(errstr, self.taskDataSet[name][1],
                                        errno.strerror(), errno())
                 assert(file ~= nil, errstr)
                 local function iterator()
@@ -182,6 +193,26 @@ do
                 end
                 return iterator, nil
             end,
+            iterateDataSetWrap = function(self, name)
+                local iter_func = self:iterateDataSet(name)
+                local last_item = {}
+                local category  = 1
+                local iterator = function()
+                    if last_item[1] == nil then
+                        last_item = iter_func()
+                        if last_item == nil then
+                            return
+                        end
+                    end
+                    return table.remove(last_item)
+                end
+                return iterator, nil
+            end,
+            storeDataSet = function(self, name)
+                for tuple in self:iterateDataSetWrap(name) do
+                    self.taskDataSet[name][2]:replace(tuple)
+                end
+            end,
             addAggregators = function(self, instance)
                 log.info("<worker_context> Adding aggregators")
                 for taskName, _ in pairs(self.taskPhases) do
@@ -193,9 +224,11 @@ do
                             features = {}
                         },
                         merge   = function(old, new)
-                            if old == nil or new.command > old.command then
+                            if new ~= nil and
+                               (old == nil or new.command > old.command) then
                                 return deepcopy(new)
                             end
+                            return old
                         end
                     })
                 end
@@ -203,6 +236,35 @@ do
             end
         }
     })
+
+    if worker == 'worker' then
+        for _, task_config in ipairs(input) do
+            local name   = task_config['name']
+            local input  = task_config['input']
+            local fname  = check_file(fio.pathjoin(DATASET_PATH, input))
+            local sname  = ('wc_%s_data_set'):format(name)
+            local fspace = box.space[sname]
+            taskDataSet[name] = {fname, fspace}
+            if box.space[sname] == nil then
+                local space = box.schema.create_space(sname, {
+                    format = {
+                        [1] = {name = 'id_type',  type = 'str'},
+                        [2] = {name = 'id',       type = 'str'},
+                        [3] = {name = 'category', type = 'num'}
+                    }
+                })
+                space:create_index('primary', {
+                    type  = 'TREE',
+                    parts = {1, 'STR', 2, 'STR'}
+                })
+                taskDataSet[name][2] = space
+                log.info("<worker_context> Begin preloading data for '%s'", name)
+                wc:storeDataSet(name)
+                log.info("<worker_context> Data stored for '%s'", name)
+            end
+            log.info("<worker_context> Done loading dataSet for '%s'", name)
+        end
+    end
 end
 
 local node_common_methods = {
@@ -262,7 +324,7 @@ local node_task_methods = {
         if self:get_status() == node_status.NEW then
             self:set_status(node_status.WORKING)
         end
-        local space_name = string.format('task_node_%s_data_set', taskName)
+        local space_name = ('task_node_%s_data_set'):format(taskName)
         if box.space[space_name] == nil then
             local space = box.schema.create_space(space_name, {
                 format = {
@@ -279,8 +341,8 @@ local node_task_methods = {
                 parts = {1, 'NUM'}
             })
             space:create_index('name', {
-                type  = 'TREE',
-                parts = {2, 'STR', 3, 'NUM', 4, 'STR'},
+                type   = 'TREE',
+                parts  = {2, 'STR', 3, 'NUM', 4, 'STR'},
                 unique = false
             })
         end
@@ -294,8 +356,8 @@ local node_task_methods = {
         if phase == task_phase.SELECTION then
 
             log.info('<task node, %s> SELECTION phase', taskName)
-            for task in self:iterateDataSet(taskName) do
-                local ktype, kname, value = unpack(task)
+            for _, task in wc.taskDataSet[taskName][2]:pairs() do
+                local ktype, kname, value = task:unpack()
                 local name = ('%s:%s'):format(ktype, kname)
                 log.info('<iterateDataSet, %s> send_message to <%s>', taskName, name)
                 self:send_message(name, {
@@ -341,8 +403,7 @@ local node_task_methods = {
             log.info('Number of calibration messages: %d', nCalibrationMessages)
 
             local calibrationProb = math.min(
-                1.0 * nCalibrationMessages / #wc.RandomVertexIDS,
-                1.0
+                1.0 * nCalibrationMessages / #wc.randomVertexIds, 1.0
             )
             log.info('Probability to take message for calibration: %f',
                      calibrationProb)
@@ -352,14 +413,14 @@ local node_task_methods = {
                 if math.random() < calibrationProb then
                     self:send_message(randomID, {
                         sender   = self:get_name(),
-                        command  = message_command.COMMAND_PREDICT_CALIBRATION,
+                        command  = message_command.PREDICT_CALIBRATION,
                         target   = 0.0,
                         features = value.features,
                     })
                     n = n + 1
                 end
             end
-            log.info('sent %d calibration messages. Waiting for response')
+            log.info('sent %d calibration messages. Waiting for response', n)
 
             wc:setTaskPhase(taskName, task_phase.CALIBRATION)
         elseif phase == task_phase.CALIBRATION then
@@ -367,25 +428,30 @@ local node_task_methods = {
             log.info('<task node, %s> CALIBRATION phase', taskName)
             local ds = algo.PercentileCounter()
             for _, msg, _ in self:pairs_messages() do
-                ds.addValue(msg.target)
+                ds:addValue(msg.target)
             end
             if ds:getN() == 0 then
                 log.warn('Master didn\'t receive any messages, so no calibration occured')
                 log.warn('Waiting one superstep')
                 return
             end
-            local cbp = GDParams['calibration.buckets.percents']
+            local cbp = GDParams['calibration.bucket.percents']
             log.info('Calibration bucket percents %f', cbp)
             local parametersAndCalibration = self:calibrate(value.features, ds,
                                                             #value.features, cbp)
+            log.info('parametersAndCalibration %d', #parametersAndCalibration)
             local broadcast = {
                 sender   = self:get_name(),
                 command  = message_command.PREDICT,
                 target   = 0.0,
                 features = parametersAndCalibration
             }
-            log.info('<%s> Set aggregator to broadcast model across all vertices to %s',
-                     taskName, json.encode(broadcast))
+            log.info('<task node, %s> Set aggregator to broadcast model ' ..
+                     'across all vertices to:', taskName)
+            log.info('<task node, %s> - command - PREDICT', taskName)
+            log.info("<task node, %s> - sender: %s", taskName, broadcast.sender)
+            log.info('<task node, %s> - features:', taskName)
+            log_features(("task node, %s"):format(taskName), broadcast.features)
             self:set_aggregation(taskName, broadcast)
 
             wc:setTaskPhase(taskName, task_phase.PREDICTION)
@@ -415,36 +481,43 @@ local node_task_methods = {
             assert(false)
         end
     end,
-    calibrate = function(self, parameters, ds, dim, calibrationBucketPercents)
+    calibrate = function(self, param, ds, dim, calibrationBucketPercents)
         local nPercentiles = math.floor(100 / calibrationBucketPercents) - 1;
         log.info('Model dimensionality: %d, calibration bucket percents: %f',
                  dim, calibrationBucketPercents)
         log.info('Number of calibration percentiles: %d', nPercentiles)
-        local parametersWithCalibration = fun.iter(parameters):totable()
+        local parametersWithCalibration = fun.iter(param):chain(
+            fun.range(1, nPercentiles):map(function(p)
+                return ds:getPercentile((p + 1) * calibrationBucketPercents)
+            end)
+        ):totable()
+--[[--
         for p = 1, nPercentiles do
-            table.insert(parametersWithCalibration, ds.getPercentile(
-                (p + 1) * calibrationBucketPercents
-            ))
+            table.insert(parametersWithCalibration,
+                         ds:getPercentile((p + 1) * calibrationBucketPercents)
+            )
         end
+--]]--
         return parametersWithCalibration
     end,
     train = function(self, taskName, recordounts, dim, maxIter,
                      trainBatchSize, testBatchSize, alpha, epsilon)
-        log.info('Initializing Gradient descent for task %s', taskName)
-        log.info(' - train batch size %d', trainBatchSize)
-        log.info(' - test batch size %d', testBatchSize)
-        log.info(' - maximum number of iteration %d', maxIter)
-        log.info(' - loss averaging factor %f', alpha)
-        log.info(' - loss convergence factor %f', epsilon)
+        log.info('<task node, %s> Initializing Gradient descent',    taskName)
+        log.info('<task node, %s> - train batch size %d',            taskName, trainBatchSize)
+        log.info('<task node, %s> - test batch size %d',             taskName, testBatchSize)
+        log.info('<task node, %s> - maximum number of iteration %d', taskName, maxIter)
+        log.info('<task node, %s> - loss averaging factor %f',       taskName, alpha)
+        log.info('<task node, %s> - loss convergence factor %f',     taskName, epsilon)
 
         local gd = algo.GradientDescent('hinge', 'l2')
-        local parameters = gd:initialize(dim)
-        log.info('initialized model parameters to %s', json.encode(parameters))
+        local param = gd:initialize(dim)
+        log.info('<task node, %s> initialized model parameters to:', taskName)
+        log_features(('task node, %s'):format(taskName), param)
 
         local trainAverageLoss = nil
         local testAverageLoss  = nil
 
-        for nIter = 1, maxIter, 1 do
+        for nIter = 1, maxIter do
             local trainBatchLoss = 0.0
             local testBatchLoss  = 0.0
             local trainBatchGradient = fun.duplicate(0.0):take(300):totable()
@@ -462,10 +535,10 @@ local node_task_methods = {
                                                 :take(batchSize)
                                                 :any(function(tuple)
                         local target, features = last:unpack(5, 6)
-                        local lg = gd:lossAndGradient(target, features, parameters)
+                        local lg = gd:lossAndGradient(target, features, param)
                         if isTrain then
                             trainBatchLoss = trainBatchLoss + lg[1] / trainBatchSize
-                            for i = 1, #trainBatchGradient, 1 do
+                            for i = 2, #lg do
                                 trainBatchGradient[i - 1] = trainBatchGradient[i - 1] + lg[i]
                             end
                         else
@@ -476,8 +549,7 @@ local node_task_methods = {
                     end)
                 end
                 --
-                -- self:removeDataSetLocalSpace(taskName, target, suffix)
-                last = self.dataSetSpace:select({taskName, target, suffix}, {
+                last = self.dataSetSpace.index.name:select({taskName, target, suffix}, {
                     iterator = 'GT',
                     limit = 1
                 })[1]
@@ -503,23 +575,19 @@ local node_task_methods = {
                 testAverageLoss = tal
             end
 
-            parameters = gd:update(nIter, parameters, trainBatchGradient)
+            param = gd:update(nIter, param, trainBatchGradient)
             log.info('<task node, %s> GD OUTPUT on iteration %d:', taskName, nIter)
             log.info('<task node, %s> trainBatchLoss - %f, testBatchLoss - %f',
-                     trainBatchLoss, testBatchLoss)
+                     taskName, trainBatchLoss, testBatchLoss)
             log.info('<task node, %s> trainAverageLoss - %f, testAverageLoss - %f',
-                     trainAverageLoss, testAverageLoss)
+                     taskName, trainAverageLoss, testAverageLoss)
         end
 
-        local in_one_line = 10
-        log.info('<task node, %s> Finihsed GD, new parameters', taskName)
-        for i = 1, math.ceil(#parameters)/in_one_line, 1 do
-            local ln = fun.iter(parameters):skip((i - 1) * in_one_line):take(in_one_line):totable()
-            log.info('<task node, %s> %d: %s', taskName, i, json.encode(ln))
-        end
+        log.info('<task node, %s> Finished GD, new parameters', taskName)
+        log_features(('task node, %s'):format(taskName), param)
 
         self.dataSetSpace:truncate()
-        return parameters
+        return param
     end,
     saveDataSetToLocalSpace = function(self, taskName, testVerticesFraction)
         log.info('<task node, %s> Saving data to space %s',
@@ -534,19 +602,29 @@ local node_task_methods = {
             self.dataSetSpace:auto_increment{taskName, target, suffix, msg.target, msg.features}
             cnt = cnt + 1
         end
-        for _, tuple in self.dataSetSpace.index.name:pairs(taskName) do
-            local target, suffix = tuple:unpack(3, 4)
-            local cnt = self.dataSetSpace.index.name:count(taskName, target, suffix)
+        local last = self.dataSetSpace.index.name:select(taskName, {
+            limit = 1
+        })[1]
+        while true do
+            if last == nil or last[2] ~= taskName then
+                break
+            end
+            local target, suffix = last:unpack(3, 4)
+            local cnt = self.dataSetSpace.index.name:count{taskName, target, suffix}
             log.info('<task node, %s> Written data set: %s_%d_%s -> %d',
                      taskName, taskName, target, suffix, cnt)
+            last = self.dataSetSpace.index.name:select(
+                {taskName, target, suffix},
+                {limit = 1, iterator = 'gt'}
+            )[1]
         end
-
         return cnt
     end,
     removeDataSetLocalSpace = function(self, taskName, target, suffix)
         log.info('<task node, %s> Removing all records for %s_%d_%s',
                  taskName, taskName, target, suffix)
-        local to_remove = self.dataSetSpace:pairs{taskName, target, suffix}
+        local to_remove = self.dataSetSpace.index.name
+                                           :pairs{taskName, target, suffix}
                                            :map(function(tuple)
             return tuple[1]
         end):totable()
@@ -555,28 +633,10 @@ local node_task_methods = {
         end)
         log.info('<task node, %s> Removed %d records', #to_remove)
     end,
-    iterateDataSet = function(self, name)
-        local iter_func = wc:iterateDataSet(name)
-        local last_item = {}
-        local category  = 1
-        local iterator = function()
-            if last_item[1] == nil then
-                last_item = iter_func()
-                if last_item == nil then
-                    return
-                end
-            end
-            return table.remove(last_item)
-        end
-        return iterator, nil
-    end,
 }
-
-local crc32 = digest.crc32.new()
 
 local node_data_methods = {
     __init = function(self)
-        -- log.info('<data node> Initializing %s', self:get_name())
         local status = self:get_status()
         local negativeVerticesFraction = GDParams['negative.vertices.fraction']
         if status == node_status.NEW then
@@ -593,8 +653,8 @@ local node_data_methods = {
         for _, msg in self:pairs_messages() do
             -- return feature vector to master
             if msg.command == message_command.FETCH then
-                log.info('<data node, %s> processing command FETCH',
-                         self:get_name())
+                log.info("<data node, '%s'->'%s'> processing command FETCH",
+                         self:get_name(), msg.sender)
                 self:send_message(msg.sender, {
                     sender   = self:get_name(),
                     command  = message_command.NONE,
@@ -603,8 +663,8 @@ local node_data_methods = {
                 })
             -- compute raw prediction and return to master
             elseif msg.command == message_command.PREDICT_CALIBRATION then
-                log.info('<data node, %s> processing command PREDICT_CALIBRATION',
-                         self:get_name())
+                log.info("<data node, '%s'->'%s'> processing command PREDICT_CALIBRATION",
+                         self:get_name(), msg.sender)
                 local prediction = self:predictRaw(msg.features)
                 self:send_message(msg.sender, {
                     sender   = self:get_name(),
@@ -625,12 +685,11 @@ local node_data_methods = {
             local msg = self:get_aggregation(taskName)
 
             -- predict and save
-            if msg.command == message_command.PREDICT then
+            if msg ~= nil and msg.command == message_command.PREDICT then
                 log.info('<data node, %s> processing command PREDICT from aggregator', self:get_name())
                 isPredictionPhase = true
                 local calibratedPrediction = self:predictCalibrated(
-                    msg.features,
-                    wc.calibrationBucketPercent
+                    msg.features, wc.calibrationBucketPercents
                 )
 
                 -- return to master for report, maybe
@@ -646,34 +705,39 @@ local node_data_methods = {
                 -- write (audience, score) pair if threshold exceeded
                 local dcName = ('%s:%s'):format(taskName, self.idType)
                 local dc = wc.taskDeploymentConfigs[dcName]
+                local maxPredictedCalibratedValue = GDParams['max.predicted.calibrated.value']
                 if (dc ~= nil and
-                    calibratedPrediction >
-                        (GDParams['max.predicted.calibrated.value'] *
-                         (1 - dc.threshold))) then
-                    table.insert(predictions, dc.targeting)
-                    table.insert(predictions, calibratedPrediction)
+                    calibratedPrediction > maxPredictedCalibratedValue *
+                                           (1 - dc.threshold)) then
+                    table.insert(predictions, {dc.targeting, calibratedPrediction})
                 end
             end
         end
 
         if isPredictionPhase then
+            if #predictions > 0 then
+                log.info('<data node, %s> Prediction phase done', self:get_name())
+                log.info('<data node, %s> %s', self:get_name(), json.encode(predictions))
+            end
+            -- Update value
             local val = self:get_value()
             val.features = predictions
             self:set_value(val)
+            -- Make it inactive
             self:set_status(node_status.INACTIVE)
             self:vote_halt()
         end
     end,
     predictRaw = function(self, param)
         local prediction = 0.0
-        local features = self.get_value().features
+        local features = self:get_value().features
         for i, feature in ipairs(features) do
             prediction = prediction + feature * param[i]
         end
         return prediction
     end,
     predictCalibrated = function(self, param, calibrationBucketPercents)
-        local features = self.get_value().features
+        local features = self:get_value().features
         local dim = #features
         local nPercentiles = math.floor(100 / calibrationBucketPercents) - 1
         local percentileStep = GDParams['max.predicted.calibrated.value'] / 100
@@ -681,14 +745,16 @@ local node_data_methods = {
         local prediction = self:predictRaw(param)
 
         local calibratedPrediction = -1
-        for i = 0, nPercentiles - 1 do
+        -- log.info('param_len %d', #param)
+        -- log.info('featu_len %d', dim)
+        for i = 1, nPercentiles do
             if prediction < param[dim + i] then
-                calibratedPrediction = math.random(-1000000, 1000000) + i * percentileStep
+                calibratedPrediction = math.random(0, percentileStep) + i * percentileStep
                 break
             end
         end
         if calibratedPrediction == -1 then
-            calibratedPrediction = math.random(-1000000, 1000000)
+            calibratedPrediction = math.random(0, percentileStep)
             calibratedPrediction = calibratedPrediction + nPercentiles * percentileStep
         end
         return calibratedPrediction
@@ -772,10 +838,6 @@ local common_cfg = {
     delayed_push   = false,
     obtain_name    = utils.obtain_name
 }
-
-box.once('bootstrap', function()
-    box.schema.user.grant('guest', 'read,write,execute', 'universe')
-end)
 
 if worker == 'worker' then
     worker = pworker.new('test', common_cfg)

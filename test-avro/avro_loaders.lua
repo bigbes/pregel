@@ -1,6 +1,7 @@
 local fio = require('fio')
 local fun = require('fun')
 local log = require('log')
+local json = require('json')
 local fiber = require('fiber')
 local clock = require('clock')
 
@@ -157,7 +158,7 @@ local function process_avro_file(self, filename, cnt_cur, cnt_all)
                 local fval = feature:get('value'):get():get()
                 local tst  = feature:get('timestamp')
                 assert(tst == nil, 'timestamp is not nil')
-                fea_object[fid] = {fval, tst}
+                fea_object[fid] = fval
             end
         end
         local vtype = constants.vertex_type.DATA
@@ -174,6 +175,7 @@ local function process_avro_file(self, filename, cnt_cur, cnt_all)
         }
         line:release()
         count = count + 1
+        fiber.yield()
     end
     log.info('done processing %d values in %.3f seconds',
                 count, clock.time() - begin_time)

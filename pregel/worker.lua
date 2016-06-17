@@ -146,7 +146,9 @@ local worker_mt = {
             end
 
             local function tuple_process(acc, tuple)
-                if acc % 10000 == 0 then
+                if acc % 1000 == 0 then
+                    log.info('Processed %d/%d vertices', acc,
+                             self.data_space:len())
                     fiber.yield()
                 end
                 local vertex_object = self.vertex_pool:pop(tuple)
@@ -237,6 +239,9 @@ local worker_mt = {
                 local rv = self.data_space:delete{vertex_name}
                 if rv == nil then
                     log.error("<topology mutation, del_vertex> vertex '%s': deleted", vertex_name)
+                    if rv[2] == false then
+                        self.in_progress = self.in_progress - 1
+                    end
                 else
                     log.error("<topology mutation, del_vertex> vertex '%s': not exists", vertex_name)
                 end
@@ -264,6 +269,7 @@ local worker_mt = {
                 else
                     self.data_space:replace{vertex_name, false, vertex, edges}
                     log.info("<topology mutation, add_vertex> vertex '%s': added", vertex_name)
+                    self.in_progress = self.in_progress + 1
                 end
                 table.insert(to_delete, idx)
             end

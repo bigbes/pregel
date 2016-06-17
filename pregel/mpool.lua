@@ -70,8 +70,6 @@ end
 
 local bucket_common_methods = {
     send = function(self, msg, args)
-        log.info('bucket:send - instance "%s", message "%s", args <%s>',
-                    self.name, msg, json.encode(args))
         return self.connection:eval(
             'return require("pregel.worker").deliver(...)',
             self.name, msg, args
@@ -314,6 +312,8 @@ local mpool_mt = {
             end
         end,
         send_wait = function(self, message, args)
+            log.info('mpool:send_wait - instance "%s", message "%s", args <%s>',
+                     self.name, message, json.encode(args))
             return self.waitpool(message, args)
         end,
         send = function(self, message, args)
