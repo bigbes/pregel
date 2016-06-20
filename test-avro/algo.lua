@@ -2,7 +2,8 @@ local fun  = require('fun')
 local log  = require('log')
 local json = require('json')
 
-local dup  = fun.duplicate
+local dup       = fun.duplicate
+local duplicate = fun.duplicate
 
 local function math_round(fnum)
     return (fnum % 1 >= 0.5) and math.ceil(fnum) or math.floor(fnum)
@@ -19,7 +20,7 @@ local function ConstantLearningRate_new(c)
     }, {
         __index = {
             rate = function(self, iteration, parameters)
-                return fun.range(1, #parameters):zip(dup(self.c)):tomap()
+                return fun.duplicate(self.c):take(#parameters):totable()
             end,
         }
     })
@@ -32,9 +33,8 @@ local function HingeLoss_new()
                 local result = nil
                 local y = scalar_product(x, parameters)
                 if t * y < 1 then
-                    result = fun.range(2, #x + 1)
-                                :zip(x, dup(t))
-                                :map(function(x_i, t) return -1 * t * x_i end)
+                    result = fun.range(2, #x + 1):zip(x, dup(t))
+                                :map(function(idx, x_i, t) return idx, -t * x_i end)
                                 :tomap()
                     result[1] = 1 - t * y
                 else
@@ -52,8 +52,7 @@ local function L2_new()
             valueAndGradient = function(self, t, x, parameters)
                 local result = nil
                 local y = scalar_product(x, parameters)
-                result = fun.range(2, #x + 1)
-                            :zip(parameters)
+                result = fun.range(2, #x + 1):zip(parameters)
                             :map(function(idx, p_i) return idx, p_i * 2 end)
                             :tomap()
                 result[1] = scalar_product(parameters, parameters)
@@ -76,11 +75,9 @@ local function RegularizedLoss_new(loss, regularizer, lambda)
                 local regularizerResult  = self.regularizer:valueAndGradient(t, x, parameters)
 
                 local result = nil
-                result = fun.iter(lossResult)
-                            :zip(regularizerResult, dup(self.lambda))
-                            :map(function(l, r, lmbd)
-                    return l + lmbd * r
-                end):totable()
+                result = fun.iter(lossResult):zip(regularizerResult)
+                            :map(function(l, r) return l + self.lambda * r end)
+                            :totable()
 
                 return result
             end,
@@ -147,9 +144,7 @@ local function PercentileCounter_new(window_size)
                 self.n = self.n + 1
             end,
             getPercentile = function(self, p)
-                -- log.info('<PercentileCounter:getPercentile> %d, %f', self.n, p)
                 local p = math_round(p * self.n / 100)
-                -- log.info('<PercentileCounter:getPercentile> %d -> %s', p, tostring(self.values[p]))
                 return self.values[p]
             end,
             getN = function(self)

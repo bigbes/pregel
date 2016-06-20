@@ -1,3 +1,7 @@
+local fun  = require('fun')
+local log  = require('log')
+local json = require('json')
+
 local constants = require('constants')
 
 local vertex_type = constants.vertex_type
@@ -30,7 +34,21 @@ local function obtain_name(value)
     assert(false)
 end
 
+local function math_round(fnum)
+    return (fnum % 1 >= 0.5) and math.ceil(fnum) or math.floor(fnum)
+end
+
+local function log_features(prefix, features, in_one_line)
+    in_one_line = in_one_line or 7
+    for i = 1, math.ceil(#features/in_one_line) do
+        local ln = fun.iter(features):drop((i - 1) * in_one_line):take(in_one_line):totable()
+        log.info('<%s> %d: %s', prefix, i, json.encode(ln))
+    end
+end
+
 return {
-    obtain_type = obtain_type,
-    obtain_name = obtain_name,
+    obtain_type  = obtain_type,
+    obtain_name  = obtain_name,
+    math_round   = math_round,
+    log_features = log_features
 }

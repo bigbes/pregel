@@ -7,6 +7,7 @@ clean_lr:
 	LUA_PATH="`pwd`\?.lua;`pwd`\?\init.lua;;" ./workers.sh restart $(COUNT)
 	sleep 0.5
 	$(TNT_PATH) common.lua
+	LUA_PATH="`pwd`\?.lua;`pwd`\?\init.lua;;" ./workers.sh stop $(COUNT)
 
 clean_all:
 	LUA_PATH="`pwd`\?.lua;`pwd`\?\init.lua;;" ./workers.sh stop $(COUNT)
@@ -14,5 +15,6 @@ clean_all:
 	LUA_PATH="`pwd`\?.lua;`pwd`\?\init.lua;;" ./workers.sh start $(COUNT)
 	sleep 0.5
 	$(TNT_PATH) common.lua load
+	LUA_PATH="`pwd`\?.lua;`pwd`\?\init.lua;;" ./workers.sh stop $(COUNT)
 
 all: clean_lr

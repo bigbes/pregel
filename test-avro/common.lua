@@ -28,14 +28,14 @@ if worker == 'worker' then
     box.cfg{
         wal_mode = 'none',
         slab_alloc_arena = 2.5,
-        listen = 'localhost:' .. tostring(3301 + port_offset),
+        listen = '0.0.0.0:' .. tostring(3301 + port_offset),
         background = true,
         logger_nonblock = false
     }
 else
     box.cfg{
         wal_mode = 'none',
-        listen = 'localhost:' .. tostring(3301 + port_offset),
+        listen = '0.0.0.0:' .. tostring(3301 + port_offset),
         logger_nonblock = false
     }
 end
@@ -48,17 +48,10 @@ box.schema.user.grant('guest', 'read,write,execute', 'universe', nil, {
 --[[--------------------------------- Utils --------------------------------]]--
 --[[------------------------------------------------------------------------]]--
 
-local function math_round(fnum)
-    return (fnum % 1 >= 0.5) and math.ceil(fnum) or math.floor(fnum)
-end
+local math_round   = utils.math_round
+local log_features = utils.log_features
 
-local function log_features(prefix, features, in_one_line)
-    in_one_line = in_one_line or 7
-    for i = 1, math.ceil(#features/in_one_line) do
-        local ln = fun.iter(features):drop((i - 1) * in_one_line):take(in_one_line):totable()
-        log.info('<%s> %d: %s', prefix, i, json.encode(ln))
-    end
-end
+local NULL = json.NULL
 
 --[[------------------------------------------------------------------------]]--
 --[[--------------------------- Job configuration --------------------------]]--
@@ -91,14 +84,38 @@ local GDParams               = constants.GDParams
 
 local wc = nil
 do
+    local featureList           = {}
+    local featureMap            = {}
     local randomVertexIds       = {} -- List of vertices
     local taskPhases            = {} -- taskName -> phase
-    local taskDeploymentConfigs = {} -- taskName -> config
+    local taskDeploymentConfigs = {} -- taskName:uid_type -> config
     local taskDataSet           = {} -- taskName -> data_set_path
     local jobID                 = math.random(0, math.pow(2, 16))
 
     local predictionReportSamplingProb = GDParams['p.report.prediction']
     local calibrationBucketPercents    = GDParams['calibration.bucket.percents']
+
+    -- Open/Parse file with features
+    local fd = io.open(fio.pathjoin(DATASET_PATH, 'features.txt'))
+    assert(fd, "Can't open file for reading")
+    local line, input = fd:read('*a'), nil
+    assert(line, "Bad input")
+    local n = 1
+    while true do
+        if line:match('\n') ~= nil then
+            input, line = line:match('([^\n]+)\n(.*)')
+        elseif #line > 0 then
+            input = line
+            line = ''
+        else
+            break
+        end
+        table.insert(featureList, input)
+        featureMap[input] = n
+        n = n + 1
+    end
+    log.info("<worker_context> Found %d features", #featureList)
+    fd:close()
 
     local fd = io.open(fio.pathjoin(DATASET_PATH, 'express_prediction_config.json'))
     assert(fd, "Can't open file for reading")
@@ -131,6 +148,8 @@ do
     local dataSetKeysTypes = {'email', 'okid', 'vkid'}
 
     wc = setmetatable({
+        featureList                  = featureList,
+        featureMap                   = featureMap,
         randomVertexIds              = randomVertexIds,
         taskPhases                   = taskPhases,
         taskDeploymentConfigs        = taskDeploymentConfigs,
@@ -265,6 +284,12 @@ do
             log.info("<worker_context> Done loading dataSet for '%s'", name)
         end
     end
+
+    log.info('<worker_context> Initialized:')
+    log.info('<worker_context> taskDeploymentConfigs:')
+    fun.iter(taskDeploymentConfigs):each(function(name, config)
+        log.info('<worker_context> %s -> %s', name, json.encode(config))
+    end)
 end
 
 local node_common_methods = {
@@ -299,7 +324,7 @@ local node_master_methods = {
         log.info('<MASTER> Initializing')
     end,
     work = function(self)
-        local val = self:get_value()
+        local value = self:get_value()
 
         if self:get_superstep() == 1 then
             for name, _ in pairs(wc.taskPhases) do
@@ -307,7 +332,7 @@ local node_master_methods = {
                 self:add_vertex({
                     name     = name,
                     vtype    = vertex_type.TASK,
-                    features = val.features,
+                    features = value.features,
                     status   = node_status.NEW
                 })
             end
@@ -330,8 +355,8 @@ local node_task_methods = {
                 format = {
                     [1] = {name = 'id',           type = 'num'  },
                     [2] = {name = 'task_name',    type = 'str'  },
-                    [3] = {name = 'target_round', type = 'num'  },
-                    [4] = {name = 'suffix',       type = 'str'  },
+                    [3] = {name = 'suffix',       type = 'str'  },
+                    [4] = {name = 'target_round', type = 'num'  },
                     [5] = {name = 'target',       type = 'num'  },
                     [6] = {name = 'features',     type = 'array'},
                 }
@@ -342,7 +367,7 @@ local node_task_methods = {
             })
             space:create_index('name', {
                 type   = 'TREE',
-                parts  = {2, 'STR', 3, 'NUM', 4, 'STR'},
+                parts  = {2, 'STR', 3, 'STR', 4, 'NUM'},
                 unique = false
             })
         end
@@ -359,12 +384,12 @@ local node_task_methods = {
             for _, task in wc.taskDataSet[taskName][2]:pairs() do
                 local ktype, kname, value = task:unpack()
                 local name = ('%s:%s'):format(ktype, kname)
-                log.info('<iterateDataSet, %s> send_message to <%s>', taskName, name)
+                -- log.info('<iterateDataSet, %s> send_message to <%s>', taskName, name)
                 self:send_message(name, {
                     sender   = self:get_name(),
                     command  = message_command.FETCH,
                     target   = value,
-                    features = {}
+                    features = NULL
                 })
             end
             log.info('<task node, %s> SELECTION phase done', taskName)
@@ -460,7 +485,7 @@ local node_task_methods = {
             log.info('<task node, %s> PREDICTION phase', taskName)
             log.info("Calibrated data:")
             local n = 1
-            for _, msg, _ in self:pairs_messages() do
+            for _, msg in self:pairs_messages() do
                 log.info('%d> %f', n, msg.target)
                 n = n + 1
             end
@@ -491,13 +516,6 @@ local node_task_methods = {
                 return ds:getPercentile((p + 1) * calibrationBucketPercents)
             end)
         ):totable()
---[[--
-        for p = 1, nPercentiles do
-            table.insert(parametersWithCalibration,
-                         ds:getPercentile((p + 1) * calibrationBucketPercents)
-            )
-        end
---]]--
         return parametersWithCalibration
     end,
     train = function(self, taskName, recordounts, dim, maxIter,
@@ -517,44 +535,73 @@ local node_task_methods = {
         local trainAverageLoss = nil
         local testAverageLoss  = nil
 
+        local function get_rtargets(self)
+            local acc = {n = 0}
+            self.dataSetSpace.index.name:pairs{taskName, 'test'}
+                                        :each(function(tuple)
+                local target_round = tuple[4]
+                if acc[acc.n] ~= target_round then
+                    table.insert(acc, target_round)
+                    acc.n = acc.n + 1
+                end
+            end)
+            return acc
+        end
+
+        local rtargets = get_rtargets(self)
+
         for nIter = 1, maxIter do
             local trainBatchLoss = 0.0
             local testBatchLoss  = 0.0
-            local trainBatchGradient = fun.duplicate(0.0):take(300):totable()
-            local last = self.dataSetSpace:select(nil, {limit=1})[1]
-            while true do
-                if last == nil then
-                    break
+            local trainBatchGradient = fun.duplicate(0.0):take(dim):totable()
+            for _, rtarget in ipairs(rtargets) do
+                do
+                    local batchSize = testBatchSize
+                    while batchSize > 0 do
+                        self.dataSetSpace.index.name:pairs{taskName, 'test', rtarget}
+                                                    :take(batchSize)
+                                                    :all(function(tuple)
+                            local target, features = tuple:unpack(5, 6)
+                            -- log.info('- msgid: %d', tuple[1])
+                            -- log.info('- target: %f', target)
+                            -- log.info('- features')
+                            -- log_features(('task node, %s'):format(taskName), features, 500)
+                            local lg = gd:lossAndGradient(target, features, param)
+                            testBatchLoss = testBatchLoss + lg[1] / testBatchSize
+                            -- if fun.iter(lg):all(function(val) return val == 0 end) == true then
+                            --     log.info('<task node, %s> lossAndGradient has zeroed result', taskName)
+                            -- end
+                            batchSize = batchSize - 1
+                            -- log.info('"test" message processed, %d left', batchSize)
+                            return batchSize > 0
+                        end)
+                    end
                 end
-                local target, suffix = last:unpack(3, 4)
-                local isTrain = (suffix == 'train')
-                local batchSize = isTrain and trainBatchSize or testBatchSize
-                --
-                while batchSize > 0 do
-                    self.dataSetSpace.index.name:pairs{taskName, target, suffix}
-                                                :take(batchSize)
-                                                :any(function(tuple)
-                        local target, features = last:unpack(5, 6)
-                        local lg = gd:lossAndGradient(target, features, param)
-                        if isTrain then
+                do
+                    local batchSize = trainBatchSize
+                    while batchSize > 0 do
+                        self.dataSetSpace.index.name:pairs{taskName, 'train', rtarget}
+                                                    :take(batchSize)
+                                                    :all(function(tuple)
+                            local target, features = tuple:unpack(5, 6)
+                            -- log.info('- target: %f', target)
+                            -- log.info('- features')
+                            -- log_features(('task node, %s'):format(taskName), features, 500)
+                            local lg = gd:lossAndGradient(target, features, param)
                             trainBatchLoss = trainBatchLoss + lg[1] / trainBatchSize
                             for i = 2, #lg do
                                 trainBatchGradient[i - 1] = trainBatchGradient[i - 1] + lg[i]
                             end
-                        else
-                            testBatchLoss = testBatchLoss + lg[1] / testBatchSize
-                        end
-                        batchSize = batchSize - 1
-                        return batchSize > 0
-                    end)
+                            -- if fun.iter(lg):all(function(val) return val == 0 end) == true then
+                            --     log.info('<task node, %s> lossAndGradient has zeroed result', taskName)
+                            -- end
+                            batchSize = batchSize - 1
+                            -- log.info('"train" message processed, %d left', batchSize)
+                            return batchSize > 0
+                        end)
+                    end
                 end
-                --
-                last = self.dataSetSpace.index.name:select({taskName, target, suffix}, {
-                    iterator = 'GT',
-                    limit = 1
-                })[1]
             end
-
             if trainAverageLoss == nil then
                 trainAverageLoss = trainBatchLoss
             else
@@ -596,10 +643,11 @@ local node_task_methods = {
         local cnt = 0
 
         for _, msg in self:pairs_messages() do
-            local target = math_round(msg.target)
+            local rtarget = math_round(msg.target)
             local suffix = math.random() < testVerticesFraction and SUFFIX_TEST or SUFFIX_TRAIN
 
-            self.dataSetSpace:auto_increment{taskName, target, suffix, msg.target, msg.features}
+            self.dataSetSpace:auto_increment{taskName, suffix, rtarget,
+                                             msg.target, msg.features}
             cnt = cnt + 1
         end
         local last = self.dataSetSpace.index.name:select(taskName, {
@@ -609,22 +657,21 @@ local node_task_methods = {
             if last == nil or last[2] ~= taskName then
                 break
             end
-            local target, suffix = last:unpack(3, 4)
-            local cnt = self.dataSetSpace.index.name:count{taskName, target, suffix}
+            local suffix, target = last:unpack(3, 4)
+            local cnt = self.dataSetSpace.index.name:count{taskName, suffix, target}
             log.info('<task node, %s> Written data set: %s_%d_%s -> %d',
                      taskName, taskName, target, suffix, cnt)
             last = self.dataSetSpace.index.name:select(
-                {taskName, target, suffix},
-                {limit = 1, iterator = 'gt'}
+                {taskName, suffix, target}, {limit = 1, iterator = 'GT'}
             )[1]
         end
         return cnt
     end,
-    removeDataSetLocalSpace = function(self, taskName, target, suffix)
+    removeDataSetLocalSpace = function(self, taskName, suffix, target)
         log.info('<task node, %s> Removing all records for %s_%d_%s',
-                 taskName, taskName, target, suffix)
+                 taskName, taskName, suffix, target)
         local to_remove = self.dataSetSpace.index.name
-                                           :pairs{taskName, target, suffix}
+                                           :pairs{taskName, suffix, target}
                                            :map(function(tuple)
             return tuple[1]
         end):totable()
@@ -653,8 +700,8 @@ local node_data_methods = {
         for _, msg in self:pairs_messages() do
             -- return feature vector to master
             if msg.command == message_command.FETCH then
-                log.info("<data node, '%s'->'%s'> processing command FETCH",
-                         self:get_name(), msg.sender)
+                -- log.info("<data node, '%s'->'%s'> processing command FETCH",
+                --          self:get_name(), msg.sender)
                 self:send_message(msg.sender, {
                     sender   = self:get_name(),
                     command  = message_command.NONE,
@@ -663,14 +710,15 @@ local node_data_methods = {
                 })
             -- compute raw prediction and return to master
             elseif msg.command == message_command.PREDICT_CALIBRATION then
-                log.info("<data node, '%s'->'%s'> processing command PREDICT_CALIBRATION",
-                         self:get_name(), msg.sender)
+                -- log.info("<data node, '%s'->'%s'> processing command PREDICT_CALIBRATION",
+                --          self:get_name(), msg.sender)
                 local prediction = self:predictRaw(msg.features)
+                -- log.info('<data node, "%s"> prediction is %f', self:get_name(), prediction)
                 self:send_message(msg.sender, {
                     sender   = self:get_name(),
                     command  = message_command.NONE,
                     target   = prediction,
-                    features = {}
+                    features = NULL
                 })
             else
                 assert(false)
@@ -686,11 +734,12 @@ local node_data_methods = {
 
             -- predict and save
             if msg ~= nil and msg.command == message_command.PREDICT then
-                log.info('<data node, %s> processing command PREDICT from aggregator', self:get_name())
+                -- log.info('<data node, %s> processing command PREDICT from aggregator', self:get_name())
                 isPredictionPhase = true
                 local calibratedPrediction = self:predictCalibrated(
                     msg.features, wc.calibrationBucketPercents
                 )
+                -- log.info('<data node, %s> calibratedPrediction %f', self:get_name(), calibratedPrediction)
 
                 -- return to master for report, maybe
                 if math.random() < wc.predictionReportSamplingProb then
@@ -698,7 +747,7 @@ local node_data_methods = {
                         sender   = self:get_name(),
                         command  = message_command.NONE,
                         target   = calibratedPrediction,
-                        features = {}
+                        features = NULL
                     })
                 end
 
@@ -714,26 +763,26 @@ local node_data_methods = {
             end
         end
 
-        if isPredictionPhase then
+        if isPredictionPhase == true then
             if #predictions > 0 then
                 log.info('<data node, %s> Prediction phase done', self:get_name())
                 log.info('<data node, %s> %s', self:get_name(), json.encode(predictions))
             end
             -- Update value
-            local val = self:get_value()
-            val.features = predictions
-            self:set_value(val)
+            local value = self:get_value()
+            value.features = predictions
+            self:set_value(value)
             -- Make it inactive
             self:set_status(node_status.INACTIVE)
             self:vote_halt()
         end
     end,
-    predictRaw = function(self, param)
-        local prediction = 0.0
+    predictRaw = function(self, parameters)
         local features = self:get_value().features
-        for i, feature in ipairs(features) do
-            prediction = prediction + feature * param[i]
-        end
+        local prediction = fun.iter(features):zip(parameters)
+                              :map(function(feature, parameter)
+            return feature * parameter
+        end):sum()
         return prediction
     end,
     predictCalibrated = function(self, param, calibrationBucketPercents)
@@ -744,7 +793,7 @@ local node_data_methods = {
               percentileStep = math.floor(percentileStep * calibrationBucketPercents)
         local prediction = self:predictRaw(param)
 
-        local calibratedPrediction = -1
+        local calibratedPrediction = nil
         -- log.info('param_len %d', #param)
         -- log.info('featu_len %d', dim)
         for i = 1, nPercentiles do
@@ -753,7 +802,7 @@ local node_data_methods = {
                 break
             end
         end
-        if calibratedPrediction == -1 then
+        if calibratedPrediction == nil then
             calibratedPrediction = math.random(0, percentileStep)
             calibratedPrediction = calibratedPrediction + nPercentiles * percentileStep
         end
@@ -826,7 +875,7 @@ local function generate_worker_uri(cnt)
 end
 
 local common_cfg = {
-    master         = 'localhost:3301',
+    master         = 'sh7.tarantool.org:3301',
     workers        = generate_worker_uri(8),
     compute        = computeGradientDescent,
     combiner       = nil,
@@ -842,20 +891,6 @@ local common_cfg = {
 if worker == 'worker' then
     worker = pworker.new('test', common_cfg)
     wc:addAggregators(worker)
-    --[[--
-    local space = worker.data_space
-    space:pairs():each(function(tuple)
-        local name, is_halted, value, edges = tuple:unpack(1, 3)
-        local name1, _ = utils.obtain_type(name)
-        if name1:match('MASTER') ~= nil or value.key.vid:match('MASTER') then
-            log.info('found MASTER')
-            value.vtype = vertex_type.MASTER
-            space:replace{name, is_halted, value, edges}
-        end
-    end)
-    log.info('DONE')
-    box.snapshot()
-    --]]--
 else
     xpcall_tb(function()
         local master = pmaster.new('test', common_cfg)
@@ -864,24 +899,11 @@ else
         if arg[1] == 'load' then
             -- master:preload()
             master:preload_on_workers()
-            --[[--
-            master.mpool:by_id('MASTER:'):put('vertex.store', {
-                key = {vid = 'MASTER', category = 0},
-                features = fun.range(300):map(function()
-                    return 0.0
-                end):totable(),
-                vtype =  constants.vertex_type.MASTER,
-                status = constants.node_status.NEW
-            })
-            master.mpool:flush()
-            --]]--
             master.mpool:send_wait('snapshot')
         end
         master.mpool:by_id('MASTER:'):put('vertex.store', {
             key      = {vid = 'MASTER', category = 0},
-            features = fun.range(300):map(function()
-                return 0.0
-            end):totable(),
+            features = fun.duplicate(0.0):take(#wc.featureList):totable(),
             vtype    = constants.vertex_type.MASTER,
             status   = constants.node_status.NEW
         })

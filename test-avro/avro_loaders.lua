@@ -167,12 +167,13 @@ local function process_avro_file(self, filename, cnt_cur, cnt_all)
            key_object.vid == constants.MASTER_VERTEX_TYPE then
             vtype = constants.vertex_type.MASTER
         end
-        self:store_vertex{
+        local vertex = {
             key      = key_object,
             features = fea_object,
             vtype    = vtype,
             status   = constants.node_status.NEW,
         }
+        self:store_vertex(vertex)
         line:release()
         count = count + 1
         fiber.yield()
