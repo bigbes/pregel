@@ -28,7 +28,7 @@ local vertex_write_solution = vertex.vertex_private_methods.write_solution
 
 local workers = {}
 
-local RECONNECT_AFTER = 0.5
+local RECONNECT_AFTER = 5
 
 local TOPMT_EDGE_DELETE   = 0
 local TOPMT_VERTEX_DELETE = 1
@@ -147,9 +147,11 @@ local worker_mt = {
 
             local function tuple_process(acc, tuple)
                 if acc % 1000 == 0 then
+                    fiber.yield()
+                end
+                if acc % 10000 == 0 then
                     log.info('Processed %d/%d vertices', acc,
                              self.data_space:len())
-                    fiber.yield()
                 end
                 local vertex_object = self.vertex_pool:pop(tuple)
                 vertex_object.__superstep = superstep

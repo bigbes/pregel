@@ -26,17 +26,18 @@ port_offset = port_offset or 0
 
 if worker == 'worker' then
     box.cfg{
-        wal_mode = 'none',
-        slab_alloc_arena = 2.5,
-        listen = '0.0.0.0:' .. tostring(3301 + port_offset),
-        background = true,
-        logger_nonblock = false
+        wal_mode           = 'none',
+        slab_alloc_arena   = 10,
+        -- slab_alloc_maximal = 4*1024*1024,
+        listen             = '0.0.0.0:' .. tostring(3301 + port_offset),
+        background         = true,
+        logger_nonblock    = true
     }
 else
     box.cfg{
-        wal_mode = 'none',
-        listen = '0.0.0.0:' .. tostring(3301 + port_offset),
-        logger_nonblock = false
+        wal_mode           = 'none',
+        listen             = '0.0.0.0:' .. tostring(3301 + port_offset),
+        logger_nonblock    = true
     }
 end
 
@@ -880,8 +881,12 @@ local common_cfg = {
     compute        = computeGradientDescent,
     combiner       = nil,
     master_preload = avro_loaders.master,
-    worker_preload = avro_loaders.worker,
-    preload_args   = DATASET_PATH,
+    worker_preload = avro_loaders.worker_additional,
+    preload_args   = {
+        path          = DATASET_PATH,
+        feature_count = 300,
+        vertex_count  = 17600000,
+    },
     squash_only    = false,
     pool_size      = 250,
     delayed_push   = false,

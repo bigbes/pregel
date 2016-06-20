@@ -2,6 +2,7 @@ local fio = require('fio')
 local fun = require('fun')
 local log = require('log')
 local json = require('json')
+local uuid = require('uuid')
 local fiber = require('fiber')
 local clock = require('clock')
 
@@ -10,6 +11,9 @@ local ploader = require('pregel.loader')
 
 local utils = require('utils')
 local constants = require('constants')
+
+local FEATURE_COUNT = 300
+local VERTEX_COUNT  = 16000000
 
 --[[--
 -- Avro schema (in JSON representation) is:
@@ -103,7 +107,15 @@ local constants = require('constants')
 -- }
 --]]--
 
-local function process_avro_file(self, filename, cnt_cur, cnt_all)
+local function append_feature_vector(feature_count, features)
+    if #features < feature_count then
+        for k = #features + 1, feature_count do
+            table.insert(features, math.random() * math.random(-30, 30))
+        end
+    end
+end
+
+local function process_avro_file(self, filename, cnt_cur, cnt_all, feature_count)
     log.info('%03d/%03d processing %s', cnt_cur, cnt_all, filename)
     local avro_file = pavro.open(filename)
     local count = 0
@@ -160,6 +172,9 @@ local function process_avro_file(self, filename, cnt_cur, cnt_all)
                 assert(tst == nil, 'timestamp is not nil')
                 fea_object[fid] = fval
             end
+            if feature_count ~= nil then
+                append_feature_vector(feature_count, fea_object)
+            end
         end
         local vtype = constants.vertex_type.DATA
         if type(key_object.vid) == 'string' and
@@ -182,6 +197,7 @@ local function process_avro_file(self, filename, cnt_cur, cnt_all)
                 count, clock.time() - begin_time)
     avro_file:close()
     fiber.yield()
+    return count
 end
 
 local function master_avro_loader(master, path)
@@ -216,7 +232,77 @@ local function worker_avro_loader(worker, path)
     return ploader.new(worker, loader)
 end
 
+local function generate_random_features(feature_count)
+    return fun.range(feature_count):map(function()
+        return math.random() * math.random(-30, 30)
+    end):totable()
+end
+
+local function generate_random_name()
+    local name = {
+        vid   = '',
+        email = uuid.str(),
+    }
+    local b = math.random(0, 1000000)
+    if b % 739 == 0 then
+        name['vkid'] = math.random(200000, 10000000)
+    elseif b % 839 == 0 then
+        name['okid'] = math.random(200000, 10000000)
+    end
+    return name
+end
+
+local function generate_random_vertex(feature_count)
+    return {
+        key      = generate_random_name(),
+        features = generate_random_features(feature_count),
+        vtype    = constants.vertex_type.DATA,
+        status   = constants.node_status.NEW
+    }
+end
+
+local function worker_additional_avro_loader(worker, opts)
+    assert(type(opts) == 'table')
+    assert(type(opts.path) == 'string')
+    local path = opts.path
+    local feature_count = opts.feature_count or FEATURE_COUNT
+    local vertex_count  = opts.vertex_count  or VERTEX_COUNT
+    local function loader(self, current_idx, worker_count)
+        local avro_path  = fio.pathjoin(path, '*.avro')
+        local avro_files = fun.iter(fio.glob(avro_path)):filter(function(filename)
+            local avrofile_no = tonumber(filename:match('part%-m%-(%d+).avro'))
+            if avrofile_no % worker_count == current_idx - 1 then
+                return true
+            end
+            return false
+        end):totable()
+        table.sort(avro_files)
+        log.info('%d found files found in path %s', #avro_files, avro_path)
+        local vertex_processed = 0
+        for idx, filename in ipairs(avro_files) do
+            vertex_processed = vertex_processed + process_avro_file(self, filename, idx,
+                                                                    #avro_files, feature_count)
+        end
+        if vertex_processed < vertex_count then
+            vertex_count = vertex_count - vertex_processed
+            vertex_count = math.floor(vertex_count / worker_count)
+            fun.range(vertex_count):each(function(id)
+                if id % 100 == 0 then
+                    fiber.yield()
+                end
+                if id % 100000 == 0 then
+                    log.info('<preload> generated %d/%d vertices', id, vertex_count)
+                end
+                local vertex = generate_random_vertex(feature_count)
+                self:store_vertex(vertex)
+            end)
+        end
+    end
+    return ploader.new(worker, loader)
+end
+
 return {
     master = master_avro_loader,
     worker = worker_avro_loader,
+    worker_additional = worker_additional_avro_loader
 }

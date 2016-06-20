@@ -12,7 +12,11 @@ local json = require('json')
 local vertex_private_methods = {
     apply = function(self, tuple)
         self.__modified = false
-        self.__id, self.__halt, self.__value, self.__edges = tuple:unpack()
+        self.__id, self.__halt, self.__value, self.__edges = tuple:unpack(1, 4)
+        -- self.__id, self.__halt = tuple:unpack(1, 2)
+        -- self.__tuple = tuple
+        -- self.__value = nil
+        -- self.__edges = nil
         return self
     end,
     compute = function(self)
@@ -82,6 +86,9 @@ local vertex_methods = {
         end
     end,
     pairs_edges = function(self)
+        -- if self.__edges == nil then
+        --     self.__edges = self.__tuple[4]
+        -- end
         local last = 0
         return function(pos)
             last = last + 1
@@ -102,6 +109,9 @@ local vertex_methods = {
         )
     end,
     get_value = function(self)
+        -- if self.__value == nil then
+        --     self.__value = self.__tuple[3]
+        -- end
         return self.__value
     end,
     set_value = function(self, new)
