@@ -16,7 +16,9 @@ local avro      = require('pregel.avro')
 local xpcall_tb = require('pregel.utils').xpcall_tb
 local deepcopy  = require('pregel.utils.copy').deep
 
-local algo         = require('algo')
+local GradientDescent   = require('math.gd').GradientDescent
+local PercentileCounter = require('math.pc').PercentileCounter
+
 local avro_loaders = require('avro_loaders')
 local constants    = require('constants')
 local utils        = require('utils')
@@ -317,6 +319,37 @@ local node_common_methods = {
             ))
         end
     end,
+    predictRaw = function(self, parameters)
+        local features = self:get_value().features
+        local prediction = fun.iter(features):zip(parameters)
+                              :map(function(feature, parameter)
+            return feature * parameter
+        end):sum()
+        return prediction
+    end,
+    predictCalibrated = function(self, param, calibrationBucketPercents)
+        local features = self:get_value().features
+        local dim = #features
+        local nPercentiles = math.floor(100 / calibrationBucketPercents) - 1
+        local percentileStep = GDParams['max.predicted.calibrated.value'] / 100
+              percentileStep = math.floor(percentileStep * calibrationBucketPercents)
+        local prediction = self:predictRaw(param)
+
+        local calibratedPrediction = nil
+        -- log.info('param_len %d', #param)
+        -- log.info('featu_len %d', dim)
+        for i = 1, nPercentiles do
+            if prediction < param[dim + i] then
+                calibratedPrediction = math.random(0, percentileStep) + i * percentileStep
+                break
+            end
+        end
+        if calibratedPrediction == nil then
+            calibratedPrediction = math.random(0, percentileStep)
+            calibratedPrediction = calibratedPrediction + nPercentiles * percentileStep
+        end
+        return calibratedPrediction
+    end
 }
 
 local node_master_methods = {
@@ -452,7 +485,7 @@ local node_task_methods = {
         elseif phase == task_phase.CALIBRATION then
 
             log.info('<task node, %s> CALIBRATION phase', taskName)
-            local ds = algo.PercentileCounter()
+            local ds = PercentileCounter()
             for _, msg, _ in self:pairs_messages() do
                 ds:addValue(msg.target)
             end
@@ -528,7 +561,7 @@ local node_task_methods = {
         log.info('<task node, %s> - loss averaging factor %f',       taskName, alpha)
         log.info('<task node, %s> - loss convergence factor %f',     taskName, epsilon)
 
-        local gd = algo.GradientDescent('hinge', 'l2')
+        local gd = GradientDescent('hinge', 'l2')
         local param = gd:initialize(dim)
         log.info('<task node, %s> initialized model parameters to:', taskName)
         log_features(('task node, %s'):format(taskName), param)
@@ -778,37 +811,6 @@ local node_data_methods = {
             self:vote_halt()
         end
     end,
-    predictRaw = function(self, parameters)
-        local features = self:get_value().features
-        local prediction = fun.iter(features):zip(parameters)
-                              :map(function(feature, parameter)
-            return feature * parameter
-        end):sum()
-        return prediction
-    end,
-    predictCalibrated = function(self, param, calibrationBucketPercents)
-        local features = self:get_value().features
-        local dim = #features
-        local nPercentiles = math.floor(100 / calibrationBucketPercents) - 1
-        local percentileStep = GDParams['max.predicted.calibrated.value'] / 100
-              percentileStep = math.floor(percentileStep * calibrationBucketPercents)
-        local prediction = self:predictRaw(param)
-
-        local calibratedPrediction = nil
-        -- log.info('param_len %d', #param)
-        -- log.info('featu_len %d', dim)
-        for i = 1, nPercentiles do
-            if prediction < param[dim + i] then
-                calibratedPrediction = math.random(0, percentileStep) + i * percentileStep
-                break
-            end
-        end
-        if calibratedPrediction == nil then
-            calibratedPrediction = math.random(0, percentileStep)
-            calibratedPrediction = calibratedPrediction + nPercentiles * percentileStep
-        end
-        return calibratedPrediction
-    end
 }
 
 --[[------------------------------------------------------------------------]]--
@@ -870,10 +872,23 @@ local function computeGradientDescent(vertex)
 end
 
 local function generate_worker_uri(cnt)
+    cnt = cnt or 8
+    local sh7servers = fun.range(cnt):map(function(k)
+        return 'sh7.tarantool.org:' .. tostring(3301 + k)
+    end)
+    local sh8servers = fun.range(cnt):map(function(k)
+        return 'sh8.tarantool.org:' .. tostring(3301 + k)
+    end)
+    return sh7servers:chain(sh8servers):totable()
+end
+
+--[[--
+local function generate_worker_uri(cnt)
     return fun.range(cnt or 4):map(function(k)
         return 'localhost:' .. tostring(3301 + k)
     end):totable()
 end
+--]]--
 
 local common_cfg = {
     master         = 'sh7.tarantool.org:3301',
