@@ -207,6 +207,9 @@ local vertex_methods = {
                     {src, dest}
             )
         end
+    end,
+    get_worker_context = function(self)
+        return self.__pregel.worker_context
     end
 }
 
@@ -271,5 +274,6 @@ end
 return {
     vertex_private_methods = vertex_private_methods,
     new = vertex_new,
-    pool_new = vertex_pool_new
+    pool_new = vertex_pool_new,
+    vertex_methods = vertex_methods,
 }

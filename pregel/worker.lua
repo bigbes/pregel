@@ -375,6 +375,7 @@ local worker_new = function(name, options)
     local pool_size   = options.pool_size or 1000
     local obtain_name = options.obtain_name
     local is_delayed  = options.delayed_push
+    local wrk_context = options.worker_context
     if is_delayed == nil then
         is_delayed = false
     end
@@ -386,17 +387,18 @@ local worker_new = function(name, options)
     assert(type(master_uri) == 'string', 'options.master must be string')
 
     local self = setmetatable({
-        name         = name,
-        workers      = worker_uris,
-        master_uri   = master_uri,
-        preload_func = nil,
-        mpool        = mpool.new(name, worker_uris, {
-            msg_count  = pool_size,
-            is_delayed = is_delayed
+        name           = name,
+        workers        = worker_uris,
+        master_uri     = master_uri,
+        preload_func   = nil,
+        mpool          = mpool.new(name, worker_uris, {
+            msg_count    = pool_size,
+            is_delayed   = is_delayed
         }),
-        aggregators  = {},
-        in_progress  = 0,
-        obtain_name  = obtain_name
+        aggregators    = {},
+        in_progress    = 0,
+        obtain_name    = obtain_name,
+        worker_context = wrk_context
     }, worker_mt)
 
     local preload = options.worker_preload

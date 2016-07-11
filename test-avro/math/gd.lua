@@ -47,7 +47,7 @@ local function L2_new()
             valueAndGradient = function(self, t, x, parameters)
                 local result = nil
                 local y = scalar_product(x, parameters)
-                result = fun.range(2, #x + 1):zip(fun.iter(parameters):skip(1))
+                result = fun.range(2, #x + 1):zip(fun.iter(parameters):drop_n(1))
                             :map(function(idx, p_i)
                                 if idx == 2 then
                                     return 2, 0

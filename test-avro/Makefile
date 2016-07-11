@@ -1,6 +1,6 @@
 # TNT_PATH = /Users/blikh/src/work/tarantool/src/tarantool
-TNT_PATH = tarantool
-COUNT    = 8
+TNT_PATH := tarantool
+COUNT    := 8
 
 clean_lr:
 	rm -f var/*.log

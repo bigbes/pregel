@@ -2,18 +2,18 @@ local fun = require('fun')
 
 local table_new = require('table.new')
 
-local qsort = require('math.qsort').qsort2a
+local qsort2a = require('math.qsort').qsort2a
 
 -- truth:       is array of integers
 -- probability: is array of doubles
-local function measure_auc(truth, probability)
+local function MeasureAUC(truth, probability)
     local truth_len = #truth
     assert(truth_len == #probability)
 
     local pos = fun.sum(truth)
     local neg = truth_len - pos
 
-    local prediction, label = qsort.qsort2a(truth, probability)
+    local prediction, label = qsort2a(truth, probability)
 
     local rank = table_new(truth_len, 0)
     for i = 1, truth_len do
@@ -47,3 +47,7 @@ local function measure_auc(truth, probability)
 
     return auc
 end
+
+return {
+    MeasureAUC = MeasureAUC
+}
