@@ -268,7 +268,7 @@ local function worker_additional_avro_loader(worker, opts)
     local feature_count = opts.feature_count or FEATURE_COUNT
     local vertex_count  = opts.vertex_count  or nil
     local function loader(self, current_idx, worker_count)
-        local avro_path  = fio.pathjoin(path, '*.avro')
+        local avro_path  = fio.pathjoin(path, 'tokens', '*.avro')
         local avro_files = fun.iter(fio.glob(avro_path)):filter(function(filename)
             local avrofile_no = tonumber(filename:match('part%-m%-(%d+).avro'))
             if avrofile_no % worker_count == current_idx - 1 then
