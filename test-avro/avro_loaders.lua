@@ -266,7 +266,7 @@ local function worker_additional_avro_loader(worker, opts)
     assert(type(opts.path) == 'string')
     local path = opts.path
     local feature_count = opts.feature_count or FEATURE_COUNT
-    local vertex_count  = opts.vertex_count  or VERTEX_COUNT
+    local vertex_count  = opts.vertex_count  or nil
     local function loader(self, current_idx, worker_count)
         local avro_path  = fio.pathjoin(path, '*.avro')
         local avro_files = fun.iter(fio.glob(avro_path)):filter(function(filename)
@@ -283,7 +283,7 @@ local function worker_additional_avro_loader(worker, opts)
             vertex_processed = vertex_processed + process_avro_file(self, filename, idx,
                                                                     #avro_files, feature_count)
         end
-        if vertex_processed < vertex_count then
+        if vertex_count and vertex_processed < vertex_count then
             vertex_count = vertex_count - vertex_processed
             vertex_count = math.floor(vertex_count / worker_count)
             fun.range(vertex_count):each(function(id)

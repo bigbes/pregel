@@ -361,7 +361,7 @@ local common_cfg = {
     preload_args   = {
         path          = DATASET_PATH,
         feature_count = 300,
-        vertex_count  = 17600000,
+        -- vertex_count  = 17600000,
     },
     squash_only    = false,
     pool_size      = 250,

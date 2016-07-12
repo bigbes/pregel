@@ -35,6 +35,10 @@ local TOPMT_VERTEX_DELETE = 1
 local TOPMT_VERTEX_STORE  = 2
 local TOPMT_EDGE_STORE    = 3
 
+local function count_active(acc, tuple)
+    return acc + (tuple[2] == false and 1 or 0)
+end
+
 local info_functions = setmetatable({
     ['vertex.store'] = function(instance, args)
         return instance:vertex_store(args)
@@ -81,12 +85,8 @@ local info_functions = setmetatable({
         fiber.sleep(10)
     end,
     ['count'] = function(instance, args)
-        instance.in_progress = 0
-        instance.data_space:pairs():each(function(tuple)
-            if tuple[2] == false then
-                instance.in_progress = instance.in_progress + 1
-            end
-        end)
+        instance.in_progress = instance.data_space:pairs():reduce(count_active, 0)
+        log.info('<count> Found %d active vertices', instance.in_progress)
     end,
     ['preload'] = function(instance)
         instance:preload()
@@ -94,7 +94,7 @@ local info_functions = setmetatable({
 }, {
     __index = function(self, op)
         return function(k)
-            error('unknown operation: %s', op)
+            error('unknown message type: %s', op)
         end
     end
 })
