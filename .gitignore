@@ -9,3 +9,4 @@ cmake_install.cmake
 *.so
 var
 var.bkp
+worker-*.lua

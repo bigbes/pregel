@@ -31,7 +31,7 @@ port_offset = port_offset or 0
 if worker == 'worker' then
     box.cfg{
         wal_mode           = 'none',
-        slab_alloc_arena   = 10,
+        slab_alloc_arena   = 3,
         -- slab_alloc_maximal = 4*1024*1024,
         listen             = '0.0.0.0:' .. tostring(3301 + port_offset),
         background         = true,
@@ -39,6 +39,7 @@ if worker == 'worker' then
     }
 else
     box.cfg{
+        slab_alloc_arena   = 0.1,
         wal_mode           = 'none',
         listen             = '0.0.0.0:' .. tostring(3301 + port_offset),
         logger_nonblock    = true
@@ -122,7 +123,7 @@ do
     log.info("<worker_context> Found %d features", #featureList)
     fd:close()
 
-    local fd = io.open(fio.pathjoin(DATASET_PATH, 'express_prediction_config.json'))
+    local fd = io.open(fio.pathjoin(DATASET_PATH, 'prediction_config.json'))
     assert(fd, "Can't open file for reading")
     local input = json.decode(fd:read('*a'))
     assert(input, "Bad input")
@@ -270,7 +271,7 @@ do
             local name   = task_config['name']
             local input  = task_config['input']
             local fname  = check_file(fio.pathjoin(DATASET_PATH, input))
-            local sname  = ('wc_%s_data_set'):format(name)
+            local sname  = ('wc_%s_ds'):format(name)
             local fspace = box.space[sname]
             taskDataSet[name] = {fname, fspace}
             if box.space[sname] == nil then
@@ -331,29 +332,31 @@ local function computeGradientDescent(vertex)
     setmetatable(vertex, vertex_mt)
 end
 
---[[--
 local function generate_worker_uri(cnt)
     cnt = cnt or 8
+    local sh6servers = fun.range(cnt):map(function(k)
+        return 'sh6.tarantool.org:' .. tostring(3301 + k)
+    end)
     local sh7servers = fun.range(cnt):map(function(k)
         return 'sh7.tarantool.org:' .. tostring(3301 + k)
     end)
     local sh8servers = fun.range(cnt):map(function(k)
         return 'sh8.tarantool.org:' .. tostring(3301 + k)
     end)
-    return sh7servers:chain(sh8servers):totable()
+    return sh6servers:chain(sh7servers):chain(sh8servers):totable()
 end
---]]--
 
+--[[--
 local function generate_worker_uri(cnt)
     return fun.range(cnt or 4):map(function(k)
         return 'localhost:' .. tostring(3301 + k)
     end):totable()
 end
-
+--]]--
 
 local common_cfg = {
     master         = 'sh7.tarantool.org:3301',
-    workers        = generate_worker_uri(8),
+    workers        = generate_worker_uri(23),
     compute        = computeGradientDescent,
     combiner       = nil,
     master_preload = avro_loaders.master,

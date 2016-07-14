@@ -33,7 +33,7 @@ local node_task_methods = {
         if self:get_status() == node_status.NEW then
             self:set_status(node_status.WORKING)
         end
-        local space_name = ('task_node_%s_data_set'):format(taskName)
+        local space_name = ('task_node_%s_ds'):format(taskName)
         if box.space[space_name] == nil then
             local space = box.schema.create_space(space_name, {
                 format = {
