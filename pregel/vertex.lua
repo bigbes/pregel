@@ -72,7 +72,7 @@ local vertex_methods = {
     -- * self:send_message    (receiver_id, value)
     -- * self:get_value       ()
     -- * self:set_value       (value)
-    -- * self:get_id          ()
+    -- * self:get_name        ()
     -- * self:get_superstep   ()
     -- * self:get_aggragation (name)
     -- * self:set_aggregation (name, value)
@@ -135,7 +135,7 @@ local vertex_methods = {
     -- * self:add_vertex     (value)
     -- * self:add_edge       ([src = self:get_name(), ]dest, value)
     -- * self:delete_vertex  ([src][, vertices = true])
-    -- * self:delete_edge    ([src = self:get_id(), ]dest)
+    -- * self:delete_edge    ([src = self:get_name(), ]dest)
     --]]--
     add_vertex = function(self, value)
         assert(value ~= nil, 'value is nil')

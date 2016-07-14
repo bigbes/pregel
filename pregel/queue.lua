@@ -1,10 +1,11 @@
 local log = require('log')
 local fun = require('fun')
 local yaml = require('yaml')
+local json = require('json')
 
 local collections = require('pregel.utils.collections')
-local error = require('pregel.utils').error
 local is_callable = require('pregel.utils').is_callable
+local error = require('pregel.utils').error
 
 local tube_list
 

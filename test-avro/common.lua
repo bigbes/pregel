@@ -384,7 +384,7 @@ else
         if arg[1] == 'load' then
             -- master:preload()
             master:preload_on_workers()
-            master.mpool:send_wait('snapshot')
+            master:save_snapshot()
         end
         master.mpool:by_id('MASTER:'):put('vertex.store', {
             key      = {vid = 'MASTER', category = 0},

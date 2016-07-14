@@ -98,6 +98,9 @@ local master_mt = {
             self.aggregators[name] = aggregator.new(name, self, opts)
             return self
         end,
+        save_snapshot = function(self)
+            master.mpool:send_wait('snapshot')
+        end,
     }
 }
 
@@ -110,10 +113,8 @@ local master_mt = {
 -- }
 --
 local master_new = function(name, options)
-    local connections = options.connections
     local workers     = options.workers or {}
     local pool_size   = options.pool_size or 1000
-    local key_parts   = options.key_parts or {'STR'}
     local obtain_name = options.obtain_name
 
     assert(is_callable(obtain_name),      'options.obtain_name must be callable')
@@ -125,7 +126,6 @@ local master_new = function(name, options)
         mpool        = mpool.new(name, workers, {
             msg_count = pool_size
         }),
-        key_parts    = key_parts,
         obtain_name  = obtain_name,
         aggregators  = {}
     }, master_mt)
@@ -137,7 +137,7 @@ local master_new = function(name, options)
         preload = preload
     else
         assert(false,
-            string.format('<preload> expected "function"/"table", got %s',
+            string.format('<master_preload> expected "function"/"table", got %s',
                           type(options.master_preload))
         )
     end

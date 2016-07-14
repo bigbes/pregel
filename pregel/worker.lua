@@ -338,7 +338,7 @@ local worker_mt = {
             local tuple = self.data_space:get(from)
             assert(tuple, 'absence of vertex')
             tuple = tuple:totable()
-            tuple[5] = fun.chain(tuple[5], edges):totable()
+            tuple[4] = fun.chain(tuple[4], edges):totable()
             self.data_space:replace(tuple)
         end,
         vertex_store_delayed = function(self, vertex)
@@ -402,12 +402,14 @@ local worker_new = function(name, options)
     }, worker_mt)
 
     local preload = options.worker_preload
-    if type(preload) == 'function' then
+    if     type(preload) == 'function' then
         preload = preload(self, options.preload_args)
-    elseif type(preload) ~= 'table' then
+    elseif type(preload) ~= 'table' and
+           type(preload) ~= 'nil'   then
         assert(false,
-            string.format('<preload> expected "function"/"table", got %s',
-                          type(options.master_preload))
+            ('<worker_preload> expected "function"/"table"/"nil", got "%s"'):format(
+                type(preload)
+            )
         )
     end
     self.preload_func = preload

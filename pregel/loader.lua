@@ -25,6 +25,7 @@ local function loader_methods(instance)
         store_vertex          = function(self, vertex)
             local id = instance.obtain_name(vertex)
             instance.mpool:by_id(id):put('vertex.store', vertex)
+            return id
         end,
         -- no conflict resolving, may be dups in output.
         store_edge            = function(self, src, dest, value)
@@ -35,8 +36,9 @@ local function loader_methods(instance)
             instance.mpool:by_id(src):put('edge.store', {src, list})
         end,
         store_vertex_edges    = function(self, vertex, list)
-            self:store_vertex(vertex)
+            local id = self:store_vertex(vertex)
             self:store_edges_batch(vertex, list)
+            return id
         end,
         flush                 = function(self)
             instance.mpool:flush()
@@ -100,12 +102,10 @@ local function loader_graph_edges_file(master, file)
                         })
                         vertices[id] = id_new
                     elseif section == 2 then
-                        print('section 2')
                         local v1, v2, val = line:match("(%d+) (%d+) (%d+)")
                         v1, v2 = tonumber(v1), tonumber(v2)
                         if v1 == current_id and count ~= 1000 then
                             count = count + 1
-                            -- table.insert(current_edges, {v2, val})
                             table.insert(current_edges, {vertices[v2], val})
                         else
                             count = 0
@@ -113,7 +113,7 @@ local function loader_graph_edges_file(master, file)
                                 self:store_edges_batch(vertices[v1], current_edges)
                             end
                             current_id = v1
-                            current_edges = {{v2, val}}
+                            current_edges = {{vertices[v2], val}}
                         end
                     end
                 end
