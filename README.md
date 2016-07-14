@@ -132,7 +132,36 @@ options table.
 
 ## Developing
 
-Simple example is located in `example` folder.
+Simple example is located in `example` folder. It finds maximum value of
+vertices by communication:
+* first step, everyone sends message with their values to their neighbor
+* if value, that vertice receive, then it, again, informs all neighbours that
+	it got value greater, than it've got before.
+* everything ends, when no message sent and every vertice is halted (everyone
+	got max before)
+
+For more usages of Pregel data model you can read [paper](http://kowshik.github.io/JPregel/pregel_paper.pdf)
+or read on it's [site](http://kowshik.github.io/JPregel/).
+
+For example:
+* Shortest Path:
+	- http://kowshik.github.io/JPregel/developers.html#shortestpaths
+	- https://cwiki.apache.org/confluence/display/GIRAPH/Shortest+Paths+Example
+* PageRank Algorithm
+	- http://kowshik.github.io/JPregel/developers.html#pagerank
+	- http://giraph.apache.org/pagerank.html
+* e.t.c.
+
+In future it's planned to write down more examples/algorithms.
+
+Also, it's preferably to use tarantool-pregel in conjuction with [Torch](http://torch.ch/).
+
+> Torch is a scientific computing framework with wide support for machine
+> learning algorithms that puts GPUs first. It is easy to use and efficient,
+> thanks to an easy and fast scripting language, LuaJIT.
+
+But you shouldn't use parallelization (as it'll break Tarantool evloop) or GPU
+(since it doesn't integrated with our Fibers and it'll stop Tarantool)
 
 ### Master node
 
