@@ -118,6 +118,8 @@ helper.GHOST_URI = 'unix/:./ghost.iproto'
 --                        scope produces. Switches the cluster to manual
 --                        failover with the first instance as the leader, and
 --                        turns the WAL on, since replication needs one.
+-- opts.ssl          -- {cert = <path>, key = <path>}: make every instance
+--                      listen with `transport: ssl` (Enterprise only)
 function helper.config(opts)
     opts = opts or {}
     local job     = opts.job or helper.JOB
@@ -137,6 +139,19 @@ function helper.config(opts)
                               opts.replica_worker and 'write' or 'none')
     if opts.replica_worker then
         builder:set_global_option('replication.failover', 'manual')
+    end
+    if opts.ssl then
+        -- Same address cbuilder listens on by default, with the transport
+        -- spelled out. The peers' side of it is not written anywhere: it is
+        -- what the roles have to carry over from iproto.listen themselves.
+        builder:set_global_option('iproto.listen', {{
+            uri    = 'unix/:./{{ instance_name }}.iproto',
+            params = {
+                transport     = 'ssl',
+                ssl_cert_file = opts.ssl.cert,
+                ssl_key_file  = opts.ssl.key,
+            },
+        }})
     end
 
     local worker_uris = {}

@@ -433,20 +433,33 @@ M.MASTER_ROLE = 'pregel.roles.master'
 --- The URI another instance can be reached at.
 --
 -- config:instance_uri() answers with a table, not a string: {uri = ..., login
--- = ..., params = ...}, where the login is whatever iproto.advertise.peer
--- carries -- the replication user, in a stock cbuilder config. Only the
--- address is taken from it; who pregel connects as is roles_cfg's `user`, and
--- borrowing the replication login would connect the graph traffic as a user
--- that has no lua_call grant and every reason not to get one.
+-- = ..., password = ..., params = ...}.
+--
+-- The login and the password are dropped. They are whatever
+-- iproto.advertise.peer carries -- the replication user, in a stock cbuilder
+-- config -- and borrowing them would connect the graph traffic as a user that
+-- has no lua_call grant and every reason not to get one. Who pregel connects
+-- as is roles_cfg's `user`.
+--
+-- The params are kept, and have to be: they are the listener's transport
+-- settings (`transport: ssl` and the ssl_* files), and dropping them made the
+-- peers speak plaintext to an SSL listener -- which shows up as
+-- 'SSL_write(128)' on the listening side and, on every instance, a job that
+-- never connects. net.box takes them as part of the URI argument, so the
+-- return value is the {uri = ..., params = ...} table it accepts; a listener
+-- without params still yields a plain string.
 local function peer_uri(config, instance)
     local uri = config:instance_uri('peer', {instance = instance})
-    if type(uri) == 'table' then
-        uri = uri.uri
+    if type(uri) ~= 'table' then
+        return type(uri) == 'string' and uri or nil
     end
-    if type(uri) ~= 'string' then
+    if type(uri.uri) ~= 'string' then
         return nil
     end
-    return uri
+    if uri.params == nil then
+        return uri.uri
+    end
+    return {uri = uri.uri, params = uri.params}
 end
 
 local function has_role(roles, role)
