@@ -1,4 +1,5 @@
 local t = require('luatest')
+local fio = require('fio')
 local clock = require('clock')
 local fiber = require('fiber')
 
@@ -343,6 +344,105 @@ g.test_a_server_must_be_a_uri_or_a_uri_table = function()
     t.assert_error_msg_contains('a URI string or a', function()
         mpool.new('unit', {{params = {}}}, {connect_async = true})
     end)
+end
+
+-------------------------------------------------------------------------------
+-- wait_connected: a peer that is up but not yet serving pregel
+-------------------------------------------------------------------------------
+
+-- These need a second process. A bucket pointed at this very instance is
+-- resolved as local and never probed -- correctly, since the process holding a
+-- pool has pregel.worker loaded by construction -- so the window this covers
+-- only exists across a connection.
+local LATE_WORKER = fio.pathjoin(fio.cwd(), 'test', 'instances',
+                                 'late_worker.lua')
+
+local late_counter = 0
+
+--- Start a peer that begins serving pregel `delay` seconds from now.
+--
+-- mode 'proc' withholds _G.pregel.worker (ER_NO_SUCH_PROC), mode 'grant'
+-- withholds guest's lua_call grant (ER_ACCESS_DENIED). See the script.
+local function late_worker(mode, delay)
+    late_counter = late_counter + 1
+    local server = t.Server:new({
+        alias   = string.format('late_%s_%d', mode, late_counter),
+        command = LATE_WORKER,
+        net_box_credentials = {user = 'luatest', password = 'luatest'},
+        env     = {
+            PREGEL_LATE_MODE  = mode,
+            PREGEL_LATE_DELAY = tostring(delay),
+        },
+    })
+    -- A custom command is not luatest's own instance script, so start() would
+    -- otherwise return as soon as the process is forked.
+    server:start({wait_until_ready = true})
+    return server
+end
+
+-- The defect: an instance that is listening, and whose user is in place,
+-- answers the master's first call with "Procedure 'pregel.worker.deliver' is
+-- not defined" for as long as its worker role has not applied. Reporting the
+-- pool as connected there is what made the job fail 0 ms later, permanently.
+g.test_wait_connected_waits_for_a_peer_that_is_not_serving_yet = function()
+    local server = late_worker('proc', 1.5)
+    local pool = mpool.new('unit', {server.net_box_uri},
+                           {connect_async = true})
+    local started = clock.monotonic()
+    local ok, err = pcall(pool.wait_connected, pool, 30)
+    local elapsed = clock.monotonic() - started
+    pool:stop()
+    server:drop()
+
+    t.assert_equals(ok, true, tostring(err))
+    t.assert_equals(pool.connected, true)
+    t.assert_ge(elapsed, 1,
+                'returned before the peer could possibly have been serving')
+end
+
+-- The other half of the same window, seen from the credentials side: the entry
+-- point is there and this user's lua_call grant is not yet.
+--
+-- The assertion is that a call goes through the moment wait_connected returns,
+-- and it has to be: "it returned" is what a pool that never probed at all does
+-- too, so a test asserting only that could not fail. Measured -- with the
+-- probe removed this one stayed green while the other two went red.
+g.test_wait_connected_waits_out_a_missing_lua_call_grant = function()
+    local server = late_worker('grant', 1.5)
+    local pool = mpool.new('unit', {server.net_box_uri},
+                           {connect_async = true})
+    local ok, err = pcall(pool.wait_connected, pool, 30)
+    local called, answer = pcall(pool.buckets[1].send, pool.buckets[1], 'ping')
+    pool:stop()
+    server:drop()
+
+    t.assert_equals(ok, true, tostring(err))
+    t.assert_equals(pool.connected, true)
+    t.assert_equals(called, true, tostring(answer))
+    t.assert_equals(answer, true)
+end
+
+-- Waiting for good would be the same defect with the sign flipped, so the wait
+-- ends at the timeout -- carrying the last probe failure verbatim, since that
+-- string is the only place the difference between "not there yet" and "never
+-- going to be there" is written down.
+g.test_wait_connected_gives_up_with_the_last_probe_error = function()
+    local server = late_worker('proc', 3600)
+    local pool = mpool.new('unit', {server.net_box_uri},
+                           {connect_async = true})
+    local started = clock.monotonic()
+    local ok, err = pcall(pool.wait_connected, pool, 1)
+    local elapsed = clock.monotonic() - started
+    pool:stop()
+    server:drop()
+
+    t.assert_equals(ok, false, 'the pool reported a peer that never served')
+    t.assert_equals(pool.connected, false)
+    err = tostring(err)
+    t.assert_str_contains(err, 'is not serving pregel')
+    t.assert_str_contains(err,
+                          "Procedure 'pregel.worker.deliver' is not defined")
+    t.assert_lt(elapsed, 20, 'overran the timeout it was given')
 end
 
 -------------------------------------------------------------------------------

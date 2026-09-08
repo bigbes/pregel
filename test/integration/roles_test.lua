@@ -154,6 +154,50 @@ g.test_removing_the_role_stops_the_worker = function()
     assert_max_value_everywhere(c)
 end
 
+-- A worker that is listening, holds the `pregel` user and its lua_call grants,
+-- and has not applied its role yet. During a cluster start that is the ordinary
+-- case rather than an exotic one -- tt forks the instances in whatever order it
+-- likes and nothing sequences the role appliers -- and it used to end the job
+-- for good: the pool called that peer connected, wait_up() got "Procedure
+-- 'pregel.worker.deliver' is not defined", and the master went to 'failed'
+-- 0 ms after reporting every peer reached, with no alert and nothing retrying.
+--
+-- The window is raced for in real life; here it is held open by starting with
+-- the role off worker1 and adding it back by config:reload() afterwards.
+g.test_a_worker_whose_role_applies_late_still_runs_the_job = function()
+    local c = Cluster:new(helper.config({autostart = true, drop_worker = 1}),
+                          helper.server_opts)
+    c:start()
+
+    local worker1 = helper.worker_name(1)
+
+    -- Waiting, visibly, and saying which peer and why -- the same contract as
+    -- a peer that is simply down.
+    local said
+    t.helpers.retrying({timeout = 60, delay = 0.5}, function()
+        t.assert_equals(helper.master_status(c).state, 'connecting')
+        said = nil
+        for _, alert in ipairs(helper.config_info(c, helper.MASTER_NAME).alerts) do
+            if alert.message:find('not serving pregel', 1, true) ~= nil then
+                said = alert
+            end
+        end
+        t.assert_not_equals(said, nil, 'no alert says the peer is not serving')
+    end)
+    t.assert_equals(said.type, 'warn')
+    t.assert_str_contains(said.message,
+                          "Procedure 'pregel.worker.deliver' is not defined")
+
+    -- The role applies late; the job must pick that up and run to completion.
+    c:sync(helper.config({autostart = true}))
+    helper.reload(c, worker1)
+
+    helper.wait_state(c, 'done')
+    assert_max_value_everywhere(c)
+    t.assert_equals(helper.config_info(c, helper.MASTER_NAME).alerts, {},
+                    'the alert outlived the peer it was about')
+end
+
 -- Taking the master role off an instance while its job is running. Nothing
 -- covered this at all, which is where the status below was left stuck: stop()
 -- used to set 'idle' and *then* cancel the autostart fiber, so the

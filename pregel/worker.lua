@@ -158,6 +158,14 @@ end
 -- The single-message entry point, used for the control messages the master
 -- fans out and waits on. Bulk graph traffic goes through deliver_batch.
 --
+-- Two messages are answered before the instance is looked up, and both have to
+-- be: they are what a peer asks *while* this instance is still becoming a
+-- worker. 'wait' blocks until it is one; 'ping' does not block at all -- it is
+-- mpool's readiness probe, and all it proves is that this module is loaded here
+-- and the caller may call it. Being a message rather than a fifth entry point
+-- is deliberate: the `lua_call` grant list is written out by hand in every
+-- credentials section, and a new name in it would have to be added to each.
+--
 -- @param name the instance name
 -- @param msg protocol message name, a key of info_functions
 -- @param args the message's argument
@@ -169,6 +177,9 @@ end
 local function deliver_msg(name, msg, args)
     if msg == 'wait' then
         return wait_ready(name)
+    end
+    if msg == 'ping' then
+        return true
     end
     local rv = {xpcall_tb(function()
         local instance = workers[name]

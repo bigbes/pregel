@@ -48,6 +48,10 @@ local CONNECT_TIMEOUT  = 30
 -- authentication -- is noticed while it happens instead of after the whole
 -- connect timeout.
 local CONNECT_POLL     = 0.1
+-- One step of the wait_serving() poll -- the same shape as CONNECT_POLL, and
+-- for the same reason: a peer that is up but not yet serving becomes ready
+-- within a role apply, not within a connect timeout.
+local SERVING_POLL     = 0.1
 -- How long a producer blocked on a full bucket sleeps before re-checking. The
 -- flush broadcasts, so this is only a backstop against a lost wakeup.
 local FULL_POLL        = 0.1
@@ -58,6 +62,9 @@ local HANDLER_POLL     = 1
 
 local WORKER_DELIVER       = 'pregel.worker.deliver'
 local WORKER_DELIVER_BATCH = 'pregel.worker.deliver_batch'
+-- The readiness probe: a message pregel.worker.deliver answers before it looks
+-- for an instance and without touching anything. See worker.lua's deliver.
+local WORKER_PING          = 'ping'
 
 local function bench_monotonic(func, ...)
     local start_time = clock.monotonic()
@@ -140,6 +147,56 @@ local function is_fatal_connect_error(err)
         end
     end
     return false
+end
+
+--- The box.error code of a raised value, when it has one.
+--
+-- net.box turns a remote failure into a box.error object carrying the far
+-- side's own code, which is the only reliable way to tell "there is no such
+-- procedure" from a procedure that raised a string containing those words.
+-- Anything else -- a plain Lua string, a table -- has no code, and indexing it
+-- must not become a second error.
+--
+-- @param err whatever pcall returned
+-- @return the numeric code, or nil
+local function error_code(err)
+    if err == nil then
+        return nil
+    end
+    local ok, code = pcall(function() return err.code end)
+    if ok and type(code) == 'number' then
+        return code
+    end
+    return nil
+end
+
+--- Does this failed probe mean "up, but not serving pregel yet"?
+--
+-- Two codes, and during a cluster start both are ordinary rather than
+-- exceptional:
+--
+--   * ER_NO_SUCH_PROC -- the instance is listening and its user exists, but
+--     pregel/worker.lua has not been required there yet, so _G.pregel.worker
+--     does not exist. That is the whole window between an instance accepting
+--     connections and its worker role applying, and tt forks the instances of
+--     a cluster in whatever order it likes.
+--   * ER_ACCESS_DENIED -- the entry point is there but this user's lua_call
+--     grant is not, which is the same window seen from the credentials side.
+--
+-- A lost connection counts too: net.box reconnects on its own, so the next
+-- poll is the retry.
+--
+-- Every other failure means the call reached the function body, which is
+-- exactly what the probe asks about -- so those are handled by the caller as
+-- "serving", not by widening this list.
+--
+-- @param err whatever the probe's pcall returned
+-- @return true when the peer may yet become ready
+local function is_not_serving_error(err)
+    local code = error_code(err)
+    return code == box.error.NO_SUCH_PROC or
+           code == box.error.ACCESS_DENIED or
+           code == box.error.NO_CONNECTION
 end
 
 -------------------------------------------------------------------------------
@@ -287,6 +344,56 @@ local bucket_common_methods = {
         error(0, "mpool: cannot connect to '%s' within %s seconds: %s",
               safe_uri(self.uri), tostring(timeout),
               tostring(conn.error or 'no error reported'))
+    end,
+    --- Wait until the peer actually serves pregel, not merely iproto.
+    --
+    -- A connection proves the instance is listening and that the credentials
+    -- are good. It does not prove that pregel/worker.lua has been required
+    -- there: _G.pregel.worker is published when that module loads, which
+    -- happens when the worker role applies, and nothing sequences the role
+    -- appliers of a cluster against each other. So an instance that is up
+    -- before its role has applied answers the master's very first call with
+    -- "Procedure 'pregel.worker.deliver' is not defined" -- and that used to
+    -- end the job for good, 0 ms after the pool reported every peer reached.
+    -- Which instance tt forked first decided whether the cluster ran.
+    --
+    -- The probe is a 'ping' message on the ordinary entry point, so it needs
+    -- no privilege the traffic does not already need: adding a fifth lua_call
+    -- name would have broken every credentials section written against the
+    -- four documented ones.
+    --
+    -- Anything other than the two "not there yet" codes counts as serving:
+    -- such an error came out of the function body, and whether the body is
+    -- happy is the next call's business, not the probe's.
+    --
+    -- @param timeout seconds to keep polling
+    -- @raise with the last probe failure verbatim, when the peer never started
+    --  serving within the timeout
+    -- @function wait_serving
+    wait_serving = function(self, timeout)
+        local conn = self.connection
+        if conn == nil then
+            -- Either a local bucket -- this process has pregel.worker loaded
+            -- by construction, it is the one holding this pool -- or a bucket
+            -- that was never given a connection. Neither can be probed.
+            return
+        end
+        local deadline = clock.monotonic() + timeout
+        local last
+        while true do
+            local ok, err = pcall(conn.call, conn, WORKER_DELIVER,
+                                  {self.name, WORKER_PING})
+            if ok or not is_not_serving_error(err) then
+                return
+            end
+            last = err
+            if clock.monotonic() >= deadline then
+                break
+            end
+            fiber.sleep(SERVING_POLL)
+        end
+        error(0, "mpool: '%s' is not serving pregel within %s seconds: %s",
+              safe_uri(self.uri), tostring(timeout), tostring(last))
     end,
     --- Note whether this bucket is in fact this very instance.
     --
@@ -902,10 +1009,18 @@ local mpool_mt = {
         -- shared out as the buckets are walked, so a pool of ten slow peers
         -- cannot take ten times as long as it was given.
         --
+        -- Three passes, and the third is not redundant: a connection says the
+        -- peer is listening, and the pool's caller goes on to call
+        -- pregel.worker.* on it. See the bucket's wait_serving for what
+        -- "connected but not serving" costs when nobody waits for it. The
+        -- probe comes after resolve_local so that the bucket that is this very
+        -- instance is skipped rather than probed over a loopback connection
+        -- resolve_local has just closed.
+        --
         -- @param timeout seconds for the whole pool (default 30)
         -- @return self
-        -- @raise the first bucket that never came up, with net.box's own
-        --  reason in the message
+        -- @raise the first bucket that never came up or never started serving,
+        --  with net.box's own reason in the message
         -- @function wait_connected
         wait_connected = function(self, timeout)
             timeout = timeout or CONNECT_TIMEOUT
@@ -919,6 +1034,10 @@ local mpool_mt = {
                 if bucket.is_local then
                     self.self_idx = idx
                 end
+            end
+            for _, bucket in ipairs(self.buckets) do
+                local left = deadline - clock.monotonic()
+                bucket:wait_serving(left > 0 and left or 0)
             end
             self.connected = true
             return self

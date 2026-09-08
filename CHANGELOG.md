@@ -52,6 +52,7 @@ than ported — the vendored C Avro binding and the tarantoolctl deployment.
 
 ### Fixed
 
+- `mpool:wait_connected()` called a peer connected as soon as its iproto answered, so a worker that was up before its role had applied — the ordinary case during a cluster start, since nothing sequences the role appliers — answered the master's first call with "Procedure `pregel.worker.deliver` is not defined" and sent the job to `failed` for good, with no alert and nothing retrying. The pool now probes the entry point (a `ping` message on `pregel.worker.deliver`, so no new `lua_call` grant) and keeps such a peer in `connecting` until it serves or the role's `connect_timeout` runs out (pregel-ib4).
 - A delayed `edge.delete` mutation removed only the first parallel edge to the destination, while the local `delete_edge` path removes every one (pregel-iv7).
 - `pregel.utils.error()` formatted a lone message through `string.format`, so re-raising a caught error whose text contained a `%` reported the formatting failure instead of the message (pregel-2qk.1).
 - `strict.strictify()` keyed its declared-key sets on the address in `tostring()`, which leaked and collided once an address was reused (pregel-2qk.1).
