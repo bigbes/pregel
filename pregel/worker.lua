@@ -10,6 +10,8 @@
 --   topology_mutation_<name>  edge/vertex additions and deletions, applied
 --                             between supersteps
 --   pregel_tube_mqueue_*_<name>  the two message queues (see pregel.queue)
+--
+-- @module pregel.worker
 
 local fun    = require('fun')
 local log    = require('log')
@@ -48,6 +50,15 @@ local RPC_DELIVER       = 'pregel.worker.deliver'
 local RPC_DELIVER_BATCH = 'pregel.worker.deliver_batch'
 local RPC_WAIT          = 'pregel.worker.wait'
 
+--- Reducer counting the vertices that have not voted to halt.
+--
+-- Field 2 is is_halted, so an active vertex is one whose flag is exactly
+-- false; the test is against `false` rather than a truth test because a tuple
+-- that somehow held nil there is not an active vertex.
+--
+-- @param acc the running count
+-- @param tuple a data-space tuple
+-- @return the count including this tuple
 local function count_active(acc, tuple)
     return acc + (tuple[2] == false and 1 or 0)
 end
@@ -114,6 +125,16 @@ local info_functions = setmetatable({
 -- index a worker-side loader is handed (mpool.self_idx) is only known once the
 -- message pool has resolved its connections, and a preload that ran before
 -- that would give every worker the same share of the graph.
+--
+-- Published as `pregel.worker.wait`, and reached as the 'wait' message rather
+-- than through info_functions: it has to answer before there is an instance to
+-- dispatch on.
+--
+-- @param name the instance name
+-- @return true
+-- @raise when the instance was never created here, when its master stayed
+--  unreachable, or when its peers did -- each within WAIT_TIMEOUT
+-- @function wait
 local function wait_ready(name)
     local deadline = fiber.clock() + WAIT_TIMEOUT
     while workers[name] == nil do
@@ -132,6 +153,19 @@ local function wait_ready(name)
     return true
 end
 
+--- Dispatch one protocol message, published as `pregel.worker.deliver`.
+--
+-- The single-message entry point, used for the control messages the master
+-- fans out and waits on. Bulk graph traffic goes through deliver_batch.
+--
+-- @param name the instance name
+-- @param msg protocol message name, a key of info_functions
+-- @param args the message's argument
+-- @return whatever the handler returned
+-- @raise when no instance of that name exists here, when the message type is
+--  unknown, and when the handler itself fails; the traceback is folded into
+--  the message, since a net.box caller sees only the string
+-- @function deliver
 local function deliver_msg(name, msg, args)
     if msg == 'wait' then
         return wait_ready(name)
@@ -148,6 +182,21 @@ local function deliver_msg(name, msg, args)
     return unpack(rv)
 end
 
+--- Dispatch a whole batch, published as `pregel.worker.deliver_batch`.
+--
+-- One RPC per batch instead of one per message is the reason a superstep's
+-- traffic is affordable at all; mpool's buckets accumulate for exactly this.
+--
+-- The batch is not a transaction and is not atomic: the messages are applied
+-- in order and the first failure abandons the rest, leaving what came before
+-- it applied. Order within a batch is therefore load-bearing -- an edge.store
+-- must follow the vertex.store it depends on.
+--
+-- @param name the instance name
+-- @param msgs array of {message_name, args} pairs
+-- @return the number of messages applied, which on success is #msgs
+-- @raise on the first message that fails, or when no such instance exists here
+-- @function deliver_batch
 local function deliver_batch(name, msgs)
     local status, err = xpcall_tb(function()
         local instance = workers[name]
@@ -172,6 +221,15 @@ end
 -- Everything is read out before anything is applied: applying deletes from the
 -- mutation space, and mutating a space underneath its own iterator is not
 -- something to rely on.
+--
+-- `order` exists because `groups` is keyed by name and pairs() over it would
+-- apply one superstep's mutations in hash order; the requests are applied in
+-- the order they were queued instead.
+--
+-- @param index the topology_mutation space's type_name index
+-- @param tmtype one of the TOPMT_* constants
+-- @return groups, a map of vertex name to array of {id, dest, value}
+-- @return order, the vertex names in the order they were first seen
 local function collect_mutations(index, tmtype)
     local groups, order = {}, {}
     for _, tuple in index:pairs({tmtype}) do
@@ -193,6 +251,21 @@ end
 
 local worker_mt = {
     __index = {
+        --- Run the compute function over this shard, once.
+        --
+        -- The first half of a superstep. Every message a compute function
+        -- sends is addressed to the next queue, not this one, so what a vertex
+        -- reads is fixed for the whole pass and does not depend on the order
+        -- the shard happened to be walked in.
+        --
+        -- It ends on mpool:flush(), which is the BSP barrier: it returns only
+        -- once every message this shard produced has been acknowledged by the
+        -- worker that owns its receiver.
+        --
+        -- @param superstep the superstep number, which vertices read
+        -- @return 'ok'
+        -- @raise whatever a compute function or a delivery raised
+        -- @function run_superstep
         run_superstep = function(self, superstep)
             local function tuple_filter(tuple)
                 local id, halt = tuple:unpack(1, 2)
@@ -232,6 +305,20 @@ local worker_mt = {
             log.info('ending superstep %d', superstep)
             return 'ok'
         end,
+        --- Close the superstep: swap the queues, apply the mutations, report.
+        --
+        -- The second half, and a separate message on purpose -- the master
+        -- calls it only once every worker has finished run_superstep, so a
+        -- worker cannot start reading messages another worker is still
+        -- sending.
+        --
+        -- Anything left unread in the queue being retired is dropped, with a
+        -- warning: a message is for the superstep after the one that sent it,
+        -- and by here that superstep is over.
+        --
+        -- @return 'ok'
+        -- @raise whatever a topology mutation or a report to the master raised
+        -- @function after_superstep
         after_superstep = function(self)
             -- Swap the message queues: what was delivered during the superstep
             -- becomes what the next one reads.
@@ -266,6 +353,24 @@ local worker_mt = {
 
             return 'ok'
         end,
+        --- Apply everything the last superstep queued against the graph.
+        --
+        -- Between supersteps, never during one: a vertex that added an edge
+        -- while its neighbours were still being computed would make the result
+        -- depend on the order the shard was walked in. The vertex API only
+        -- ever queues -- see vertex.lua's add_vertex and friends.
+        --
+        -- The four types are applied in a fixed order -- delete edges, delete
+        -- vertices, add vertices, add edges -- so that an edge can be added in
+        -- the same superstep as the vertex it points out of, and so that
+        -- deleting a vertex and re-adding it is a replacement rather than a
+        -- coin toss.
+        --
+        -- A request against a vertex that is not here is logged and dropped,
+        -- not raised: a compute function may legitimately name a vertex
+        -- another one has just deleted.
+        --
+        -- @function apply_topology_mutations
         apply_topology_mutations = function(self)
             local tmspace = self.topology_mutation_space
             local tmindex = tmspace.index.type_name
@@ -375,12 +480,35 @@ local worker_mt = {
                 tmspace:delete{id}
             end
         end,
+        --- Register an aggregator under `name`.
+        --
+        -- The master must declare the same set under the same names: this
+        -- worker reports its copy by name and the master looks it up by name.
+        --
+        -- @param name the aggregator's name
+        -- @param opts as for aggregator.new
+        -- @return self, so declarations chain
+        -- @raise when `name` is already taken
+        -- @function add_aggregator
         add_aggregator = function(self, name, opts)
             assert(self.aggregators[name] == nil,
                    'aggregator already exists: ' .. tostring(name))
             self.aggregators[name] = aggregator.new(name, self, opts)
             return self
         end,
+        --- Run this worker's own loader over its share of the input.
+        --
+        -- The loader is handed the shard index and the worker count so it can
+        -- take a share of the input without talking to anyone -- which is why
+        -- this may only run after the message pool has resolved, and why the
+        -- master sends 'wait' before it sends 'preload'.
+        --
+        -- A worker with no loader configured is not an error: an app may load
+        -- entirely from the master instead.
+        --
+        -- @return 'ok'
+        -- @raise whatever the loader or the delivery raised
+        -- @function preload
         preload = function(self)
             if self.preload_func == nil then
                 log.info('no worker preload configured')
@@ -390,10 +518,30 @@ local worker_mt = {
             self.mpool:flush()
             return 'ok'
         end,
+        --- Store one vertex, as a loader does. Immediate, not queued.
+        --
+        -- A replace, not an insert: it resets the vertex to this state, edges
+        -- and halt flag included, so re-running a loader over an existing
+        -- shard rebuilds it rather than accumulating onto it. `in_progress` is
+        -- deliberately not touched -- the master sends 'count' once the
+        -- preload is over, and that is what establishes it.
+        --
+        -- @param value the vertex value; obtain_name names it
+        -- @function vertex_store
         vertex_store = function(self, value)
             local id = self.obtain_name(value)
             self.data_space:replace{id, false, value, {}}
         end,
+        --- Append edges to a vertex this worker owns. Immediate, not queued.
+        --
+        -- No conflict resolution: the edges are appended, so loading the same
+        -- input twice duplicates them.
+        --
+        -- @param from source vertex name
+        -- @param edges array of {destination_name, edge_value}
+        -- @raise when `from` is not on this shard -- which is what a preload
+        --  that pushed an edge ahead of its vertex looks like
+        -- @function edge_store
         edge_store = function(self, from, edges)
             local tuple = self.data_space:get{from}
             if tuple == nil then
@@ -403,17 +551,40 @@ local worker_mt = {
             tuple[4] = fun.chain(tuple[4], edges):totable()
             self.data_space:replace(tuple)
         end,
+        --- Queue a vertex addition, for the next apply_topology_mutations.
+        --
+        -- The four *_delayed methods are the far end of the vertex API: a
+        -- compute function calls vertex:add_vertex(), which routes the request
+        -- to whichever worker owns the name. Nothing is visible until the
+        -- superstep ends.
+        --
+        -- @param value the vertex value; obtain_name names it
+        -- @function vertex_store_delayed
         vertex_store_delayed = function(self, value)
             self.topology_mutation_space:insert{
                 box.NULL, TOPMT_VERTEX_STORE, self.obtain_name(value),
                 box.NULL, value
             }
         end,
+        --- Queue one edge addition, for the next apply_topology_mutations.
+        --
+        -- @param src source vertex name, which is what put the request here
+        -- @param dest destination vertex name
+        -- @param value edge value
+        -- @function edge_store_delayed
         edge_store_delayed = function(self, src, dest, value)
             self.topology_mutation_space:insert{
                 box.NULL, TOPMT_EDGE_STORE, src, dest, value
             }
         end,
+        --- Queue a vertex deletion, for the next apply_topology_mutations.
+        --
+        -- Its edges go with it, since they live in the vertex's own tuple.
+        -- Edges pointing *at* it do not: they are on whatever shard owns their
+        -- source, and a vertex that wants them gone deletes them itself.
+        --
+        -- @param vertex_name the vertex to remove
+        -- @function vertex_delete_delayed
         vertex_delete_delayed = function(self, vertex_name)
             -- The 1.6 version inserted a stray 2 between the type and the
             -- name, which put the vertex name in the `dest` field and left
@@ -422,11 +593,30 @@ local worker_mt = {
                 box.NULL, TOPMT_VERTEX_DELETE, vertex_name, box.NULL, box.NULL
             }
         end,
+        --- Queue one edge deletion, for the next apply_topology_mutations.
+        --
+        -- One request removes one edge: apply_topology_mutations stops at the
+        -- first match, so of `a -> b` twice over, a single request leaves one
+        -- behind (measured). The local path is not like this -- a vertex
+        -- deleting its own edge drops every parallel one in a single pass --
+        -- and vertex:delete_edge() issues one request per call either way, so
+        -- which form was used decides how many edges go.
+        --
+        -- @param src source vertex name, which is what put the request here
+        -- @param dest destination vertex name
+        -- @function edge_delete_delayed
         edge_delete_delayed = function(self, src, dest)
             self.topology_mutation_space:insert{
                 box.NULL, TOPMT_EDGE_DELETE, src, dest, box.NULL
             }
         end,
+        --- Tear the worker down, leaving its data where it is.
+        --
+        -- The message pool, the connection to the master and this instance's
+        -- entry in the module registry go; the spaces stay, which is what lets
+        -- a restarted instance pick its shard up again.
+        --
+        -- @function stop
         stop = function(self)
             self.mpool:stop()
             if self.master ~= nil then
@@ -455,6 +645,15 @@ local worker_mt = {
 -- Schema
 -------------------------------------------------------------------------------
 
+--- Create this instance's two own spaces, or adopt the existing ones.
+--
+-- if_not_exists throughout, because a worker restarted under the same name is
+-- meant to find its shard where it left it. The message queues are not here;
+-- pregel.queue owns those.
+--
+-- @param name the instance name, which the space names are built from
+-- @return the data space
+-- @return the topology_mutation space
 local function create_spaces(name)
     local data = box.schema.space.create('data_' .. name, {
         if_not_exists = true,
@@ -509,6 +708,10 @@ end
 -- caller's privileges, so a send_message under delayed_push writes to one of
 -- them on the caller's behalf. mpool.new() has already created them by the
 -- time worker_new() grants.
+--
+-- @param name the instance name
+-- @return array of space names: the four fixed ones whether or not they exist
+--  yet, plus every bucket space that does
 local function space_names(name)
     local names = {
         'data_' .. name,
@@ -548,6 +751,11 @@ end
 -- A lua_call grant alone is not enough to run a worker: the call executes with
 -- the caller's privileges, and the entry points write to the instance's
 -- spaces.
+--
+-- @param user the net.box user the peers connect as
+-- @param instance_name grant the space half for this instance too; omit for
+--  the entry points alone
+-- @function grant
 local function grant(user, instance_name)
     for _, name in ipairs({RPC_DELIVER, RPC_DELIVER_BATCH, RPC_WAIT}) do
         box.schema.user.grant(user, 'execute', 'lua_call', name,
@@ -602,6 +810,22 @@ end
 -- A URI -- options.master and every entry of options.workers -- is either a
 -- net.box URI string or a {uri = ..., params = ...} table, the form a
 -- Tarantool 3 config uses for a listener with transport parameters.
+--
+-- options.workers must list every worker of the job, this one included: the
+-- list is what the sharding is computed over, so an instance that leaves
+-- itself out disagrees with the rest about who owns what.
+--
+-- Registering the instance under `name` is the last thing done, so the
+-- 'wait' message cannot find a half-built worker.
+--
+-- @param name the instance name; the spaces and the peers' addressing use it
+-- @param options table as above
+-- @return the worker object
+-- @raise when name or options are the wrong type, when compute or obtain_name
+--  is not callable, when combiner, squash_only, queue_engine or master are
+--  the wrong shape, when worker_preload is neither a function, a table nor
+--  nil, and -- unless connect_async -- when a peer did not answer in time
+-- @function new
 local function worker_new(name, options)
     assert(type(name) == 'string', 'name must be a string')
     assert(type(options) == 'table', 'options must be a table')

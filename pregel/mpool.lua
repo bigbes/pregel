@@ -16,6 +16,8 @@
 -- master.lua populate (_G.pregel.worker.*), not through conn:eval(): eval needs
 -- a universe execute grant, while a call needs only the per-function lua_call
 -- grant that pregel.worker.grant() hands out.
+--
+-- @module pregel.mpool
 
 local fun    = require('fun')
 local log    = require('log')
@@ -65,6 +67,14 @@ local function bench_monotonic(func, ...)
 end
 
 --- A URI with any credentials removed, safe to log.
+--
+-- Beware the tail call: gsub answers with the string *and* its substitution
+-- count, so a URI that carried credentials comes back as two values. Every
+-- call site here passes it in a non-final argument position, where Lua drops
+-- the extra one; a new one that does not has to wrap the call in parentheses.
+--
+-- @param u the URI, string or otherwise
+-- @return the URI without its userinfo (a non-string is stringified)
 local function safe_uri(u)
     if type(u) ~= 'string' then
         return tostring(u)
@@ -84,6 +94,10 @@ end
 -- ssl` and the client-side ssl_* files -- and net.box accepts those only as
 -- part of the URI argument ({uri = ..., params = ...}); there is no `params`
 -- connection option (measured on 3.9: "unexpected option 'params'").
+--
+-- @param srv a URI string, or a {uri = ..., params = ...} table
+-- @return a table with `uri` and, when the entry had them, `params`
+-- @raise when srv is neither of those
 local function normalize_server(srv)
     if type(srv) == 'string' then
         return {uri = srv}
@@ -108,6 +122,13 @@ local FATAL_CONNECT_ERRORS = {
     'Session access is denied',
 }
 
+--- Is this net.box conn.error one of the refusals worth giving up on?
+--
+-- Matched as substrings of the message, because that is all net.box offers:
+-- the state is the same for a refusal and for a peer that is merely down.
+--
+-- @param err conn.error, or nil
+-- @return true when retrying cannot help
 local function is_fatal_connect_error(err)
     if err == nil then
         return false
@@ -132,6 +153,14 @@ local crc32 = digest.crc32.new()
 -- Jump consistent hashing (digest.guava) over a crc32 of the name, so adding a
 -- worker moves only the names it must move, and every instance computes the
 -- same answer from the name alone.
+--
+-- A number is hashed as itself, so two names that are meant to collide have to
+-- agree on their type as well as their value.
+--
+-- @param name vertex name: a string, a number, or an array of strings
+-- @param server_cnt number of buckets to spread over
+-- @return the bucket id, 1..server_cnt
+-- @function guava_name
 local function guava_name(name, server_cnt)
     if type(name) == 'table' then
         for _, el in ipairs(name) do
@@ -150,6 +179,9 @@ end
 -------------------------------------------------------------------------------
 
 --- Resolve a dotted name against _G, e.g. 'pregel.worker.deliver'.
+--
+-- @param path the dotted registry name
+-- @return whatever is there, or nil if any step of the path is missing
 local function registry_lookup(path)
     local node = _G
     for part in path:gmatch('[^%.]+') do
@@ -167,6 +199,13 @@ local bucket_common_methods = {
     -- A local bucket calls the registry function in this process: there is no
     -- reason to pay for a loopback connection, and net.box.self would still
     -- serialise everything through msgpack.
+    --
+    -- @param path dotted registry name, e.g. 'pregel.worker.deliver'
+    -- @param args array of arguments, unpacked into the call
+    -- @return whatever the far side returned
+    -- @raise on a local bucket when `path` is not registered here, and on a
+    --  remote one whenever net.box does
+    -- @function rpc
     rpc = function(self, path, args)
         if self.is_local then
             local func = registry_lookup(path)
@@ -178,9 +217,24 @@ local bucket_common_methods = {
         return self.connection:call(path, args)
     end,
     --- Send one message and wait for its result.
+    --
+    -- Bypasses the batch entirely, so it neither waits behind what put() has
+    -- accumulated nor keeps its order with it. This is what the waitpool
+    -- fans out -- a control message such as 'superstep' -- not a graph
+    -- message.
+    --
+    -- @param msg protocol message name, as in worker.lua's info_functions
+    -- @param args the message's argument
+    -- @return the worker's answer
+    -- @function send
     send = function(self, msg, args)
         return self:rpc(WORKER_DELIVER, {self.name, msg, args})
     end,
+    --- Hand one accumulated batch to the far side in a single RPC.
+    --
+    -- @param msgs array of {message_name, args} pairs
+    -- @return the number of messages the worker dispatched
+    -- @function deliver_batch
     deliver_batch = function(self, msgs)
         return self:rpc(WORKER_DELIVER_BATCH, {self.name, msgs})
     end,
@@ -191,6 +245,12 @@ local bucket_common_methods = {
     -- running the superstep. Recording it on the bucket is what lets the next
     -- put() or flush() tell the producer that the run is no longer sound,
     -- instead of reporting 'ok' over a lost batch.
+    --
+    -- Sticky: the first failure is kept and re-raised by every later call, so
+    -- a bucket never quietly resumes after one.
+    --
+    -- @raise the recorded failure, if there is one
+    -- @function check_failure
     check_failure = function(self)
         if self.failure ~= nil then
             error("mpool: bucket %d (%s) failed to deliver: %s", self.id,
@@ -202,6 +262,11 @@ local bucket_common_methods = {
     -- The message carries net.box's own conn.error verbatim, because that is
     -- the only place the difference between "nothing is listening there" and
     -- "the credentials were refused" exists.
+    --
+    -- @param timeout seconds to wait
+    -- @raise when the peer never answered, or refused the credentials -- the
+    --  latter as soon as it is known rather than at the deadline
+    -- @function wait_connected
     wait_connected = function(self, timeout)
         local conn = self.connection
         if conn == nil then
@@ -229,6 +294,11 @@ local bucket_common_methods = {
     -- "this is another instance" costs no RPC -- and box.info.server.uuid,
     -- which the 1.6 version compared against, no longer exists. It needs a
     -- live connection, which is why it happens here and not in bucket_new().
+    --
+    -- Closes the connection when the answer is yes: from then on the bucket
+    -- dispatches through the registry in this process.
+    --
+    -- @function resolve_local
     resolve_local = function(self)
         local conn = self.connection
         if conn == nil then
@@ -244,6 +314,14 @@ local bucket_common_methods = {
         conn:close()
         self.connection = nil
     end,
+    --- Wind the bucket down: stop the pusher, close the connection.
+    --
+    -- Nothing is sent on the way out. An instant bucket's accumulated batch is
+    -- simply lost, so a caller that wants it delivered drains first; a delayed
+    -- bucket's is in a space and survives, which is what drop() is separately
+    -- for.
+    --
+    -- @function stop
     stop = function(self)
         self.stopped = true
         local worker = self.worker
@@ -269,6 +347,13 @@ local bucket_common_methods = {
 }
 
 --- Background pusher for an instant bucket.
+--
+-- It is what makes put() cheap: a producer accumulates and this fiber sends,
+-- so nothing in the library has to remember to flush for throughput's sake --
+-- only for the barrier's.
+--
+-- @param bucket the bucket to push for
+-- @return a function to hand to fiber.create
 local function pusher_handler(bucket)
     local function handler(self)
         -- Named for the bucket alone: whether it is the local one is not known
@@ -304,6 +389,13 @@ local function pusher_handler(bucket)
 end
 
 local bucket_instant_methods = {
+    --- Accumulate one message, blocking while the batch is full.
+    --
+    -- @param msg protocol message name
+    -- @param args the message's argument
+    -- @raise a delivery failure recorded by the pusher, either on entry or
+    --  while waiting for room
+    -- @function put
     put = function(self, msg, args)
         self:check_failure()
         while self.count >= self.max_count do
@@ -325,6 +417,14 @@ local bucket_instant_methods = {
         slot[1] = msg
         slot[2] = args
     end,
+    --- Send what has accumulated, and wait for the far side to acknowledge it.
+    --
+    -- Not the barrier by itself: it returns with the bucket empty, which a
+    -- batch the pusher took also looks like. drain() is the barrier.
+    --
+    -- @raise when the send fails -- the batch is lost with it, and the failure
+    --  is recorded so later calls raise too
+    -- @function flush
     flush = function(self)
         self:check_failure()
         -- One sender at a time. The background pusher and a caller's own
@@ -376,6 +476,9 @@ local bucket_instant_methods = {
     -- and the master's inform_workers all end here -- and skipping a bucket
     -- because its count is 0 is what let a superstep's messages land in the
     -- next one.
+    --
+    -- @raise whatever flush() raises, and any failure recorded meanwhile
+    -- @function drain
     drain = function(self)
         while true do
             self:flush()
@@ -389,16 +492,32 @@ local bucket_instant_methods = {
         end
         self:check_failure()
     end,
+    --- Start the background pusher. Called once, by mpool.new().
+    --
+    -- @function start
     start = function(self)
         self.worker = fiber.create(pusher_handler(self))
     end
 }
 
 local bucket_delayed_methods = {
+    --- Append one message to the backing space.
+    --
+    -- Never blocks and never bounds itself: the whole reason for a delayed
+    -- bucket is a preload that produces more messages than memory holds, so
+    -- max_count sizes the batch flush() sends rather than what may pile up.
+    --
+    -- @param msg protocol message name
+    -- @param args the message's argument
+    -- @function put
     put = function(self, msg, args)
         self.space:insert{box.NULL, msg, args == nil and box.NULL or args}
         self.count = self.count + 1
     end,
+    --- Send the space's contents, max_count at a time, until it is empty.
+    --
+    -- @raise whatever the RPC raises; the messages then stay in the space
+    -- @function flush
     flush = function(self)
         while true do
             local tuples = self.space:select(nil, {
@@ -426,11 +545,20 @@ local bucket_delayed_methods = {
     --- Nothing travels behind a delayed bucket's back: it has no pusher fiber
     -- and flush() only returns once every batch has been acknowledged, so the
     -- barrier is already flush()'s own doing.
+    --
+    -- @function drain
     drain = function(self)
         if self.count > 0 then
             self:flush()
         end
     end,
+    --- Create (or adopt) the backing space. Called once, by mpool.new().
+    --
+    -- `count` is read back from the space rather than started at zero, so an
+    -- instance that comes back up knows it still owes what the previous run
+    -- left there.
+    --
+    -- @function start
     start = function(self)
         self.space_name = string.format('pregel_mpool_%s_%02d', self.name,
                                         self.id)
@@ -453,6 +581,8 @@ local bucket_delayed_methods = {
     end,
     --- Drop the backing space. Not part of stop(): a delayed bucket is meant
     -- to survive a restart with its pending messages.
+    --
+    -- @function drop
     drop = function(self)
         if self.space ~= nil then
             self.space:drop()
@@ -461,6 +591,10 @@ local bucket_delayed_methods = {
     end,
 }
 
+--- The common bucket methods with one engine's put/flush/drain/start on top.
+--
+-- @param engine_methods bucket_instant_methods or bucket_delayed_methods
+-- @return a fresh method table, for use as an __index
 local function methods_of(engine_methods)
     local result = {}
     for k, v in pairs(bucket_common_methods) do result[k] = v end
@@ -471,6 +605,21 @@ end
 local bucket_instant_mt = { __index = methods_of(bucket_instant_methods) }
 local bucket_delayed_mt = { __index = methods_of(bucket_delayed_methods) }
 
+--- One peer's share of the pool: its connection and its pending batch.
+--
+-- The connection is created here but not waited for, and start() is a separate
+-- step, so a whole pool can be built before any peer has answered.
+--
+-- options.msg_count  -- messages per batch (default 1000)
+-- options.is_delayed -- back the batch with a space (default false)
+-- options.user / options.password  -- net.box credentials
+-- options.reconnect_after          -- net.box retry interval
+--
+-- @param id the bucket's position in the pool, 1-based
+-- @param name the pregel instance name, which the far side is addressed by
+-- @param srv a normalized {uri = ..., params = ...} server entry
+-- @param options optional table as above
+-- @return the bucket object
 local function bucket_new(id, name, srv, options)
     options = options or {}
     local msg_count  = options.msg_count or 1000
@@ -527,6 +676,16 @@ end
 -- waitpool: one message to every bucket, in parallel, wait for all
 -------------------------------------------------------------------------------
 
+--- One long-lived fiber per bucket, so a fan-out costs no fiber creation.
+--
+-- It parks on channel_in between calls rather than being spawned per message:
+-- send_wait runs once per superstep phase over the whole cluster.
+--
+-- @param id the bucket's position, which is also this handler's slot in
+--  `rval`/`errors`
+-- @param bucket the bucket it sends through
+-- @return a function to hand to fiber.create, taking the waitpool as its
+--  argument
 local function waitpool_handler(id, bucket)
     local function handler(self)
         fiber.self():name(string.format('waitpool_handler-%02d', id),
@@ -557,8 +716,12 @@ end
 
 local waitpool_mt = {
     __index = {
+        --- Retire every handler.
+        --
         -- Closing the input channel makes every handler's get() return nil,
         -- which is how they are told to finish -- no cancel, no stack trace.
+        --
+        -- @function stop
         stop = function(self)
             self.channel_in:close()
             self.fpool = {}
@@ -570,6 +733,9 @@ local waitpool_mt = {
         -- task never answers on channel_out. __call used to wait for that
         -- answer forever -- in production, and in the very test that covers
         -- the pcall, where it hung the whole suite instead of failing it.
+        --
+        -- @raise naming the dead handler's bucket
+        -- @function check_handlers
         check_handlers = function(self)
             for id, handler in ipairs(self.fpool) do
                 if handler:status() == 'dead' then
@@ -579,6 +745,19 @@ local waitpool_mt = {
             end
         end
     },
+    --- Send `msg` to every bucket at once and wait for all of them.
+    --
+    -- Not reentrant: one waitpool serves one caller at a time, since the
+    -- results are collected on the object itself. Every bucket is tried even
+    -- when one has already failed, so the error names all of them at once
+    -- rather than whichever answered first.
+    --
+    -- @param msg protocol message name
+    -- @param args the message's argument
+    -- @return array indexed by bucket id of {elapsed_seconds, results...}
+    -- @raise listing every bucket that failed, sorted so the message is the
+    --  same on every instance
+    -- @function __call
     __call = function(self, msg, args)
         self.rval   = {}
         self.errors = {}
@@ -608,6 +787,13 @@ local waitpool_mt = {
     end,
 }
 
+--- The fan-out apparatus behind mpool:send_wait(), one handler per bucket.
+--
+-- Built after the buckets, and holds them by reference: a pool cannot gain or
+-- lose a bucket once this exists.
+--
+-- @param pool the mpool whose buckets to serve
+-- @return the waitpool, itself callable -- see __call
 local function waitpool_new(pool)
     local self = setmetatable({
         fpool_cnt   = pool.bucket_cnt,
@@ -638,10 +824,20 @@ end
 local mpool_mt = {
     __index = {
         --- Id of the bucket owning `name`.
+        --
+        -- @param name a vertex name
+        -- @return the bucket id, 1..bucket_cnt
+        -- @function id
         id = function(self, name)
             return guava_name(name, self.bucket_cnt)
         end,
         --- Bucket owning `name`.
+        --
+        -- Takes the vertex name, not the id that `id` returns.
+        --
+        -- @param name a vertex name
+        -- @return the bucket object
+        -- @function by_id
         by_id = function(self, name)
             return self.buckets[guava_name(name, self.bucket_cnt)]
         end,
@@ -652,18 +848,42 @@ local mpool_mt = {
         -- skip a bucket whose count was 0, which is exactly what a bucket the
         -- background pusher has taken a batch from looks like -- so the phase
         -- ended with messages still travelling.
+        --
+        -- @raise the first bucket that could not deliver
+        -- @function flush
         flush = function(self)
             for _, bucket in ipairs(self.buckets) do
                 bucket:drain()
             end
         end,
         --- Send one message to every bucket and wait for all the answers.
+        --
+        -- The control channel: it goes out at once and out of band, so it
+        -- neither waits behind the accumulated graph messages nor keeps their
+        -- order. Every phase the master drives -- 'count', 'superstep',
+        -- 'preload' -- travels this way.
+        --
+        -- @param message protocol message name
+        -- @param args the message's argument
+        -- @return array indexed by bucket id of {elapsed_seconds, results...}
+        -- @raise listing every bucket that failed
+        -- @function send_wait
         send_wait = function(self, message, args)
             log.verbose('<mpool, %s> send_wait %s <%s>', self.name, message,
                         json.encode(args))
             return self.waitpool(message, args)
         end,
         --- Queue one message on every bucket, to go out with the next flush.
+        --
+        -- The broadcast counterpart of a bucket's put(), for something every
+        -- worker needs and no vertex name selects. Nothing in the library
+        -- calls it: aggregator:inform_workers() walks mpool.buckets and puts
+        -- into each itself, which is the same thing spelled out.
+        --
+        -- @param message protocol message name
+        -- @param args the message's argument
+        -- @raise a delivery failure already recorded on any bucket
+        -- @function send
         send = function(self, message, args)
             for _, bucket in ipairs(self.buckets) do
                 bucket:put(message, args)
@@ -678,8 +898,15 @@ local mpool_mt = {
         -- waits in a fiber of its own. mpool.new() calls this itself unless
         -- options.connect_async says otherwise.
         --
-        -- Raises the first bucket that never came up, with net.box's own
-        -- reason in the message.
+        -- The timeout is the whole pool's, not each bucket's: it is a deadline
+        -- shared out as the buckets are walked, so a pool of ten slow peers
+        -- cannot take ten times as long as it was given.
+        --
+        -- @param timeout seconds for the whole pool (default 30)
+        -- @return self
+        -- @raise the first bucket that never came up, with net.box's own
+        --  reason in the message
+        -- @function wait_connected
         wait_connected = function(self, timeout)
             timeout = timeout or CONNECT_TIMEOUT
             local deadline = clock.monotonic() + timeout
@@ -705,6 +932,12 @@ local mpool_mt = {
         -- that very connection sees the close as a failure. This is what a
         -- worker asked to preload waits on, because self_idx -- the shard a
         -- worker-side loader reads -- is one of the things being resolved.
+        --
+        -- @param timeout seconds to wait
+        -- @return self
+        -- @raise when the pool is still not connected at the deadline; it says
+        --  so, not why, since the reason belongs to whoever is connecting
+        -- @function wait_ready
         wait_ready = function(self, timeout)
             local deadline = clock.monotonic() + timeout
             while not self.connected do
@@ -717,6 +950,11 @@ local mpool_mt = {
             end
             return self
         end,
+        --- Retire the waitpool's fibers and every bucket.
+        --
+        -- Delayed buckets keep their spaces; see the bucket's drop().
+        --
+        -- @function stop
         stop = function(self)
             self.waitpool:stop()
             for _, bucket in ipairs(self.buckets) do
@@ -742,6 +980,15 @@ local mpool_mt = {
 -- options.reconnect_after -- net.box retry interval (default 0.1)
 -- options.connect_async   -- return without waiting for any peer; the caller
 --                            is then the one that calls pool:wait_connected()
+--
+-- @param name the pregel instance name; it addresses the far side, and names
+--  a delayed bucket's space
+-- @param servers array of server entries, at least one
+-- @param options optional table as above
+-- @return the pool, with its buckets started
+-- @raise when servers is empty, when an entry is neither form, and -- unless
+--  connect_async -- when a peer did not answer in time
+-- @function new
 local function mpool_new(name, servers, options)
     options = options or {}
     local msg_count = options.msg_count or 1000

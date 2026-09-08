@@ -4,6 +4,8 @@
 -- functions everywhere, apply the topology mutations everywhere, merge the
 -- aggregators, hand the merged values back -- and stops when no worker has a
 -- message left to deliver or a vertex left running.
+--
+-- @module pregel.master
 
 local log = require('log')
 
@@ -41,6 +43,19 @@ local info_functions = setmetatable({
     end
 })
 
+--- The master's whole RPC surface: one entry point, published as
+-- `pregel.master.deliver`.
+--
+-- A worker reaches it once per aggregator per superstep, to report its copy.
+-- Being a single function is what keeps the privilege story to one lua_call
+-- grant -- see grant() below.
+--
+-- @param msg operation name; 'aggregator.inform' is the only one
+-- @param args the operation's argument
+-- @return 'ok'
+-- @raise when there is no master here, when the operation is unknown, and when
+--  the operation itself fails; the traceback is folded into the message
+-- @function deliver
 local function deliver_msg(msg, args)
     assert(master ~= nil, 'no pregel master found')
     local status, err = xpcall_tb(function()
@@ -56,11 +71,29 @@ end
 local master_mt = {
     __index = {
         --- Block until every worker is up and has reached this master.
+        --
+        -- The 'wait' message is answered by the worker's own wait_ready, which
+        -- is why this is more than a connection check: it is also where a
+        -- worker's message pool finishes resolving, and therefore where its
+        -- shard index becomes known. Nothing that shards may run before it.
+        --
+        -- @return self
+        -- @raise naming the workers that did not answer within their timeout
+        -- @function wait_up
         wait_up = function(self)
             self.mpool:send_wait('wait')
             return self
         end,
         --- Run supersteps until the graph goes quiet.
+        --
+        -- Blocks for as long as the algorithm takes -- the caller is a console
+        -- session or the master role's autostart fiber, never a config apply.
+        -- Whether it converges at all is the app's business: nothing here
+        -- bounds the number of supersteps.
+        --
+        -- @return the number of supersteps run
+        -- @raise whatever a worker raised, through send_wait
+        -- @function start
         start = function(self)
             log.info('master:start(): begin')
             self.mpool:send_wait('count')
@@ -104,6 +137,15 @@ local master_mt = {
             return superstep
         end,
         --- Run the master-side loader, then push what it produced.
+        --
+        -- The flush is the barrier: it returns only once every worker has the
+        -- vertices and edges the loader addressed to it, so the first
+        -- superstep cannot run over a half-loaded graph.
+        --
+        -- @return self
+        -- @raise when this master has no master_preload configured, and
+        --  whatever the loader or the delivery raises
+        -- @function preload
         preload = function(self)
             assert(self.preload_func ~= nil,
                    'no master_preload configured for this instance')
@@ -112,20 +154,53 @@ local master_mt = {
             return self
         end,
         --- Ask every worker to run its own loader.
+        --
+        -- The alternative to preload(): each worker reads its own share of the
+        -- input, which needs a loader that can split it -- see the shard index
+        -- and worker count worker:preload() hands its loader function.
+        --
+        -- @return self
+        -- @raise whatever any worker's loader raised
+        -- @function preload_on_workers
         preload_on_workers = function(self)
             self.mpool:send_wait('preload')
             return self
         end,
+        --- Register an aggregator under `name`.
+        --
+        -- Every worker must declare the same set under the same names: a
+        -- worker reports its copy by name and this master looks it up by name.
+        --
+        -- @param name the aggregator's name
+        -- @param opts as for aggregator.new
+        -- @return self, so declarations chain
+        -- @raise when `name` is already taken
+        -- @function add_aggregator
         add_aggregator = function(self, name, opts)
             assert(self.aggregators[name] == nil,
                    'aggregator already exists: ' .. tostring(name))
             self.aggregators[name] = aggregator.new(name, self, opts)
             return self
         end,
+        --- Ask every worker to write a snapshot of its shard.
+        --
+        -- The master has nothing of its own to save; the graph is entirely on
+        -- the workers.
+        --
+        -- @return self
+        -- @raise whatever box.snapshot() raised on any worker
+        -- @function save_snapshot
         save_snapshot = function(self)
             self.mpool:send_wait('snapshot')
             return self
         end,
+        --- Tear the master down: the message pool, and this process's claim to
+        -- being a master at all.
+        --
+        -- Clearing the module-level `master` is what lets a new one be created
+        -- here afterwards, since the RPC entry point resolves through it.
+        --
+        -- @function stop
         stop = function(self)
             self.mpool:stop()
             if master == self then
@@ -136,6 +211,12 @@ local master_mt = {
 }
 
 --- Let `user` call this module's RPC entry point.
+--
+-- One grant, and a per-function one: unlike a worker, the master owns no
+-- spaces, so there is no second half to this the way there is in worker.lua.
+--
+-- @param user the net.box user the workers connect as
+-- @function grant
 local function grant(user)
     box.schema.user.grant(user, 'execute', 'lua_call', RPC_DELIVER,
                           {if_not_exists = true})
@@ -160,6 +241,17 @@ end
 -- A worker URI is either a net.box URI string or a {uri = ..., params = ...}
 -- table, the form a Tarantool 3 config uses for a listener with transport
 -- parameters.
+--
+-- One master per process: the last one created is the one the RPC entry point
+-- talks to, so creating a second silently displaces the first.
+--
+-- @param name the instance name, which the workers address it by
+-- @param options table as above
+-- @return the master object
+-- @raise when name or options are the wrong type, when obtain_name is not
+--  callable, when master_preload is neither a function, a table nor nil, and
+--  -- unless connect_async -- when a worker did not answer in time
+-- @function new
 local function master_new(name, options)
     assert(type(name) == 'string', 'name must be a string')
     assert(type(options) == 'table', 'options must be a table')
