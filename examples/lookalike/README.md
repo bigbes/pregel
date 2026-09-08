@@ -345,11 +345,25 @@ one place the two paths are written down.
 | `calibration_bucket` | 5 | percent per bucket of the rank scale |
 
 A task that cannot be trained does not take the job down. Fewer than
-`min_labels` labels, fewer than that many users answering its FETCH, or a split
-that left it **no training rows at all**, and it publishes
-`{state = 'failed', report = {reason = ...}}` instead of a model; the other
-tasks finish, and the users score what they can and stop waiting for what they
-cannot. `test/examples/lookalike_test.lua` runs each of those cases.
+`min_labels` labels, fewer than that many users answering its FETCH, a split
+that left it **no training rows at all**, or a split with **only one class** on
+either side of it, and it publishes `{state = 'failed', report = {reason = ...}}`
+instead of a model; the other tasks finish, and the users score what they can
+and stop waiting for what they cannot. `test/examples/lookalike_test.lua` runs
+each of those cases.
+
+The one-class case is the quietest of the four and was the last to be caught. A
+task whose labels are all `+1` clears `min_labels`, trains, and produces a
+weight vector — a constant classifier that learnt the bias and nothing else,
+since the hinge loss is minimised by pushing every row to the same side. It
+cannot be *scored*: an AUC is the probability that a random positive outranks a
+random negative, and with no pair of the two `pregel.math.auc` answers nil. That
+nil went into `report.auc`, msgpack dropped the key on the way to the master,
+and what was published was `state = 'ready'` with a report differing from a good
+one only by a missing key nobody read — after which every user in the job was
+ranked against it. Both halves of the split are now counted before training, out
+of the staging space rather than out of the lists, since a labels file naming
+one user twice for a task stores one row where the list held two.
 
 The third is worth a word, because the arithmetic is easy to walk into. The
 split is stratified and rounds each class on its own, so a `test_fraction` high

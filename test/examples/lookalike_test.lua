@@ -105,6 +105,19 @@ local function vertices_of(cluster)
     return helper.collect_vertices(cluster, {job = JOB})
 end
 
+--- Wait for `pattern` to appear in a worker's log.
+--
+-- An error raised while the role applies its config at startup exits the
+-- process, and all luatest sees of that is a process that went away -- which
+-- it can see before the dying instance's log has reached the file. Grepping
+-- once is therefore a race, and it is one that loses: with two refusal cases
+-- in this file it failed about one run in two, on whichever of them ran.
+local function wait_for_log(cluster, pattern, what)
+    t.helpers.retrying({timeout = 10, delay = 0.1}, function()
+        t.assert(cluster[helper.worker_name(1)]:grep_log(pattern), what)
+    end)
+end
+
 -------------------------------------------------------------------------------
 
 g.test_every_task_learns_the_hidden_model = function()
@@ -299,6 +312,97 @@ local function labels_with_a_starved_task(dir)
     return path
 end
 
+--- A labels file with one task whose labels are all the same class.
+--
+-- Thirty of them, so `min_labels` is cleared and the task reaches training on
+-- its own merits: what it cannot do is be *scored*.
+local function labels_with_a_one_class_task(dir)
+    local ocf = require('pregel.avro.ocf')
+    local path = fio.pathjoin(dir, 'labels.avro')
+
+    local source = ocf.open(fio.pathjoin(helper.ROOT, FIXTURE, 'labels.avro'),
+                            {mode = 'r'})
+    local records = {}
+    for record in source:records() do
+        table.insert(records, record)
+    end
+    source:close()
+
+    local writer = ocf.open(path, {
+        mode   = 'w',
+        schema = {
+            type = 'record', name = 'Label',
+            fields = {
+                {name = 'task',   type = 'string'},
+                {name = 'vid',    type = 'string'},
+                {name = 'target', type = 'int'   },
+            },
+        },
+    })
+    for _, record in ipairs(records) do
+        writer:append(record)
+    end
+    for i = 1, 30 do
+        writer:append{task = 'onesided', vid = 'u' .. i, target = 1}
+    end
+    writer:close()
+    return path
+end
+
+g.test_a_one_class_task_fails_instead_of_publishing_a_model_with_no_auc =
+function()
+    local dir = fio.tempdir()
+    t.assert_not_equals(dir, nil)
+    local labels = labels_with_a_one_class_task(dir)
+
+    local cluster, status = helper.run(Cluster, {
+        name    = EXAMPLE,
+        app_cfg = app_cfg({labels = labels}),
+    })
+    t.assert_equals(status.error, nil)
+    t.assert_equals(status.state, 'done')
+
+    local model = model_of(cluster)
+    local entry = model['onesided']
+    t.assert_not_equals(entry, nil, 'the one-class task published nothing')
+
+    -- It used to publish `state = 'ready'` with a report that had no `auc` key
+    -- at all: measure_auc returns nil for a one-class test split and msgpack
+    -- drops the nil on the way out, so the only trace of "this model was never
+    -- scored" was a missing key nobody looked for. Every user was then ranked
+    -- against weights that had learnt the bias and nothing else.
+    t.assert_equals(entry.state, 'failed', 'onesided state')
+    t.assert_equals(entry.report.state, 'failed', 'onesided report state')
+    t.assert_str_contains(entry.report.reason, 'one class',
+                          'onesided reason')
+    t.assert_equals(entry.weights, nil,
+                    'a task that cannot be scored published weights')
+
+    -- The guard that would have caught this from the other side: no task may
+    -- reach `ready` without an AUC. It holds for the fixture's two as well.
+    for task, published in pairs(model) do
+        if published.state == 'ready' then
+            t.assert_not_equals(published.report.auc, nil,
+                                task .. ' is ready with no AUC')
+        end
+    end
+
+    for _, task in ipairs(TASKS) do
+        t.assert_equals(model[task].state, 'ready', task .. ' after a failure')
+        t.assert_ge(model[task].report.auc, MIN_AUC, task .. ' AUC')
+    end
+
+    for name, vertex in pairs(vertices_of(cluster)) do
+        if name:sub(1, 2) == 'u:' then
+            t.assert_equals(vertex.halted, true, name .. ' did not halt')
+            t.assert_equals(vertex.value.scores['onesided'], nil,
+                            name .. ' scored a task that was never validated')
+        end
+    end
+
+    fio.rmtree(dir)
+end
+
 g.test_a_task_with_too_few_labels_fails_without_taking_the_job_down = function()
     local dir = fio.tempdir()
     t.assert_not_equals(dir, nil)
@@ -389,8 +493,8 @@ g.test_a_test_fraction_of_one_is_refused_at_startup = function()
     local ok, err = pcall(function() cluster:start() end)
     t.assert_equals(ok, false, 'the cluster started on test_fraction 1.0')
     t.assert_str_contains(tostring(err), 'Process is terminated')
-    t.assert(cluster[helper.worker_name(1)]:grep_log('test_fraction'),
-             'the worker did not say why it refused the config')
+    wait_for_log(cluster, 'test_fraction',
+                 'the worker did not say why it refused the config')
 end
 
 g.test_a_labels_file_with_no_task_is_refused_at_startup = function()
@@ -422,8 +526,8 @@ g.test_a_labels_file_with_no_task_is_refused_at_startup = function()
     -- instance's own log, because an error raised while the config is being
     -- applied at startup exits the process.
     t.assert_str_contains(tostring(err), 'Process is terminated')
-    t.assert(cluster[helper.worker_name(1)]:grep_log('names no task'),
-             'the worker did not say why it refused the config')
+    wait_for_log(cluster, 'names no task',
+                 'the worker did not say why it refused the config')
 
     fio.rmtree(dir)
 end

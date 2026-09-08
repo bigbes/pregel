@@ -725,6 +725,58 @@ local function calibration_cuts(counter, bucket)
     return cuts
 end
 
+--- How many rows of one split of the staging space are positive and how many
+--- negative.
+--
+-- Counted out of the space rather than out of the lists `split_labels`
+-- returned, because the space is what training draws its batches from and what
+-- the AUC is measured over, and the two can differ: rows go in with
+-- `space:replace{split, vid, ...}`, so a labels file naming one user twice for
+-- one task stores one row where the list held two.
+local function class_counts(space, split)
+    local positive, negative = 0, 0
+    for _, tuple in space.index.primary:pairs({split}) do
+        if tuple.target > 0 then
+            positive = positive + 1
+        else
+            negative = negative + 1
+        end
+    end
+    return positive, negative
+end
+
+--- Why a split that has rows is still not something to train or score on, or
+--- nil when both halves carry both classes.
+--
+-- A one-class *training* set fits nothing: the hinge loss is minimised by
+-- pushing every row's score to one side, so what comes out is a constant
+-- classifier whose weights are the bias and noise. A one-class *test* set
+-- cannot score one: the AUC is the probability that a random positive outranks
+-- a random negative, and with no pair of the two there is no such probability
+-- -- `auc.result()` says so by answering nil.
+--
+-- Left unchecked, that nil went into `report.auc` and msgpack dropped the key
+-- on the way to the master, so a task that was never scored published
+-- `state = 'ready'` and a report differing from a good one only by a missing
+-- key nobody looked for. Every user was then ranked against it.
+local function one_class_reason(task, space)
+    local train_pos, train_neg = class_counts(space, SPLIT_TRAIN)
+    if train_pos == 0 or train_neg == 0 then
+        return string.format(
+            'task %q has only one class in its training split (%d positive, ' ..
+            '%d negative): a classifier fitted on it learns the bias and ' ..
+            'nothing else', task, train_pos, train_neg)
+    end
+    local test_pos, test_neg = class_counts(space, SPLIT_TEST)
+    if test_pos == 0 or test_neg == 0 then
+        return string.format(
+            'task %q has only one class in its held-out split (%d positive, ' ..
+            '%d negative): there is no positive/negative pair to measure an ' ..
+            'AUC over', task, test_pos, test_neg)
+    end
+    return nil
+end
+
 local function fail_task(self, value, reason)
     value.phase = PHASE_FAILED
     value.report = {
@@ -818,6 +870,9 @@ local function compute_task(self)
                     'task %q has no training rows: test_fraction %g held out ' ..
                     'all %d of the labelled rows',
                     value.task, cfg.test_fraction, #test)
+            else
+                reason = one_class_reason(value.task,
+                                          context:space_for(value.task))
             end
         end
 
