@@ -343,6 +343,56 @@ g.test_a_task_with_too_few_labels_fails_without_taking_the_job_down = function()
     fio.rmtree(dir)
 end
 
+g.test_a_task_left_without_training_rows_fails_with_a_reason = function()
+    -- Legal but extreme: 0.99 of each class, rounded, is every row of it, so
+    -- the stratified split hands the whole labelled set to test and leaves
+    -- training nothing. Before this was caught, `#order` was zero, the batch
+    -- draw indexed the staging space with `order[0 % 0]` -- a nil -- and the
+    -- job died on `Invalid key part count in an exact match (expected 2,
+    -- got 1)` four supersteps in, taking every other task with it.
+    local cluster, status = run({test_fraction = 0.99})
+
+    t.assert_equals(status.error, nil)
+    t.assert_equals(status.state, 'done')
+
+    local model = model_of(cluster)
+    for _, task in ipairs(TASKS) do
+        t.assert_equals(model[task].state, 'failed', task .. ' state')
+        t.assert_equals(model[task].report.state, 'failed',
+                        task .. ' report state')
+        t.assert_str_contains(model[task].report.reason, 'no training rows',
+                              task .. ' reason')
+        t.assert_equals(model[task].weights, nil,
+                        task .. ' published weights without training')
+        t.assert_equals(model[task].report.auc, nil,
+                        task .. ' reported an AUC without training')
+    end
+
+    -- And the users stopped waiting for a model that is never coming, exactly
+    -- as they do for a task that starved.
+    for name, vertex in pairs(vertices_of(cluster)) do
+        if name:sub(1, 2) == 'u:' then
+            t.assert_equals(vertex.halted, true, name .. ' did not halt')
+        end
+    end
+end
+
+g.test_a_test_fraction_of_one_is_refused_at_startup = function()
+    -- The whole job, rather than one task: a `test_fraction` at or above 1
+    -- leaves *every* task without training rows, and that is an operator
+    -- typo rather than a property of the data. Refusing it while the role
+    -- applies its config says so where the operator is looking.
+    local cluster = Cluster:new(helper.config({
+        name    = EXAMPLE,
+        app_cfg = app_cfg({test_fraction = 1.0}),
+    }), helper.server_opts)
+    local ok, err = pcall(function() cluster:start() end)
+    t.assert_equals(ok, false, 'the cluster started on test_fraction 1.0')
+    t.assert_str_contains(tostring(err), 'Process is terminated')
+    t.assert(cluster[helper.worker_name(1)]:grep_log('test_fraction'),
+             'the worker did not say why it refused the config')
+end
+
 g.test_a_labels_file_with_no_task_is_refused_at_startup = function()
     local dir = fio.tempdir()
     local path = fio.pathjoin(dir, 'labels.avro')

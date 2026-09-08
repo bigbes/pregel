@@ -332,7 +332,7 @@ one place the two paths are written down.
 | `users` | — | `users.avro`, relative to this directory |
 | `labels` | — | `labels.avro`, relative to this directory |
 | `grant_to` | none | the user `roles_cfg.user` names; see the note on spaces |
-| `test_fraction` | 0.25 | held out of training, per class |
+| `test_fraction` | 0.25 | held out of training, per class; must be in [0, 1) |
 | `min_labels` | 20 | fewer than this and the task reports `failed` |
 | `learning_rate` | 0.1 | `c` in `c / (1 + k * iteration)` |
 | `learning_decay` | 0.01 | `k` in the same |
@@ -345,15 +345,30 @@ one place the two paths are written down.
 | `calibration_bucket` | 5 | percent per bucket of the rank scale |
 
 A task that cannot be trained does not take the job down. Fewer than
-`min_labels` labels, or fewer than that many users answering its FETCH, and it
-publishes `{state = 'failed', report = {reason = ...}}` instead of a model; the
-other tasks finish, and the users score what they can and stop waiting for what
-they cannot. `test/examples/lookalike_test.lua` runs exactly that case.
+`min_labels` labels, fewer than that many users answering its FETCH, or a split
+that left it **no training rows at all**, and it publishes
+`{state = 'failed', report = {reason = ...}}` instead of a model; the other
+tasks finish, and the users score what they can and stop waiting for what they
+cannot. `test/examples/lookalike_test.lua` runs each of those cases.
 
-A labels file that names **no** task at all is the one input this example
-refuses outright, while the role is validating its config. It is not a job that
-runs and produces nothing: a user vertex halts once every task it can see is
-terminal, and with no tasks it would wait for the first one to appear forever.
+The third is worth a word, because the arithmetic is easy to walk into. The
+split is stratified and rounds each class on its own, so a `test_fraction` high
+enough that `floor(#class * fraction + 0.5)` takes every row of both classes
+leaves the training set empty — and an empty training set used to reach the
+batch draw, index the staging space with a nil key, and fail the whole
+superstep with `Invalid key part count in an exact match (expected 2, got 1)`.
+Now the task reports `no training rows` and names the fraction.
+
+Two inputs this example refuses outright instead, while the role is validating
+its config:
+
+* a labels file that names **no** task at all. It is not a job that runs and
+  produces nothing: a user vertex halts once every task it can see is terminal,
+  and with no tasks it would wait for the first one to appear forever.
+* a `test_fraction` outside [0, 1). At 1 there is no task left for the
+  per-task failure above to spare — every one of them would fail the same way,
+  which makes it an operator typo rather than a property of the data, and the
+  place to say so is where the operator is looking.
 
 ## The test
 

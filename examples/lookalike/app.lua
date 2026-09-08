@@ -311,6 +311,22 @@ function app.worker_context(app_cfg)
         resolved[key] = cfg[key] or fallback
     end
 
+    -- Refused here for the same reason the empty roster below is: a
+    -- `test_fraction` at or above 1 hands every labelled row to the test half
+    -- and leaves *every* task with nothing to train on, which is an operator
+    -- typo rather than anything about the data. A task can still end up
+    -- without training rows at a legal fraction -- a class small enough that
+    -- rounding takes all of it -- and that one is reported per task, at
+    -- PHASE_TRAINING, because it is a property of the labels and not of the
+    -- config.
+    if type(resolved.test_fraction) ~= 'number' or
+       resolved.test_fraction < 0 or resolved.test_fraction >= 1 then
+        error(string.format(
+            'lookalike: test_fraction must be a number in [0, 1), got %s -- ' ..
+            'at 1 the split leaves every task without training rows',
+            tostring(resolved.test_fraction)))
+    end
+
     local labels_path = common.resolve(HERE, cfg.labels, 'labels')
     local labels, roster = read_labels(labels_path)
     -- Refused here rather than left to run, because the job would not stop: a
@@ -773,13 +789,41 @@ local function compute_task(self)
                 table.insert(answered, message)
             end
         end
+        -- Both ways this task can turn out to be untrainable, worked out
+        -- before either is acted on so that the training branch below stays
+        -- one block. Whichever fires, `fail_task` leaves the phase terminal
+        -- and the aggregator publish at the end of this function still runs --
+        -- which is what tells the users to stop waiting for a model.
+        local reason
+        local n, train, test
         if #answered < cfg.min_labels then
-            fail_task(self, value, string.format(
+            reason = string.format(
                 'task %q got %d feature vector(s) back for %d label(s): the ' ..
                 'users behind the rest are not in this job',
-                value.task, #answered, #value.labelled))
+                value.task, #answered, #value.labelled)
         else
-            local n, train, test = stage_dataset(context, value.task, answered)
+            n, train, test = stage_dataset(context, value.task, answered)
+            if #train == 0 then
+                -- The split is stratified and rounds each class separately, so
+                -- a class small enough that `floor(#class * fraction + 0.5)`
+                -- takes all of it leaves that side of the training set empty --
+                -- and with both sides empty there is nothing to draw a batch
+                -- from. `train_model`'s `position % #order` is then 0 % 0, the
+                -- key it builds out of that is nil, and the space rejects a
+                -- one-part key with `Invalid key part count` -- which fails the
+                -- superstep and takes every other task in the job down with it.
+                -- Reported like a starved task instead: this one cannot train,
+                -- the rest still can.
+                reason = string.format(
+                    'task %q has no training rows: test_fraction %g held out ' ..
+                    'all %d of the labelled rows',
+                    value.task, cfg.test_fraction, #test)
+            end
+        end
+
+        if reason ~= nil then
+            fail_task(self, value, reason)
+        else
             local space = context:space_for(value.task)
             local dim = #answered[1].features + 1
 
