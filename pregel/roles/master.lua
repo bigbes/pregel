@@ -9,14 +9,17 @@
 --         - '127.0.0.1:3302'
 --         - '127.0.0.1:3303'
 --       pool_size: 1000
---
--- `workers` may be left out: the role then reads the cluster config and takes
--- every instance running pregel.roles.worker for a job of this `name`.
 --       autostart: false               # run the job as soon as it can
 --       user: pregel                   # net.box user for outgoing calls
 --       password: secret
 --       app_cfg:                       # opaque, handed to the app module
 --         graph: '../../data/graph.txt'
+--
+-- `workers` may be left out: the role then reads the cluster config and looks
+-- for instances running pregel.roles.worker for a job of this `name`. A
+-- replicaset is one worker, not each of its instances, and which instance that
+-- is comes from the config -- see pregel/roles/worker.lua, which resolves the
+-- same list the same way, which is what makes the two agree on the sharding.
 --
 -- `app_cfg` reaches the app module as the second argument of `master_preload`,
 -- which is how a loader learns where the graph is without the app module
@@ -40,6 +43,8 @@
 -- covers both -- see the comment at the top of pregel/roles/worker.lua. The
 -- master's own entry point is `pregel.master.deliver`, which is how a worker
 -- reports its aggregators back.
+--
+-- @module pregel.roles.master
 
 local log   = require('log')
 local fiber = require('fiber')
@@ -81,16 +86,23 @@ local function set_status(name, extra)
     state.status = rv
 end
 
+--- Role contract: is this roles_cfg one the role could apply?
+--
+-- The app module is loaded here, not merely named: a syntax error or a missing
+-- dependency in it is a broken configuration, and this is the only moment at
+-- which saying so reaches whoever wrote the YAML.
+--
+-- `compute` is not required of a master, which owns no graph and runs no
+-- vertices; `obtain_name` is, because the master shards what a loader pushes.
+--
+-- @param cfg the roles_cfg table for this role
+-- @raise on any problem with the config or the app module
+-- @function validate
 local function validate(cfg)
     common.check_cfg(ROLE, cfg, SPEC)
     common.load_app(ROLE, cfg.app, {'obtain_name'})
 end
 
---- Wait for the workers, load the graph, run the supersteps.
---
--- Everything here can block for as long as the job takes, which is why it is a
--- fiber and not part of apply(): a config apply that waited for a graph
--- algorithm to converge would hold up the whole config framework.
 --- Has this fiber been cancelled?
 --
 -- There is no fiber.is_cancelled in Lua -- it exists in the C API only, and
@@ -98,6 +110,8 @@ end
 -- inside an xpcall message handler becomes 'error in error handling' and takes
 -- the real error with it. fiber.testcancel() is the Lua spelling, and it
 -- raises rather than answering, so the question is asked through pcall.
+--
+-- @return true when the running fiber is under cancellation
 local function is_cancelled()
     return not pcall(fiber.testcancel)
 end
@@ -108,6 +122,9 @@ end
 -- arrives here as an error like any other: logging it at error level with a
 -- traceback is exactly the "spurious job failed" noise that taking the role off
 -- an instance used to produce.
+--
+-- @param instance the master, named in the message
+-- @return an xpcall message handler, which returns the error unchanged
 local function autostart_traceback(instance)
     return function(err)
         if is_cancelled() then
@@ -124,6 +141,25 @@ local function autostart_traceback(instance)
     end
 end
 
+--- Wait for the workers, load the graph, run the supersteps.
+--
+-- Everything here can block for as long as the job takes, which is why it is a
+-- fiber and not part of apply(): a config apply that waited for a graph
+-- algorithm to converge would hold up the whole config framework.
+--
+-- Started from the connector's on_ready, so by the time it runs the workers
+-- are already reachable and wait_up() is a formality rather than the place a
+-- missing worker would first be noticed.
+--
+-- It never raises: the outcome is what status() reports. A failure is
+-- 'failed' with the error; a cancellation is not a failure and says so in the
+-- log, which is what tells "the role was taken off this instance" from "the
+-- job broke".
+--
+-- @param instance the master to drive
+-- @param app the app module, read for worker_preload when there is no
+--  master-side loader
+-- @return a function to hand to fiber.create
 local function autostart_body(instance, app)
     return function()
         fiber.self():name('pregel_master_autostart', {truncate = true})
@@ -165,6 +201,23 @@ local function autostart_body(instance, app)
     end
 end
 
+--- Role contract: create the job, and with `autostart` arrange for it to run.
+--
+-- Called on every config apply and every reload, so the common case is a
+-- config that has not changed and this returns at once. A config that *has*
+-- changed is refused rather than acted on: a running job's worker list is what
+-- its sharding is computed from.
+--
+-- Returns without waiting for a single worker, and without running anything.
+-- It runs inside the config framework's synchronous post_apply, where blocking
+-- holds up the instance's whole startup and raising at startup exits the
+-- process -- so the waiting is a fiber's job (common.connector), and the job
+-- itself starts from that fiber's on_ready.
+--
+-- @param cfg the roles_cfg table for this role
+-- @raise when the config changed under a running job, and on anything
+--  discovery or master.new refuses
+-- @function apply
 local function apply(cfg)
     if state.master ~= nil then
         if common.deep_equal(state.cfg, cfg) then
@@ -231,6 +284,15 @@ local function apply(cfg)
              ROLE, cfg.name, #workers, tostring(cfg.autostart or false))
 end
 
+--- Role contract: stop the job, whatever it was in the middle of.
+--
+-- Cancelling the autostart fiber is the only way out of a superstep that will
+-- not finish once the connections are gone; the fiber's own error path is what
+-- keeps that from being reported as a job failure.
+--
+-- Safe to call when no job was ever created here.
+--
+-- @function stop
 local function stop()
     local instance = state.master
     local worker_fiber = state.fiber
@@ -262,6 +324,17 @@ local function stop()
 end
 
 --- The live master object, so an operator can drive the job from a console.
+--
+-- This is how a job runs without `autostart`:
+--
+--   require('pregel.roles.master').get():wait_up():preload():start()
+--
+-- Not part of the role contract. A job driven this way still moves
+-- status().superstep, because the master keeps that current, but its `state`
+-- stays 'idle' -- only the autostart fiber writes the others.
+--
+-- @return the master, or nil when the role is idle or inert here
+-- @function get
 local function get()
     return state.master
 end
@@ -277,6 +350,12 @@ end
 -- over. 'read_only' means the instance is a replica and the role is inert
 -- here. A job driven by hand through get() moves `superstep` (the master keeps
 -- it current) but leaves `state` at 'idle'.
+--
+-- Not part of the role contract; it is what an operator reads to find out
+-- where a job got to, and 'done' is the only state that means it finished.
+--
+-- @return a table as above, plus `name` once a job exists
+-- @function status
 local function status()
     local rv = table.deepcopy(state.status)
     local connect = state.connect

@@ -9,6 +9,8 @@
 -- Every error raised from here is reported by the config framework as the
 -- reason the role failed to validate or apply, so the messages name the role,
 -- the option and what was expected.
+--
+-- @module pregel.roles.common
 
 local log   = require('log')
 local clock = require('clock')
@@ -24,6 +26,11 @@ local is_callable = utils.is_callable
 -- common.lua:96:' in front of the message is noise about a file that person
 -- did not write. Tarantool's own roles applier raises with level 0 for the
 -- same reason.
+--
+-- Shadows the global for the whole module, so every raise below is this one.
+--
+-- @param ... a format string and its arguments, as for utils.error
+-- @raise always
 local function error(...)
     return utils.error(0, ...)
 end
@@ -54,6 +61,9 @@ local CONNECT_RETRY   = 1
 -- app reached package.searchpath, which answered 'bad argument #1 to
 -- searchpath (string expected, got nil)' -- naming neither the role nor the
 -- option.
+--
+-- @param value the option's value, already known to be a string
+-- @return false and the expected shape when empty, true otherwise
 local function check_nonempty(value)
     if value == '' then
         return false, 'a non-empty string'
@@ -62,6 +72,16 @@ local function check_nonempty(value)
 end
 
 --- An array of non-empty strings, e.g. a list of net.box URIs.
+--
+-- The map test is what catches a YAML mapping written where a sequence was
+-- meant: `#value` is 0 for one, which would otherwise read as "empty".
+--
+-- Only the roles_cfg spelling is checked here. A discovered URI never passes
+-- through this and may be a {uri = ..., params = ...} table, which this would
+-- refuse -- see peer_uri.
+--
+-- @param value the option's value, already known to be a table
+-- @return false and the expected shape when it is not one, true otherwise
 local function check_uri_array(value)
     if #value == 0 then
         return false, 'a non-empty array of URIs'
@@ -125,6 +145,13 @@ M.common_spec = {
 }
 
 --- Build a spec from M.common_spec plus `extra`.
+--
+-- `extra` wins on a name they share, and the result is a fresh table, so a
+-- role cannot reach M.common_spec and change it for the other one.
+--
+-- @param extra the role's own options, or nil
+-- @return a spec table for M.check_cfg
+-- @function spec
 function M.spec(extra)
     local rv = {}
     for key, rule in pairs(M.common_spec) do
@@ -137,6 +164,20 @@ function M.spec(extra)
 end
 
 --- Check `cfg` against `spec`, raising the first problem found.
+--
+-- Called from validate(), so the config framework refuses a bad roles_cfg
+-- before apply() has built anything from it.
+--
+-- Unknown keys are refused rather than ignored: the framework validates the
+-- shape of `roles_cfg` and knows nothing about what is inside a role's own
+-- table, so a typo would otherwise be silent.
+--
+-- @param role the role name, which every message opens with
+-- @param cfg the role's roles_cfg table
+-- @param spec as built by M.spec
+-- @raise on a non-table cfg, an unknown option, a wrong type, a failed
+--  check, a missing required option, or a password with no user
+-- @function check_cfg
 function M.check_cfg(role, cfg, spec)
     if type(cfg) ~= 'table' then
         error("%s: roles_cfg['%s'] must be a table, got %s", role, role,
@@ -196,6 +237,14 @@ end
 
 --- Something worker.new / master.new accept as a preload: a loader object, or
 -- a function returning one.
+--
+-- nil is fine -- an app may load from only one side, or from neither.
+--
+-- @param role the role name
+-- @param app_name the app module's name
+-- @param key which export is being checked, for the message
+-- @param value the export
+-- @raise when it is none of those
 local function check_preload(role, app_name, key, value)
     if value == nil or type(value) == 'table' or is_callable(value) then
         return
@@ -212,6 +261,17 @@ local AGGREGATOR_OPTIONS = {
     merge   = true,
 }
 
+--- Check an app module's `aggregators` declaration.
+--
+-- Strict about the option names, because an aggregator with a misspelt
+-- `default` still works -- it just starts from nil, superstep after superstep,
+-- and the wrong answer is the only sign.
+--
+-- @param role the role name
+-- @param app_name the app module's name
+-- @param aggregators the declaration, or nil
+-- @raise on a non-table declaration, a non-string name, a '__' name, a
+--  non-table body, a non-callable reduce or merge, or an unknown option
 local function check_aggregators(role, app_name, aggregators)
     if aggregators == nil then
         return
@@ -265,6 +325,18 @@ end
 -- The module is required rather than only checked for existence, because a
 -- syntax error or a missing dependency in it must be reported while the config
 -- is being validated -- not later, from a fiber nobody is watching.
+--
+-- Called twice per apply, once from validate() and once from apply(); the
+-- second is package.loaded's cached copy, not a second execution.
+--
+-- @param role the role name
+-- @param app_name the module name from roles_cfg.app
+-- @param required array of export names that must be callable
+-- @return the app module
+-- @raise when the module cannot be loaded, does not return a table, is
+--  missing one of `required`, or exports a combiner, preload or aggregators
+--  declaration of the wrong shape
+-- @function load_app
 function M.load_app(role, app_name, required)
     local ok, app = pcall(require, app_name)
     if not ok then
@@ -300,6 +372,17 @@ end
 --
 -- The two forms are told apart by is_callable rather than by an extra option,
 -- so an app whose context genuinely is a function has to wrap it in a table.
+--
+-- Built once per apply, not per vertex: whatever comes back is shared by every
+-- vertex this worker computes, for as long as the job lives.
+--
+-- @param role the role name
+-- @param app_name the app module's name
+-- @param app the app module
+-- @param app_cfg roles_cfg.app_cfg, the builder's only argument
+-- @return the context, or nil when the app declares none
+-- @raise when a callable worker_context failed on app_cfg
+-- @function worker_context
 function M.worker_context(role, app_name, app, app_cfg)
     local context = app.worker_context
     if not is_callable(context) then
@@ -316,7 +399,14 @@ end
 --- Add the app's aggregators to a worker or a master.
 --
 -- Both sides need the same set under the same names: a worker reports its copy
--- to the master by name, and the master looks it up by name.
+-- to the master by name, and the master looks it up by name. Both roles read
+-- the same app module, which is what makes them agree.
+--
+-- @param instance a worker or a master
+-- @param app the app module
+-- @raise when a name is already taken -- '__in_progress' and '__messages' are,
+--  which is why load_app refuses a '__' prefix outright
+-- @function add_aggregators
 function M.add_aggregators(instance, app)
     for name, opts in pairs(app.aggregators or {}) do
         instance:add_aggregator(name, opts)
@@ -331,6 +421,14 @@ end
 -- namespace once, and both roles may live in the same process.
 local alert_namespaces = {}
 
+--- This role's alerts namespace, or nil where there is none to be had.
+--
+-- Everything is pcall'd and a failure answers nil: alerting is how a problem
+-- gets reported, so it must never become a problem of its own. An older
+-- Tarantool without new_alerts_namespace simply gets no alerts.
+--
+-- @param role the role name, which is also the namespace name
+-- @return the namespace, or nil
 local function alerts_of(role)
     local ns = alert_namespaces[role]
     if ns ~= nil then
@@ -357,6 +455,11 @@ end
 -- accepts type = 'warn' only and leaves config:info().status at 'ready'. A
 -- peer that is down is not a broken configuration, so it goes here. A broken
 -- configuration still raises; see check_cfg and load_app.
+--
+-- @param role the role name
+-- @param key the alert's identity; setting the same one again replaces it
+-- @param message what to show
+-- @function alert
 function M.alert(role, key, message)
     local ns = alerts_of(role)
     if ns == nil then
@@ -366,6 +469,13 @@ function M.alert(role, key, message)
 end
 
 --- Withdraw the alert published under `key`.
+--
+-- Clearing one that was never set is not an error, so a caller need not
+-- remember whether it alerted.
+--
+-- @param role the role name
+-- @param key the alert's identity
+-- @function alert_clear
 function M.alert_clear(role, key)
     local ns = alerts_of(role)
     if ns == nil then
@@ -381,6 +491,13 @@ end
 local connector_mt = {
     __index = {
         --- Keep trying until the pool is connected or the timeout runs out.
+        --
+        -- The body of the fiber, and it does not raise: giving up leaves
+        -- `state` at 'failed' with `error` saying why, and publishes an alert.
+        -- Nothing here is fatal to the instance, which is the whole point --
+        -- see M.connector.
+        --
+        -- @function run
         run = function(self)
             local deadline = clock.monotonic() + self.timeout
             local attempt = 0
@@ -425,6 +542,11 @@ local connector_mt = {
             end
         end,
         --- Start the fiber. Returns at once.
+        --
+        -- What apply() calls, and why apply() does not block.
+        --
+        -- @return self, so the call chains off M.connector
+        -- @function start
         start = function(self)
             self.fiber = fiber.create(function()
                 fiber.self():name('pregel_connect', {truncate = true})
@@ -438,6 +560,12 @@ local connector_mt = {
             end)
             return self
         end,
+        --- Stop waiting and withdraw the alert.
+        --
+        -- `stopped` is set before the cancel, so the fiber's own error path
+        -- can tell a cancellation from a genuine failure and not report one.
+        --
+        -- @function stop
         stop = function(self)
             local f = self.fiber
             self.stopped = true
@@ -465,6 +593,16 @@ local connector_mt = {
 -- opts.pool     -- the mpool to connect (built with connect_async)
 -- opts.timeout  -- seconds before giving up (default M.CONNECT_TIMEOUT)
 -- opts.on_ready -- called once, in the fiber, when the pool is connected
+--
+-- Built but not started: call start() on the result. on_ready runs in the
+-- connect fiber, so it may block -- the master role starts a whole job from
+-- it -- and it must re-check that the role still owns the job, since stop()
+-- may have run while this was connecting.
+--
+-- @param role the role name, for the messages and the alerts namespace
+-- @param opts table as above
+-- @return the connector
+-- @function connector
 function M.connector(role, opts)
     return setmetatable({
         role     = role,
@@ -505,6 +643,11 @@ M.MASTER_ROLE = 'pregel.roles.master'
 -- never connects. net.box takes them as part of the URI argument, so the
 -- return value is the {uri = ..., params = ...} table it accepts; a listener
 -- without params still yields a plain string.
+--
+-- @param config the config module
+-- @param instance the instance name to look up
+-- @return a URI string, a {uri = ..., params = ...} table, or nil when the
+--  config gives that instance no address
 local function peer_uri(config, instance)
     local uri = config:instance_uri('peer', {instance = instance})
     if type(uri) ~= 'table' then
@@ -519,6 +662,11 @@ local function peer_uri(config, instance)
     return {uri = uri.uri, params = uri.params}
 end
 
+--- Is `role` in this instance's `roles` list?
+--
+-- @param roles the instance's roles array, or nil
+-- @param role the role name to look for
+-- @return true when it is there
 local function has_role(roles, role)
     for _, name in ipairs(roles or {}) do
         if name == role then
@@ -542,6 +690,9 @@ end
 -- the first choice: a private method is a thing that can go away, and when it
 -- does, discovery says the leader is unset and asks for an explicit worker
 -- list instead of guessing wrong.
+--
+-- @param config the config module
+-- @return the cluster config document, or nil when neither accessor works
 local function cluster_config(config)
     for _, method in ipairs({'cluster_config', '_cconfig'}) do
         if is_callable(config[method]) then
@@ -555,6 +706,15 @@ local function cluster_config(config)
 end
 
 --- Each replicaset's configured leader, keyed by replicaset name.
+--
+-- What the config says, not who is actually read-write: discovery runs before
+-- anything has connected, so there is nobody to ask. Only 'manual' failover
+-- reads this -- see rw_member.
+--
+-- @param config the config module
+-- @return a map of replicaset name to leader instance name; empty when the
+--  cluster config could not be reached, and a replicaset with no leader
+--  configured is simply absent
 local function leaders_of(config)
     local rv = {}
     local cluster = cluster_config(config)
@@ -579,6 +739,24 @@ end
 -- Which instance that is has to be answered from the config, because discovery
 -- runs before anything has connected. Two failover modes say so statically;
 -- the other two do not, and there the honest answer is to ask the operator.
+--
+-- 'off' reads database.mode and wants exactly one 'rw'; 'manual' reads the
+-- replicaset's configured leader. Under 'election' and 'supervised' the config
+-- names nobody, so this raises rather than picking one -- guessing would put a
+-- worker's whole shard on an instance that cannot serve it.
+--
+-- A single-member replicaset short-circuits all of that, which is why a
+-- non-replicated cluster never meets any of these messages.
+--
+-- @param role the role name, for the messages
+-- @param role_name the role being discovered, worker or master
+-- @param job the job name
+-- @param replicaset the replicaset name
+-- @param members array of {instance, uri} carrying the role
+-- @param config the config module
+-- @param leaders as returned by leaders_of
+-- @return the one member that will be read-write
+-- @raise when the config does not single one out
 local function rw_member(role, role_name, job, replicaset, members, config,
                          leaders)
     if #members == 1 then
@@ -635,6 +813,19 @@ end
 -- The job name is part of the test on purpose: one cluster can run several
 -- pregel jobs, and an instance belongs to the one whose name its own roles_cfg
 -- names.
+--
+-- Answered entirely from the config, so it works before anything has
+-- connected -- which it has to, since this is what produces the addresses to
+-- connect to.
+--
+-- @param role the role name of the caller, for the messages
+-- @param role_name the role to look for, M.WORKER_ROLE or M.MASTER_ROLE
+-- @param job the job name to match against each instance's roles_cfg
+-- @return array of {instance, uri}, ordered by instance name; `uri` may be
+--  nil for an instance the config gives no address
+-- @raise when a replicaset carrying the role names no single read-write
+--  instance
+-- @function instances_of
 function M.instances_of(role, role_name, job)
     local config = require('config')
     local instances = config:instances()
@@ -673,6 +864,16 @@ function M.instances_of(role, role_name, job)
 end
 
 --- URIs only, refusing an instance the config gives no address for.
+--
+-- Refused rather than skipped: a silently shorter list is a different sharding
+-- from the one the other instances computed, and the job would then disagree
+-- with itself about who owns which vertex.
+--
+-- @param role the role name of the caller
+-- @param role_name the role to look for
+-- @param job the job name
+-- @return array of URIs, in instance-name order
+-- @raise when any discovered instance has no address
 local function uris_of(role, role_name, job)
     local rv = {}
     for _, found in ipairs(M.instances_of(role, role_name, job)) do
@@ -687,6 +888,16 @@ local function uris_of(role, role_name, job)
 end
 
 --- Every worker of `job`, from the cluster config.
+--
+-- What roles_cfg.workers stands in for. Both roles call it, and both get the
+-- same answer from the same document, which is what lets them agree on the
+-- sharding without being told it.
+--
+-- @param role the role name of the caller
+-- @param job the job name
+-- @return array of worker URIs, in instance-name order
+-- @raise when the cluster config has no worker for that job
+-- @function discover_workers
 function M.discover_workers(role, job)
     local uris = uris_of(role, M.WORKER_ROLE, job)
     if #uris == 0 then
@@ -697,6 +908,17 @@ function M.discover_workers(role, job)
 end
 
 --- The single master of `job`, from the cluster config.
+--
+-- Only the worker role needs this. A second master is refused rather than
+-- picked between: two of them over one set of workers would each drive their
+-- own supersteps against the same graph.
+--
+-- @param role the role name of the caller
+-- @param job the job name
+-- @return the master's URI
+-- @raise when no instance runs the master role for that job, or more than one
+--  does
+-- @function discover_master
 function M.discover_master(role, job)
     local uris = uris_of(role, M.MASTER_ROLE, job)
     if #uris == 0 then
@@ -715,6 +937,16 @@ end
 -------------------------------------------------------------------------------
 
 --- Structural equality, enough for two roles_cfg tables.
+--
+-- Used to tell "this apply changes nothing" -- the common case, since every
+-- config apply and every reload calls apply() -- from a reconfiguration, which
+-- a running job refuses. Enough for a config document: no metatables, no
+-- cycles, and keys compared by identity.
+--
+-- @param a first value
+-- @param b second value
+-- @return true when they are structurally equal
+-- @function deep_equal
 function M.deep_equal(a, b)
     if a == b then
         return true
@@ -748,6 +980,13 @@ end
 -- unappliable, and at startup an unappliable config exits the process. So the
 -- role does nothing, says so once, and the next reload -- after a promotion,
 -- say -- picks the job up.
+--
+-- Read at apply time and not watched afterwards: an instance that becomes
+-- read-write later does not start a job by itself.
+--
+-- @param role the role name, for the message
+-- @return false when the instance is read-only, and the role should stop here
+-- @function check_writable
 function M.check_writable(role)
     if box.info.ro then
         log.info('%s: the instance is read-only, so this role does nothing ' ..

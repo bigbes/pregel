@@ -10,12 +10,6 @@
 --         - '127.0.0.1:3302'           # this instance included
 --         - '127.0.0.1:3303'
 --       pool_size: 1000
---
--- `master` and `workers` may both be left out: the role then reads the cluster
--- config and takes every instance that runs pregel.roles.worker (or
--- pregel.roles.master) for a job of this `name`. That is resolved once, by the
--- apply that creates the job -- adding a worker to the cluster does not move a
--- running one, and cannot: see the note on reconfiguration below.
 --       delayed_push: false
 --       squash_only: false
 --       queue_engine: space            # 'space' or 'table'
@@ -24,6 +18,19 @@
 --       app_cfg:                       # opaque, handed to the app module
 --         graph: '../../data/graph.txt'
 --         threshold: 5
+--
+-- `master` and `workers` may both be left out: the role then reads the cluster
+-- config and looks for instances that run pregel.roles.worker (or
+-- pregel.roles.master) for a job of this `name`. A *replicaset* is one
+-- participant, not each of its instances -- `roles:` is written at replicaset
+-- scope, so every replica carries the role and none of them can run it -- so
+-- discovery takes the one instance per replicaset that the config says will be
+-- read-write. Under election or supervised failover the config names nobody,
+-- and the role asks for an explicit list instead of guessing.
+--
+-- That is resolved once, by the apply that creates the job: adding a worker to
+-- the cluster does not move a running one, and cannot: see the note on
+-- reconfiguration below.
 --
 -- The app module returns a table:
 --
@@ -63,6 +70,8 @@
 -- the `user` from roles_cfg, right after creating them. A config that sets no
 -- `user` gets no such grant: the peers then connect as guest, and giving guest
 -- write access to the graph is a decision for the operator, not for this role.
+--
+-- @module pregel.roles.worker
 
 local log = require('log')
 
@@ -113,11 +122,39 @@ local state = {
     read_only = false,
 }
 
+--- Role contract: is this roles_cfg one the role could apply?
+--
+-- The app module is loaded here, not merely named: a syntax error or a missing
+-- dependency in it is a broken configuration, and this is the only moment at
+-- which saying so reaches whoever wrote the YAML.
+--
+-- Runs on every instance carrying the role, read-only replicas included --
+-- validate() has no view of that, and check_writable belongs to apply().
+--
+-- @param cfg the roles_cfg table for this role
+-- @raise on any problem with the config or the app module
+-- @function validate
 local function validate(cfg)
     common.check_cfg(ROLE, cfg, SPEC)
     common.load_app(ROLE, cfg.app, {'compute', 'obtain_name'})
 end
 
+--- Role contract: create the job, or do nothing if it already exists.
+--
+-- Called on every config apply and every reload, so the common case is a
+-- config that has not changed and this returns at once. A config that *has*
+-- changed is refused rather than acted on: a running job's worker list is what
+-- its sharding is computed from.
+--
+-- Returns without waiting for a single peer. It runs inside the config
+-- framework's synchronous post_apply, where blocking holds up the instance's
+-- whole startup and raising at startup exits the process -- so the waiting is
+-- a fiber's job (common.connector) and a peer that is down is an alert.
+--
+-- @param cfg the roles_cfg table for this role
+-- @raise when the config changed under a running job, and on anything
+--  discovery or worker.new refuses
+-- @function apply
 local function apply(cfg)
     if state.worker ~= nil then
         if common.deep_equal(state.cfg, cfg) then
@@ -186,6 +223,10 @@ end
 -- functions are published when pregel.worker is first required, and a require
 -- of an already-loaded module does not run it again -- removing them would
 -- leave nothing to re-register when the role comes back).
+--
+-- Role contract, and safe to call when no job was ever created here.
+--
+-- @function stop
 local function stop()
     local instance = state.worker
     local connect = state.connect
@@ -204,6 +245,12 @@ local function stop()
 end
 
 --- The live worker object, for a console session that wants to look at it.
+--
+-- Not part of the role contract, and not the way to drive a worker: the master
+-- does that. It is here to be read.
+--
+-- @return the worker, or nil when the role is idle or inert here
+-- @function get
 local function get()
     return state.worker
 end
@@ -218,6 +265,14 @@ end
 -- replica and the role is therefore inert here; 'connecting' while the job
 -- exists but some peer has not answered yet; 'failed' once the role has given
 -- up on them (the job object is still there, and a config reload retries).
+--
+-- The counts are this shard's, not the job's: every worker answers for itself.
+--
+-- Not part of the role contract; it is what an operator reads to find out
+-- whether a job that is not progressing is stuck on a peer or simply working.
+--
+-- @return a table as above
+-- @function status
 local function status()
     if state.read_only then
         return {state = 'read_only'}
