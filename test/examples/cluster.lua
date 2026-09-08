@@ -211,6 +211,22 @@ function helper.collect_vertices(cluster, opts)
     return all
 end
 
+--- How many of the workers hold at least one vertex.
+--
+-- For a graph of a few dozen vertices this is every worker; for one of six it
+-- may not be, and demanding it would be a test of the hash function rather
+-- than of the example.
+function helper.workers_holding(vertices)
+    local seen, rv = {}, 0
+    for _, vertex in pairs(vertices) do
+        if not seen[vertex.worker] then
+            seen[vertex.worker] = true
+            rv = rv + 1
+        end
+    end
+    return rv
+end
+
 --- Assert that the graph really was spread over every worker.
 --
 -- A run that landed the whole graph on one instance would satisfy most of what

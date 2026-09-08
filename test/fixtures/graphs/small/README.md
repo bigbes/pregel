@@ -33,3 +33,14 @@ rather than the 6 it hears from `b` a superstep earlier. `i` has an out-edge
 and no in-edge, so it stays unreachable whichever of the other eight is the
 source. The vertex `value` column is 0 throughout — sssp takes its starting
 distances from the source name, not from the file.
+
+`pagerank6.txt` and `pagerank6/` are the six-vertex graph `examples/pagerank`
+ranks, again in both forms:
+
+    A → B, C      C → A          E → D, F
+    B → C         D → A, B, C    F → (nothing)
+
+`F` has no out-edges, which is the case the `dangling` aggregator exists for,
+and `E` has no in-edges, so its rank stays at the floor `(1-d)/N` plus its
+share of the dangling mass — between them they make every term of the PageRank
+formula observable on six vertices.
