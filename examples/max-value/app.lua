@@ -1,9 +1,16 @@
---- max-value: every vertex ends up holding the largest value in its component.
+--- max-value: every vertex ends up holding the largest value that reaches it.
 --
 -- The smallest interesting Pregel program: a vertex takes the largest value it
 -- has been told about, and if that changed anything it tells its out-neighbours.
 -- The graph goes quiet once nothing improves, which is what stops the job -- no
 -- superstep count is fixed anywhere.
+--
+-- The direction is the out-edges, so the answer is over a vertex's ancestors --
+-- the vertices that can reach it, itself included -- and not over the ones it
+-- can reach. On a directed graph those are different answers, and "the largest
+-- value in its component", which this comment used to claim, is a third one:
+-- on soc-Epinions-custom.txt 47676 of the 75879 vertices end up holding the
+-- global maximum while the giant weak component has 75877 of them.
 --
 -- Configured through roles_cfg.app_cfg:
 --

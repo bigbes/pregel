@@ -7,7 +7,7 @@ others do not.
 
 | example | algorithm | what it shows |
 | --- | --- | --- |
-| [max-value](max-value/) | largest reachable value | the smallest complete job: a combiner, an aggregator, and a text graph loaded on the master |
+| [max-value](max-value/) | largest incoming value | the smallest complete job: a combiner, an aggregator, and a text graph loaded on the master |
 | [sssp](sssp/) | single-source shortest paths | an Avro graph loaded in parallel **on the workers**, and an algorithm parameterised from the cluster config |
 | [pagerank](pagerank/) | PageRank, damping 0.85 | aggregators as the way a vertex learns something about the whole graph, and a job that runs a fixed number of supersteps |
 | [wcc](wcc/) | weakly connected components | why the graph, not the algorithm, has to be symmetric |

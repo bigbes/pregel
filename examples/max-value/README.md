@@ -1,12 +1,22 @@
 # max-value
 
-Every vertex ends up holding the largest value reachable from it.
+Every vertex ends up holding the largest value that reaches it.
 
 The smallest Pregel program worth writing, and the one to read first. A vertex
 takes the largest value it has been told about; if that is larger than what it
 held, it stores it and tells its out-neighbours. Nothing fixes the number of
 supersteps — the job stops when no vertex has improved and no message is in
 flight, which on the graph below takes twelve supersteps.
+
+Which way that runs matters, and on a directed graph the two readings differ.
+Values travel along out-edges, so what a vertex ends up with is the largest
+value held by a vertex that can reach it — its ancestors, itself included — and
+not the largest it can reach. Measured on the graph below: against a plain
+sequential fixpoint over "the largest value that reaches it", 0 of 75879
+vertices disagree with what the job stores; against "the largest value
+reachable from it", 41981 do. Only 47676 of the 75879 hold the global maximum,
+which is also why "the largest value in its component" is not it either — the
+giant weak component has 75877 vertices in it.
 
 The example also carries an aggregator, `max_seen`: every vertex reports the
 value it holds on every superstep, the workers reduce that locally, and the
