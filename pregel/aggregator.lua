@@ -31,6 +31,21 @@ local deepcopy    = require('pregel.utils.copy').deep
 
 local MASTER_DELIVER = 'pregel.master.deliver'
 
+--- One fresh accumulator from the configured default.
+--
+-- A function default is called afresh; anything else is deep-copied, because a
+-- table default handed out as itself is shared with -- and mutated by -- every
+-- accumulator that reduces into it in place.
+--
+-- @param default the configured default: a value, or a function returning one
+-- @return a value that shares no table with `default` or with any other call
+local function make_default_value(default)
+    if type(default) == 'function' then
+        return default()
+    end
+    return deepcopy(default)
+end
+
 local aggregator_mt = {
     __index = {
         --- Queue this value on every worker, to go out with the next flush.
@@ -61,17 +76,13 @@ local aggregator_mt = {
         end,
         --- Reset the accumulator to the configured default.
         --
-        -- A function default is called afresh; anything else is deep-copied.
+        -- A function default is called afresh; anything else is deep-copied --
+        -- see make_default_value, which aggregator_new uses for the same
+        -- reason, so the accumulator is never the default itself.
         --
         -- @function make_default
         make_default = function(self)
-            if type(self.default) == 'function' then
-                self.value = self.default()
-            else
-                -- A copy: a table default would otherwise be shared with, and
-                -- mutated by, every superstep that followed.
-                self.value = deepcopy(self.default)
-            end
+            self.value = make_default_value(self.default)
         end,
         --- Fold one worker's reported copy into the master's accumulator.
         --
@@ -159,10 +170,18 @@ local function aggregator_new(name, pregel, opts)
         reduce     = reduce,
         merge      = merge,
         internal   = internal,
-        value      = opts.default,
+        -- Both go through make_default_value rather than taking opts.default
+        -- as it stands. Assigning it by reference made the accumulator *be*
+        -- the default table until the first make_default() -- which runs only
+        -- when the master's merged value comes back, after superstep 1 -- so a
+        -- reduce that folded into its accumulator in place rewrote the job's
+        -- default, and a function default was stored as the value instead of
+        -- being called. Two calls, not one shared result: value and global are
+        -- two accumulators.
+        value      = make_default_value(opts.default),
         -- Read by every vertex of superstep 1, before any master has merged
         -- anything: the default is the only honest answer there.
-        global     = opts.default,
+        global     = make_default_value(opts.default),
         default    = opts.default,
         pregel     = pregel,
     }, aggregator_mt)

@@ -681,8 +681,11 @@ instance:add_aggregator('max_seen', {
 ```
 
 * `default` — the starting value, or a function returning one. Both sides take
-  a fresh copy of it every superstep, so a table default is not shared with the
-  superstep before it.
+  a fresh copy of it every superstep and at construction, so a table default is
+  shared neither with the superstep before it nor with the declaration: a
+  `reduce` may fold into its accumulator in place without rewriting the job's
+  default, and a function default is called once per accumulator rather than
+  stored as the value.
 * `reduce` — `callable(accumulator, contribution)`, folds one vertex's
   contribution into its worker's copy. Defaults to taking the contribution,
   which makes an aggregator with only a `merge` a per-superstep count.
