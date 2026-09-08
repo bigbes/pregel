@@ -284,6 +284,36 @@ g.test_the_roles_find_each_other_in_the_cluster_config = function()
     t.assert_equals(#uris, helper.WORKER_COUNT)
 end
 
+-- config:instance_uri('peer', ...) hands out the login and password from
+-- iproto.advertise.peer -- the replication user in a stock config -- and
+-- discovery drops them on purpose: replication has no lua_call grant and no
+-- business getting one. Nothing said so, because net.box's opts.user wins over
+-- a URI's own userinfo and every other test sets roles_cfg.user, so the
+-- property was held by mpool's option rather than by discovery
+-- (pregel-9vt, M6). Here there is no roles_cfg.user at all: the peers connect
+-- as guest, which the config grants, and a URI carrying 'replicator:secret@'
+-- would authenticate as a user with neither the lua_call nor the spaces.
+g.test_discovery_does_not_borrow_the_replication_login = function()
+    local c = Cluster:new(helper.config({autostart = true, discovery = true,
+                                         no_user = true}),
+                          helper.server_opts)
+    c:start()
+
+    -- Checked before the run, so a URI that does carry them says so in one
+    -- line instead of as a job that never finishes.
+    local uris = c[helper.worker_name(1)]:exec(function(role)
+        return require(role).get().workers
+    end, {helper.WORKER_ROLE})
+    for _, uri in ipairs(uris) do
+        local address = type(uri) == 'table' and uri.uri or uri
+        t.assert_not_str_contains(address, '@',
+                                  'a discovered URI carries credentials')
+    end
+
+    helper.wait_state(c, 'done', 30)
+    assert_max_value_everywhere(c)
+end
+
 -- A replicaset written as `roles: [pregel.roles.worker]` puts the role on the
 -- replica too, and discovery used to count the replica as a second worker of
 -- the job -- so every instance tried to connect to an address that would never

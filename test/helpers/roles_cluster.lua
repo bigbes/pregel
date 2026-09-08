@@ -120,6 +120,8 @@ helper.GHOST_URI = 'unix/:./ghost.iproto'
 --                        turns the WAL on, since replication needs one.
 -- opts.ssl          -- {cert = <path>, key = <path>}: make every instance
 --                      listen with `transport: ssl` (Enterprise only)
+-- opts.no_user      -- leave user/password out of roles_cfg, so the peers
+--                      connect as guest; guest is granted what they need
 function helper.config(opts)
     opts = opts or {}
     local job     = opts.job or helper.JOB
@@ -133,6 +135,17 @@ function helper.config(opts)
             lua_call    = helper.LUA_CALL,
         }},
     })
+    if opts.no_user then
+        -- With no roles_cfg.user the peers connect as guest, and the role
+        -- issues no space grants of its own -- giving guest write access to
+        -- the graph is the operator's decision, so it has to be in the config.
+        builder:set_global_option('credentials.users.guest', {
+            privileges = {
+                {permissions = {'execute'}, lua_call = helper.LUA_CALL},
+                {permissions = {'read', 'write'}, universe = true},
+            },
+        })
+    end
     -- Nothing in these tests outlives the cluster -- but a replica has to read
     -- its leader's WAL, so a replicated cluster pays for one.
     builder:set_global_option('wal.mode',
@@ -166,8 +179,8 @@ function helper.config(opts)
         return {
             name            = job,
             app             = helper.APP,
-            user            = helper.USER,
-            password        = helper.PASSWORD,
+            user            = not opts.no_user and helper.USER or nil,
+            password        = not opts.no_user and helper.PASSWORD or nil,
             connect_timeout = opts.connect_timeout,
         }
     end
