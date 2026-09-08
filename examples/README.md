@@ -1,6 +1,6 @@
 # Examples
 
-Six runnable pregel jobs. Each directory is a `tt` application — a Tarantool 3
+Seven runnable pregel jobs. Each directory is a `tt` application — a Tarantool 3
 cluster config, four instance names, an app module and a README whose every
 command was run against it — and each one is picked to show something the
 others do not.
@@ -49,7 +49,7 @@ autostart nothing happens until an operator drives it:
     local m = require('pregel.roles.master').get()
     m:wait_up():preload():start()
 
-All six listen on `127.0.0.1:3301`…`3304`, so run one at a time.
+All seven listen on `127.0.0.1:3301`…`3304`, so run one at a time.
 
 Every per-worker transcript in these READMEs is reproducible, not a snapshot:
 a vertex name is hashed onto one of the `workers` entries, and every instance
