@@ -1,10 +1,22 @@
+--- Table constructors.
+--
+-- @module pregel.utils.collections
+
 local strict = require('pregel.utils.strict')
 
 --- A table that fills a missing key in on first read.
 --
 -- `factory` is either a value copied into every missing key, or a function
 -- called with the key. Reading a key always materialises it, so `pairs()` over
--- a defaultdict only sees keys that were read or written.
+-- a defaultdict only sees keys that were read or written -- which is why the
+-- queue's counters are read with rawget() where a read must not create one.
+--
+-- A non-function `factory` is stored by reference, not copied: a table default
+-- ends up shared by every key that materialises from it.
+--
+-- @param factory value stored in a missing key, or function(key) returning one
+-- @return table
+-- @function defaultdict
 local function defaultdict(factory)
     local index
     if type(factory) == 'function' then

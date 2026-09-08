@@ -12,6 +12,8 @@
 -- can still grow fields after strictify().
 --
 -- `unstrictify` restores plain table behaviour.
+--
+-- @module pregel.utils.strict
 --]]--
 
 -- Per-table sets of declared keys, keyed weakly so a dropped module table does
@@ -42,6 +44,16 @@ strictify_mt = {
     end
 }
 
+--- Make reading an undeclared key of `t` an error.
+--
+-- The table is modified in place rather than copied, so every reference to it
+-- becomes strict at once. A table that already has a metatable keeps it and
+-- only has __index/__newindex replaced -- which means strictify() overrides an
+-- existing __index, and a table that needs one cannot be strictified.
+--
+-- @param t table to protect
+-- @return the same table
+-- @function strictify
 local function strictify(t)
     -- Everything the table already holds counts as declared; __index only ever
     -- fires for keys that are absent.
@@ -60,6 +72,14 @@ local function strictify(t)
     return t
 end
 
+--- Undo strictify(): reading a missing key is a plain nil again.
+--
+-- Safe on a table that was never strictified, and on one whose metatable came
+-- from elsewhere -- only the hooks this module installed are removed.
+--
+-- @param t table
+-- @return the same table
+-- @function unstrictify
 local function unstrictify(t)
     local mt = getmetatable(t)
     if mt == strictify_mt then
