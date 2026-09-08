@@ -66,6 +66,10 @@ local master_mt = {
             self.mpool:send_wait('count')
             local superstep = 1
             while true do
+                -- Published as the loop goes rather than only at the end, so
+                -- something watching the master -- pregel.roles.master's
+                -- status(), a console -- can see how far a running job is.
+                self.superstep_count = superstep
                 log.info('master:start(): superstep %d start', superstep)
                 local result = self.mpool:send_wait('superstep', superstep)
                 for _, v in ipairs(result) do
@@ -97,7 +101,6 @@ local master_mt = {
                 superstep = superstep + 1
             end
             log.info('master:start(): end after %d superstep(s)', superstep)
-            self.superstep_count = superstep
             return superstep
         end,
         --- Run the master-side loader, then push what it produced.

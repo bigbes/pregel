@@ -23,6 +23,7 @@ build = {
         ['pregel.vertex']            = 'pregel/vertex.lua',
         ['pregel.worker']            = 'pregel/worker.lua',
         ['pregel.roles.common']      = 'pregel/roles/common.lua',
+        ['pregel.roles.master']      = 'pregel/roles/master.lua',
         ['pregel.roles.worker']      = 'pregel/roles/worker.lua',
         ['pregel.utils']             = 'pregel/utils/init.lua',
         ['pregel.utils.collections'] = 'pregel/utils/collections.lua',
