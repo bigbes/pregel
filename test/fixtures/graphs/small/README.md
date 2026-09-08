@@ -44,3 +44,14 @@ ranks, again in both forms:
 and `E` has no in-edges, so its rank stays at the floor `(1-d)/N` plus its
 share of the dangling mass — between them they make every term of the PageRank
 formula observable on six vertices.
+
+`components3.txt` and `components3-oneway.txt` are what `examples/wcc` is
+tested against: nine vertices in three components,
+
+    1 -- 2 -- 3        4 -- 5        6 -- 7 -- 8 -- 9 -- 6
+
+with every edge written both ways in the first file and one direction of each
+kept in the second. The one-way file keeps the labels running uphill (2 -> 1,
+3 -> 2), so the first component comes apart into three while the four-cycle --
+still strongly connected -- does not: that contrast is the test that weakly
+connected components need a symmetric graph rather than a symmetric algorithm.

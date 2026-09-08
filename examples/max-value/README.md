@@ -23,7 +23,7 @@ from the master without touching a worker.
 | `app.lua` | the app module: `compute`, `combiner`, `obtain_name`, `master_preload`, `aggregators` |
 
 The graph is `test/fixtures/graphs/soc-Epinions-custom.txt` — 75879 vertices and
-508839 edges of the SNAP soc-Epinions1 trust network, with a name and a random
+508837 edges of the SNAP soc-Epinions1 trust network, with a name and a random
 value attached to each vertex. The master reads the whole file and shards it out
 over the three workers; loading takes about six tenths of a second. The path is
 `app_cfg.graph` in `config.yaml`, relative to this directory; swap in

@@ -1,0 +1,15 @@
+# This directory is one tt application: instances.yml names the instances,
+# config.yaml is the Tarantool 3 cluster config they share.
+#
+# Without a tt.yaml, `tt start` refuses to run from a subdirectory of a
+# checkout that has none of its own ("tt.yaml not found, you need to create tt
+# environment config with 'tt init'").
+env:
+  instances_enabled: .
+  restart_on_failure: false
+app:
+  run_dir: var/run
+  log_dir: var/log
+  wal_dir: var/lib
+  memtx_dir: var/lib
+  vinyl_dir: var/lib
