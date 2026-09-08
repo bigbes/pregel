@@ -126,6 +126,19 @@ local bucket_common_methods = {
     deliver_batch = function(self, msgs)
         return self:rpc(WORKER_DELIVER_BATCH, {self.name, msgs})
     end,
+    --- Re-raise a delivery failure that happened out of the caller's sight.
+    --
+    -- A batch that fails inside the background pusher is gone -- flush() has
+    -- already reset the counter -- and the fiber that lost it is not the one
+    -- running the superstep. Recording it on the bucket is what lets the next
+    -- put() or flush() tell the producer that the run is no longer sound,
+    -- instead of reporting 'ok' over a lost batch.
+    check_failure = function(self)
+        if self.failure ~= nil then
+            error("mpool: bucket %d (%s) failed to deliver: %s", self.id,
+                  safe_uri(self.uri), self.failure)
+        end
+    end,
     stop = function(self)
         self.stopped = true
         local worker = self.worker
@@ -158,8 +171,18 @@ local function pusher_handler(bucket)
                                         self.id), {truncate = true})
         log.verbose('<mpool, %s> pusher fiber started', tostring(self.name))
         while not self.stopped do
-            if self.count > 0 then
-                self:flush()
+            -- Nothing left to carry once a delivery has failed: the failure is
+            -- recorded on the bucket and put()/flush() raise it. Ending the
+            -- fiber here instead is what used to leave a producer waiting on a
+            -- flush that nobody would ever perform.
+            if self.count > 0 and self.failure == nil then
+                -- flush() records the failure and re-raises it; the pusher is
+                -- not the one that can act on it, so it logs and carries on.
+                local ok, err = pcall(self.flush, self)
+                if not ok then
+                    log.error('<mpool, %s> pusher flush failed: %s',
+                              tostring(self.name), tostring(err))
+                end
                 fiber.yield()
             else
                 fiber.sleep(0.01)
@@ -175,11 +198,16 @@ end
 
 local bucket_instant_methods = {
     put = function(self, msg, args)
+        self:check_failure()
         while self.count >= self.max_count do
             -- Bounded wait: the flush broadcasts, and the loop re-checks, so a
             -- broadcast that lands between the check and the wait costs one
             -- poll interval instead of a hang.
             self.not_full:wait(FULL_POLL)
+            -- A pusher that failed will not drain this bucket, so a producer
+            -- waiting here has to be let out with the error rather than left
+            -- to poll forever.
+            self:check_failure()
         end
         self.count = self.count + 1
         local slot = self.msg_pool[self.count]
@@ -191,6 +219,7 @@ local bucket_instant_methods = {
         slot[2] = args
     end,
     flush = function(self)
+        self:check_failure()
         -- Copy the batch out of the accumulation buffer and reset the buffer
         -- before the first yield. The slots are reused by the next put(), so a
         -- batch that merely referenced them would be rewritten underneath the
@@ -208,7 +237,17 @@ local bucket_instant_methods = {
         self.count = 0
         self.not_full:broadcast()
 
-        self:deliver_batch(msgs)
+        local ok, err = pcall(self.deliver_batch, self, msgs)
+        if not ok then
+            -- The batch is lost with the exception -- it was copied out of a
+            -- buffer that put() has been free to reuse since the line above.
+            -- What must not be lost is the fact that it happened: record it so
+            -- the next put()/flush() raises rather than reporting a superstep
+            -- as 'ok', and release any producer waiting on the bucket.
+            self.failure = self.failure or tostring(err)
+            self.not_full:broadcast()
+            error(tostring(err))
+        end
     end,
     start = function(self)
         self.worker = fiber.create(pusher_handler(self))
@@ -326,6 +365,8 @@ local function bucket_new(id, name, srv, options)
         max_count    = msg_count,
         stopped      = false,
         worker       = nil,
+        -- Set by flush() when a delivery raises, read by check_failure().
+        failure      = nil,
     }
 
     if is_delayed then
@@ -438,6 +479,11 @@ local mpool_mt = {
         end,
         flush = function(self)
             for _, bucket in ipairs(self.buckets) do
+                -- Unconditionally, even for a bucket that looks empty: a batch
+                -- the background pusher took has already reset the counter, so
+                -- `count == 0` says nothing about whether the bucket's last
+                -- delivery got through.
+                bucket:check_failure()
                 if bucket.count > 0 then
                     bucket:flush()
                 end

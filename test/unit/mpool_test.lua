@@ -318,6 +318,106 @@ g.test_put_blocks_on_a_full_bucket = function()
     pool:stop()
 end
 
+-- Defect: a background flush that raised killed the pusher fiber, and nothing
+-- ever noticed -- the batch was gone (flush() had already reset the counter),
+-- the superstep reported 'ok', and the next producer to fill the bucket waited
+-- on a flush that no longer had anyone to perform it.
+g.test_a_failed_background_flush_keeps_the_pusher_alive = function()
+    local pool = mpool.new('unit', {URI}, {msg_count = 4})
+    local bucket = pool.buckets[1]
+
+    local calls = 0
+    _G.pregel.worker.deliver_batch = function()
+        calls = calls + 1
+        error('simulated worker failure')
+    end
+
+    bucket:put('m', {1})
+    t.helpers.retrying({timeout = 5}, function()
+        t.assert_ge(calls, 1, 'the pusher never tried to deliver')
+    end)
+    -- The fiber that carries every later batch must survive the failure.
+    t.assert_equals(bucket.worker:status() ~= 'dead', true,
+                    'the pusher fiber died on the first failure')
+
+    pool:stop()
+end
+
+-- ... and the failure has to reach whoever is running the superstep. It used to
+-- reach nobody: run_superstep's mpool:flush() saw count == 0 for a bucket whose
+-- batch had died inside the pusher and returned 'ok'.
+g.test_a_failed_background_flush_is_raised_to_the_producer = function()
+    -- Room to spare: the point here is that put() raises, not that it blocks,
+    -- so the bucket must not fill up while the retry loop waits for the pusher.
+    local pool = mpool.new('unit', {URI}, {msg_count = 64})
+    local bucket = pool.buckets[1]
+
+    _G.pregel.worker.deliver_batch = function()
+        error('simulated worker failure')
+    end
+
+    bucket:put('m', {1})
+    t.helpers.retrying({timeout = 5}, function()
+        t.assert_error_msg_contains('simulated worker failure', function()
+            bucket:put('m', {2})
+        end)
+    end)
+    t.assert_error_msg_contains('simulated worker failure', function()
+        pool:flush()
+    end)
+
+    pool:stop()
+end
+
+-- The hang the two above are really about: fill the bucket after the pusher has
+-- failed, and one more put() waits on a flush that will never come.
+g.test_put_does_not_hang_after_a_failed_flush = function()
+    local pool = mpool.new('unit', {URI}, {msg_count = 4})
+    local bucket = pool.buckets[1]
+
+    local original = _G.pregel.worker.deliver_batch
+    local failing = true
+    _G.pregel.worker.deliver_batch = function(name, msgs)
+        if failing then
+            error('simulated worker failure')
+        end
+        return original(name, msgs)
+    end
+
+    bucket:put('m', {1})
+    t.helpers.retrying({timeout = 5}, function()
+        t.assert_equals(bucket.count, 0, 'the pusher never took the batch')
+    end)
+    failing = false
+
+    -- Whatever the producer does next, it must come back: either every put()
+    -- goes through, or one of them raises. Blocking forever is the defect.
+    local outcome
+    -- fiber.new, so joinable can be set before it runs: it may well be over
+    -- before the next yield, and set_joinable() on a dead fiber raises.
+    local producer = fiber.new(function()
+        local ok, err = pcall(function()
+            for i = 1, 8 do
+                bucket:put('m', {i})
+            end
+        end)
+        outcome = ok and 'ok' or tostring(err)
+    end)
+    producer:set_joinable(true)
+
+    local returned = pcall(t.helpers.retrying, {timeout = 5}, function()
+        t.assert_not_equals(outcome, nil)
+    end)
+    if not returned then
+        -- Leave nothing blocked behind: the suite runs in one process.
+        producer:cancel()
+        t.fail('put() is stuck on a bucket whose pusher failed')
+    end
+    producer:join()
+
+    pool:stop()
+end
+
 -------------------------------------------------------------------------------
 -- Delayed buckets
 -------------------------------------------------------------------------------
