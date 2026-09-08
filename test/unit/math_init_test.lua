@@ -9,6 +9,7 @@ g.test_reexports_are_the_modules_themselves = function()
     t.assert_is(m.gd, require('pregel.math.gd'))
     t.assert_is(m.auc, require('pregel.math.auc'))
     t.assert_is(m.percentile, require('pregel.math.percentile'))
+    t.assert_is(m.mf, require('pregel.math.mf'))
 end
 
 -- strictify() is what turns a typo into an error at the call site instead of

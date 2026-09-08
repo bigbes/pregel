@@ -21,8 +21,9 @@
 --
 -- The pieces are usable on their own: `pregel.math.vector` for the array
 -- arithmetic, `pregel.math.gd` for linear models and the descent loop,
--- `pregel.math.auc` for ranking quality, and `pregel.math.percentile` for a
--- streaming quantile counter.
+-- `pregel.math.auc` for ranking quality, `pregel.math.percentile` for a
+-- streaming quantile counter, and `pregel.math.mf` for the biased matrix
+-- factorisation step a recommender runs on a bipartite graph.
 --
 -- This module only re-exports; every function it names is documented where it
 -- is defined.
@@ -36,4 +37,5 @@ return strict.strictify({
     gd         = require('pregel.math.gd'),
     auc        = require('pregel.math.auc'),
     percentile = require('pregel.math.percentile'),
+    mf         = require('pregel.math.mf'),
 })
