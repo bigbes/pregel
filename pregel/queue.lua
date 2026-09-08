@@ -321,8 +321,13 @@ local tube_common_methods = {
     --
     -- Only does anything in squash_only mode; otherwise put() has already
     -- combined and there is nothing left to fold. A receiver whose messages
-    -- fold to nil is left empty rather than re-put. The folded message is
-    -- re-put with no sender, for the reason put() gives.
+    -- fold to nil is left empty rather than re-put.
+    --
+    -- The folded message has no sender because the put() below passes none --
+    -- not because of put()'s own combiner branch, which does not run in
+    -- squash_only mode. Measured: taking the `sender = nil` out of both
+    -- engines' put() leaves the squash tests green and turns the on-put
+    -- combiner tests red. Two guards, one property.
     --
     -- @function squash
     squash = function(self)
@@ -503,9 +508,12 @@ local function tube_new(name, options)
             format = TUBE_FORMAT
         })
         -- if_not_exists returns the space that is there without touching its
-        -- format, so a space written before the sender field existed would
-        -- refuse the next four-field insert. Widen it instead: the field is
-        -- nullable, so the tuples already in it stay valid.
+        -- format, so a space written before the sender field existed still
+        -- declares three. That does not stop the four-field insert -- a tuple
+        -- may carry more fields than the format names (measured) -- but it
+        -- leaves field 4 nameless, so `tuple.sender` and anything reading the
+        -- format disagree with the code. Widen it: the field is nullable, so
+        -- the tuples already in it stay valid.
         if #space:format() < #TUBE_FORMAT then
             space:format(TUBE_FORMAT)
         end

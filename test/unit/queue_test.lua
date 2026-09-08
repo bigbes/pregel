@@ -334,8 +334,14 @@ g_table.test_stats_agree_with_senders_stored =
     test_stats_agree_with_senders_stored
 
 -- A queue whose space survived a restart predates the sender field. Adopting
--- it must widen the format rather than refuse the next put -- and the messages
--- already in it read back with no sender.
+-- it must widen the format, and the messages already in it read back with no
+-- sender.
+--
+-- The widening is not what makes the next put work: Tarantool accepts a tuple
+-- with more fields than the format declares, so the four-field insert lands
+-- either way (measured -- with the widening removed every other test here
+-- stays green). What it buys is that field 4 has a name, so `tuple.sender`
+-- and anything reading the space's format see the same queue the code does.
 g_space.test_an_older_space_gains_the_sender_field = function()
     local name = fresh_name()
     local space_name = 'pregel_tube_' .. name
@@ -368,6 +374,17 @@ g_space.test_an_older_space_gains_the_sender_field = function()
         by_message[entry.message] = entry.sender
     end
     t.assert_equals(by_message['from-now'], 'alice')
+
+    -- The adopted space now declares the field, so it is reachable by name.
+    local format = box.space[space_name]:format()
+    t.assert_equals(#format, 4)
+    t.assert_equals(format[4].name, 'sender')
+    t.assert_equals(format[4].is_nullable, true)
+    for _, tuple in box.space[space_name]:pairs() do
+        if tuple[3] == 'from-now' then
+            t.assert_equals(tuple.sender, 'alice')
+        end
+    end
     drop(q)
 end
 
