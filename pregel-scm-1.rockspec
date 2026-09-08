@@ -34,5 +34,6 @@ build = {
         ['pregel.avro.codec']        = 'pregel/avro/codec.lua',
         ['pregel.avro.deflate']      = 'pregel/avro/deflate.lua',
         ['pregel.avro.ocf']          = 'pregel/avro/ocf.lua',
+        ['pregel.avro.resolve']      = 'pregel/avro/resolve.lua',
     },
 }

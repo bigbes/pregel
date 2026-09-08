@@ -240,9 +240,14 @@ function reader_mt:records()
             end
         end
         local value
-        -- decode_value rather than decode: a null record must come back as
-        -- box.NULL, since a nil would end the iteration.
-        value, self._bpos = codec.decode_value(self.schema, self._block, self._bpos)
+        -- decode_value / the resolver rather than decode: a null record must
+        -- come back as box.NULL, since a nil would end the iteration.
+        if self._resolver ~= nil then
+            value, self._bpos = self._resolver(self._block, self._bpos)
+        else
+            value, self._bpos = codec.decode_value(self.schema, self._block,
+                                                   self._bpos)
+        end
         self._remaining = self._remaining - 1
         self._read = self._read + 1
         return value
@@ -286,7 +291,16 @@ local function open_reader(opts)
         fail('the file has no "avro.schema" metadata')
     end
     self.schema_json = schema_json
-    self.schema = avro_schema.parse(schema_json)
+    -- The schema the file was written with; records are always decoded through
+    -- it, resolved against opts.schema when the caller asked for a different
+    -- one.
+    self.writer_schema = avro_schema.parse(schema_json)
+    self.schema = self.writer_schema
+    if opts.schema ~= nil then
+        self.schema = avro_schema.parse(opts.schema)
+        self._resolver = require('pregel.avro.resolve')
+            .resolver(self.writer_schema, self.schema)
+    end
     -- A file with no codec entry uses the null codec.
     self.codec  = meta['avro.codec'] or 'null'
     self._codec = get_codec(self.codec)
@@ -420,7 +434,8 @@ end
 --              carries the bytes of a file to read.
 -- @param opts  mode = 'r' (default) or 'w';
 --              for 'w': schema (required), codec, block_size, metadata, sync;
---              for 'r': data, to read an in-memory file instead of `path`.
+--              for 'r': data, to read an in-memory file instead of `path`, and
+--              schema, a *reader* schema the records are resolved into.
 function M.open(path, opts)
     if type(path) == 'table' and opts == nil then
         opts, path = path, nil

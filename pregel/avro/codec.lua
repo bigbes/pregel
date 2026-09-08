@@ -562,12 +562,128 @@ end
 
 M.decode_value = decode_value
 
+--------------------------------------------------------------------------------
+-- Skipping
+--
+-- Schema resolution drops the writer's fields the reader does not want; walking
+-- past them without building the values they hold is what this is for.
+--------------------------------------------------------------------------------
+
+local skip_value
+
+local skippers = {}
+
+skippers['null']    = function(_, _, pos) return pos end
+skippers['boolean'] = function(_, data, pos)
+    need(data, pos, 1)
+    return pos + 1
+end
+skippers['int']     = function(_, data, pos) local _, p = get_long_raw(data, pos) return p end
+skippers['long']    = skippers['int']
+skippers['float']   = function(_, data, pos) need(data, pos, 4) return pos + 4 end
+skippers['double']  = function(_, data, pos) need(data, pos, 8) return pos + 8 end
+skippers['enum']    = skippers['int']
+
+local function skip_binary(_, data, pos)
+    local len, next_pos = get_size(data, pos, 'length')
+    need(data, next_pos, len)
+    return next_pos + len
+end
+
+skippers['bytes']  = skip_binary
+skippers['string'] = skip_binary
+
+skippers['fixed'] = function(sc, data, pos)
+    need(data, pos, sc.size)
+    return pos + sc.size
+end
+
+--- Walk an array or a map. A block written in the negative-count form declares
+--  its byte size, which lets the whole block be jumped over at once.
+local function skip_blocks(data, pos, per_entry)
+    while true do
+        local count
+        count, pos = get_long_raw(data, pos)
+        if count == 0 then
+            return pos
+        end
+        if count < 0 then
+            local size
+            size, pos = get_size(data, pos, 'block size')
+            need(data, pos, size)
+            pos = pos + size
+        else
+            for _ = 1, tonumber(count) do
+                pos = per_entry(pos)
+            end
+        end
+    end
+end
+
+skippers['array'] = function(sc, data, pos)
+    return skip_blocks(data, pos, function(p)
+        return skip_value(sc.items, data, p)
+    end)
+end
+
+skippers['map'] = function(sc, data, pos)
+    return skip_blocks(data, pos, function(p)
+        return skip_value(sc.values, data, skip_binary(nil, data, p))
+    end)
+end
+
+skippers['union'] = function(sc, data, pos)
+    local idx, next_pos = get_int(data, pos)
+    local branch = sc.types[idx + 1]
+    if branch == nil then
+        fail('union branch index %d is out of range (%d branches)', idx, #sc.types)
+    end
+    return skip_value(branch, data, next_pos)
+end
+
+skippers['record'] = function(sc, data, pos)
+    for i = 1, #sc.fields do
+        pos = skip_value(sc.fields[i].type, data, pos)
+    end
+    return pos
+end
+
+--- Advance past one value without building it. Returns the next position.
+skip_value = function(sc, data, pos)
+    local fn = skippers[sc.kind]
+    if fn == nil then
+        fail('cannot skip a schema of kind %q', tostring(sc.kind))
+    end
+    return fn(sc, data, pos)
+end
+
+M.skip_value = skip_value
+
+function M.skip(sc, data, pos)
+    return skip_value(avro_schema.parse(sc), data, pos or 1)
+end
+
+-- pregel.avro.resolve requires this module, so it is loaded on first use rather
+-- than at the top.
+local resolve_mod
+
 --- Decode one value out of `data`, starting at `pos` (1-based, default 1).
---  Returns the value and the position just past it.
-function M.decode(sc, data, pos)
+--
+-- With a `reader_schema`, the bytes are read through the specification's schema
+-- resolution rules instead: `sc` describes how they were written and
+-- `reader_schema` what the caller wants back.
+--
+-- Returns the value and the position just past it.
+function M.decode(sc, data, pos, reader_schema)
     sc = avro_schema.parse(sc)
     if type(data) ~= 'string' then
         fail('decode expects a string, got %s', type(data))
+    end
+    if reader_schema ~= nil then
+        if resolve_mod == nil then
+            resolve_mod = require('pregel.avro.resolve')
+        end
+        return resolve_mod.decode(sc, data, pos or 1, reader_schema)
     end
     local value, next_pos = decode_value(sc, data, pos or 1)
     if value == NULL then

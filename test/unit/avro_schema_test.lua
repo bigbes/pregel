@@ -126,6 +126,21 @@ g.test_union_branch_index = function()
     t.assert_equals(u.branch_index.F, 3)
 end
 
+g.test_type_aliases_are_fullnames_but_field_aliases_are_not = function()
+    -- A named type's aliases are fullnames and pick up the enclosing namespace;
+    -- a field has no namespace, so qualifying its aliases the same way would
+    -- stop them ever matching a writer's field during schema resolution.
+    local sc = schema.parse({
+        type = 'record', name = 'User', namespace = 't',
+        aliases = {'Person', 'other.Thing'},
+        fields = {
+            {name = 'full_name', type = 'string', aliases = {'name', 'nm'}},
+        },
+    })
+    t.assert_equals(sc.aliases, {'t.Person', 'other.Thing'})
+    t.assert_equals(sc.field_map.full_name.aliases, {'name', 'nm'})
+end
+
 g.test_logical_type_is_kept_as_metadata = function()
     local sc = schema.parse({type = 'long', logicalType = 'timestamp-millis'})
     t.assert_equals(sc.kind, 'long')
@@ -201,6 +216,12 @@ end
 g.test_enum_default_must_be_a_symbol = function()
     assert_rejects({type = 'enum', name = 'E', symbols = {'A'}, default = 'Z'},
                    'is not one of its symbols')
+end
+
+g.test_a_dotted_field_alias_is_rejected = function()
+    assert_rejects({type = 'record', name = 'R',
+                    fields = {{name = 'a', type = 'int', aliases = {'x.y'}}}},
+                   'field "aliases" must be an array of names')
 end
 
 g.test_bad_field_order_is_rejected = function()

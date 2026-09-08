@@ -19,12 +19,17 @@ local schema  = require('pregel.avro.schema')
 local codec   = require('pregel.avro.codec')
 local ocf     = require('pregel.avro.ocf')
 local deflate = require('pregel.avro.deflate')
+local resolve = require('pregel.avro.resolve')
 
 local M = {
     schema   = schema,
     codec    = codec,
     ocf      = ocf,
     deflate  = deflate,
+    resolve  = resolve,
+    -- A reusable decoder for one (writer schema, reader schema) pair.
+    resolver = resolve.resolver,
+    skip     = codec.skip,
     -- A stand-in for a JSON null, so that a null value keeps its key in a
     -- record, array or map where a Lua nil would vanish.
     NULL     = schema.NULL,

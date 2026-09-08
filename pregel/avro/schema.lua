@@ -164,6 +164,8 @@ local function collect_props(spec, known)
     return props
 end
 
+--- Aliases of a *named type*, which are fullnames and so are resolved against
+--  the enclosing namespace just like the type's own name.
 local function parse_aliases(spec, enclosing_ns)
     local raw = spec.aliases
     if raw == nil or raw == NULL then
@@ -180,6 +182,27 @@ local function parse_aliases(spec, enclosing_ns)
         end
         local _, _, full = resolve_name(alias, nil, enclosing_ns)
         out[i] = full
+    end
+    return out
+end
+
+--- Aliases of a record *field*, which are plain field names: a field has no
+--  namespace, so qualifying these the way type aliases are qualified would stop
+--  them ever matching a writer's field.
+local function parse_field_aliases(spec)
+    local raw = spec.aliases
+    if raw == nil or raw == NULL then
+        return nil
+    end
+    if type(raw) ~= 'table' then
+        fail('field "aliases" must be an array of names')
+    end
+    local out = {}
+    for i = 1, #raw do
+        if not is_simple_name(raw[i]) then
+            fail('field "aliases" must be an array of names, got %q', tostring(raw[i]))
+        end
+        out[i] = raw[i]
     end
     return out
 end
@@ -244,7 +267,7 @@ local function parse_record(ctx, spec, enclosing_ns)
             index    = i,
             -- A field's type is resolved in the namespace of the record.
             type     = parse_any(ctx, rf.type, sc.namespace),
-            aliases  = parse_aliases(rf, sc.namespace),
+            aliases  = parse_field_aliases(rf),
             props    = collect_props(rf, KNOWN_FIELD_ATTR),
         }
         if rf.doc ~= nil and rf.doc ~= NULL then
