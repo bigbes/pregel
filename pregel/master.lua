@@ -1,57 +1,67 @@
-local fun   = require('fun')
-local log   = require('log')
-local uri   = require('uri')
-local json  = require('json')
-local yaml  = require('yaml')
-local clock = require('clock')
-local fiber = require('fiber')
+--- The pregel master.
+--
+-- The master owns no graph. It drives the superstep loop -- run the compute
+-- functions everywhere, apply the topology mutations everywhere, merge the
+-- aggregators, hand the merged values back -- and stops when no worker has a
+-- message left to deliver or a vertex left running.
 
-local is_callable = require('pregel.utils').is_callable
-
-yaml.cfg{
-    encode_load_metatables = true,
-    encode_use_tostring = true,
-    encode_invalid_as_nil = true,
-}
+local log = require('log')
 
 local mpool      = require('pregel.mpool')
 local aggregator = require('pregel.aggregator')
 
-local xpcall_tb = require('pregel.utils').xpcall_tb
+local utils       = require('pregel.utils')
+local is_callable = utils.is_callable
+local xpcall_tb   = utils.xpcall_tb
+local error       = utils.error
 
+local RPC_DELIVER = 'pregel.master.deliver'
+
+-- One master per process, so the RPC entry point does not need to be told
+-- which one it is talking to.
 local master = nil
 
 local info_functions = setmetatable({
     ['aggregator.inform'] = function(args)
-        -- args[1] - aggregator name
-        -- args[2] - aggregator new value
-        return master.aggregators[args[1]]:merge_master(args[2])
+        -- args[1] - aggregator name, args[2] - the worker's value
+        local aggr = master.aggregators[args[1]]
+        if aggr == nil then
+            error("unknown aggregator: %s", tostring(args[1]))
+        end
+        return aggr:merge_master(args[2])
     end,
 }, {
-    __index = function(self, op)
-        return function(k)
+    __index = function(_, op)
+        return function()
+            -- The 1.6 version called the global error() here, which takes a
+            -- level rather than format arguments: it raised "bad argument #2
+            -- to 'error'" and never said which operation was unknown.
             error('unknown operation: %s', op)
         end
     end
 })
 
 local function deliver_msg(msg, args)
-    local stat, err = xpcall_tb(function()
+    assert(master ~= nil, 'no pregel master found')
+    local status, err = xpcall_tb(function()
         info_functions[msg](args)
         return 1
     end)
-
-    if stat == false then
+    if status == false then
         error(tostring(err))
     end
+    return 'ok'
 end
 
 local master_mt = {
     __index = {
-        wait_up = function (self)
+        --- Block until every worker is up and has reached this master.
+        wait_up = function(self)
             self.mpool:send_wait('wait')
+            return self
         end,
-        start = function (self)
+        --- Run supersteps until the graph goes quiet.
+        start = function(self)
             log.info('master:start(): begin')
             self.mpool:send_wait('count')
             local superstep = 1
@@ -61,100 +71,125 @@ local master_mt = {
                 for _, v in ipairs(result) do
                     log.info('superstep took %010.6f seconds', v[1])
                 end
-                -- default all aggregators
-                for k, v in pairs(self.aggregators) do
-                    v:make_default()
+                -- Reset every aggregator before the workers report into it,
+                -- so a superstep aggregates its own values and not the sum of
+                -- every superstep so far.
+                for _, aggr in pairs(self.aggregators) do
+                    aggr:make_default()
                 end
                 self.mpool:send_wait('superstep.after')
                 log.info('master:start(): superstep %d end', superstep)
 
-                -- now, when we gather all values, inform workers
-                for k, v in pairs(self.aggregators) do
-                    v:inform_workers()
+                -- Now that every worker has reported, hand the merged values
+                -- back out.
+                for _, aggr in pairs(self.aggregators) do
+                    aggr:inform_workers()
                 end
                 self.mpool:flush()
 
                 local msg_count = self.aggregators['__messages']()
                 local inp_count = self.aggregators['__in_progress']()
-                log.info('master:start(): %d messages and %d in progress',
+                log.info('master:start(): %d message(s) and %d in progress',
                          msg_count, inp_count)
                 if msg_count == 0 and inp_count == 0 then
-                    -- we don't have anything to do, so stop iterating
                     break
                 end
                 superstep = superstep + 1
             end
-            log.info('master:start(): end')
+            log.info('master:start(): end after %d superstep(s)', superstep)
+            self.superstep_count = superstep
+            return superstep
         end,
+        --- Run the master-side loader, then push what it produced.
         preload = function(self)
+            assert(self.preload_func ~= nil,
+                   'no master_preload configured for this instance')
             self.preload_func()
             self.mpool:flush()
+            return self
         end,
+        --- Ask every worker to run its own loader.
         preload_on_workers = function(self)
             self.mpool:send_wait('preload')
+            return self
         end,
         add_aggregator = function(self, name, opts)
-            assert(self.aggregators[name] == nil)
+            assert(self.aggregators[name] == nil,
+                   'aggregator already exists: ' .. tostring(name))
             self.aggregators[name] = aggregator.new(name, self, opts)
             return self
         end,
         save_snapshot = function(self)
-            master.mpool:send_wait('snapshot')
+            self.mpool:send_wait('snapshot')
+            return self
+        end,
+        stop = function(self)
+            self.mpool:stop()
+            if master == self then
+                master = nil
+            end
         end,
     }
 }
 
+--- Let `user` call this module's RPC entry point.
+local function grant(user)
+    box.schema.user.grant(user, 'execute', 'lua_call', RPC_DELIVER,
+                          {if_not_exists = true})
+end
+
+--- Create the master for the instance called `name`.
 --
--- servers = {
---     'login:password@host1:port1',
---     'login:password@host2:port2',
---     'login:password@host3:port3',
---     'login:password@host4:port4',
--- }
---
-local master_new = function(name, options)
+-- options.workers        -- array of every worker's net.box URI, each of which
+--                           may carry its own 'user:password@host:port'
+-- options.obtain_name    -- callable(value) -> vertex name (required)
+-- options.pool_size      -- messages per batch (default 1000)
+-- options.master_preload -- callable(self, preload_args) -> loader, or a
+--                           loader, or nil for a master that only coordinates
+-- options.preload_args   -- passed to master_preload
+-- options.user           -- net.box user for the outgoing connections
+-- options.password       -- net.box password for the outgoing connections
+local function master_new(name, options)
+    assert(type(name) == 'string', 'name must be a string')
+    assert(type(options) == 'table', 'options must be a table')
+
     local workers     = options.workers or {}
     local pool_size   = options.pool_size or 1000
     local obtain_name = options.obtain_name
 
-    assert(is_callable(obtain_name),      'options.obtain_name must be callable')
+    assert(is_callable(obtain_name), 'options.obtain_name must be callable')
 
     local self = setmetatable({
-        name         = name,
-        preload_func = nil,
-        workers      = workers,
-        mpool        = mpool.new(name, workers, {
-            msg_count = pool_size
+        name            = name,
+        preload_func    = nil,
+        workers         = workers,
+        mpool           = mpool.new(name, workers, {
+            msg_count = pool_size,
+            user      = options.user,
+            password  = options.password,
         }),
-        obtain_name  = obtain_name,
-        aggregators  = {}
+        obtain_name     = obtain_name,
+        aggregators     = {},
+        superstep_count = 0,
     }, master_mt)
 
     local preload = options.master_preload
     if type(preload) == 'function' then
         preload = preload(self, options.preload_args)
-    elseif type(preload) == 'table' then
-        preload = preload
-    else
-        assert(false,
-            string.format('<master_preload> expected "function"/"table", got %s',
-                          type(options.master_preload))
-        )
+    elseif type(preload) ~= 'table' and type(preload) ~= 'nil' then
+        error('<master_preload> expected "function"/"table"/"nil", got "%s"',
+              type(preload))
     end
     self.preload_func = preload
 
     self:add_aggregator('__in_progress', {
         internal = true,
         default  = 0,
-        merge    = function(old, new)
-            return old + new
-        end,
+        merge    = function(old, new) return old + new end,
     }):add_aggregator('__messages', {
         internal = true,
         default  = 0,
-        merge    = function(old, new)
-            return old + new
-        end,
+        merge    = function(old, new) return old + new end,
     })
 
     master = self
@@ -162,7 +197,15 @@ local master_new = function(name, options)
     return self
 end
 
+-- See the note in worker.lua: the registry table is shared, so it is created
+-- only if the other module has not created it already.
+rawset(_G, 'pregel', rawget(_G, 'pregel') or {})
+_G.pregel.master = {
+    deliver = deliver_msg,
+}
+
 return {
     new     = master_new,
+    grant   = grant,
     deliver = deliver_msg,
 }

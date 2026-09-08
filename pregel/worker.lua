@@ -1,39 +1,49 @@
-#!/usr/bin/env tarantool
+--- The pregel worker.
+--
+-- A worker owns a shard of the graph -- the vertices whose names hash to its
+-- bucket -- and runs the compute function over them once per superstep. The
+-- master drives the supersteps; everything a worker is told to do arrives as
+-- one of the protocol messages in `info_functions` below.
+--
+-- Spaces per instance `name`:
+--   data_<name>               the graph shard
+--   topology_mutation_<name>  edge/vertex additions and deletions, applied
+--                             between supersteps
+--   pregel_tube_mqueue_*_<name>  the two message queues (see pregel.queue)
 
-local fio = require('fio')
-local fun = require('fun')
-local log = require('log')
-local uri = require('uri')
-local json = require('json')
-local yaml = require('yaml')
-local fiber = require('fiber')
-local digest = require('digest')
+local fun    = require('fun')
+local log    = require('log')
+local fiber  = require('fiber')
 local remote = require('net.box')
-
-local fmtstring   = string.format
 
 local queue      = require('pregel.queue')
 local vertex     = require('pregel.vertex')
 local aggregator = require('pregel.aggregator')
 local mpool      = require('pregel.mpool')
 
-local timeit                = require('pregel.utils').timeit
-local xpcall_tb             = require('pregel.utils').xpcall_tb
-local is_callable           = require('pregel.utils').is_callable
-local error                 = require('pregel.utils').error
-local execute_authorized_mr = require('pregel.utils').execute_authorized_mr
+local utils       = require('pregel.utils')
+local xpcall_tb   = utils.xpcall_tb
+local is_callable = utils.is_callable
+local error       = utils.error
 
-local vertex_compute        = vertex.vertex_private_methods.compute
-local vertex_write_solution = vertex.vertex_private_methods.write_solution
+local vertex_compute = vertex.vertex_private_methods.compute
 
 local workers = {}
 
 local RECONNECT_AFTER = 5
+local WAIT_TIMEOUT    = 60
 
 local TOPMT_EDGE_DELETE   = 0
 local TOPMT_VERTEX_DELETE = 1
 local TOPMT_VERTEX_STORE  = 2
 local TOPMT_EDGE_STORE    = 3
+
+-- The registry names this module publishes. Everything that talks to a worker
+-- goes through conn:call on one of these, so pregel.worker.grant(user) is the
+-- whole privilege story -- no universe grant, no eval.
+local RPC_DELIVER       = 'pregel.worker.deliver'
+local RPC_DELIVER_BATCH = 'pregel.worker.deliver_batch'
+local RPC_WAIT          = 'pregel.worker.wait'
 
 local function count_active(acc, tuple)
     return acc + (tuple[2] == false and 1 or 0)
@@ -58,22 +68,16 @@ local info_functions = setmetatable({
     ['edge.delete.delayed'] = function(instance, args)
         return instance:edge_delete_delayed(args[1], args[2])
     end,
-    ['snapshot'] = function(instance, args)
+    ['snapshot'] = function()
         return box.snapshot()
     end,
     ['message.deliver'] = function(instance, args)
-        -- args[1] - sent to
-        -- args[2] - sent value
-        -- args[3] - sent from
-        return instance.mqueue_next:put(args[1], args[2], args[3])
+        -- args[1] - receiver, args[2] - message, args[3] - sender
+        return instance.mqueue_next:put(args[1], args[2])
     end,
     ['aggregator.inform'] = function(instance, args)
-        -- args[1] - aggregator name
-        -- args[2] - aggregator new value
+        -- args[1] - aggregator name, args[2] - new value
         instance.aggregators[args[1]].value = args[2]
-    end,
-    ['superstep.before'] = function(instance)
-        return instance:before_superstep()
     end,
     ['superstep'] = function(instance, args)
         return instance:run_superstep(args)
@@ -81,67 +85,106 @@ local info_functions = setmetatable({
     ['superstep.after'] = function(instance, args)
         return instance:after_superstep(args)
     end,
-    ['test.deliver'] = function(instance, args)
-        fiber.sleep(10)
-    end,
-    ['count'] = function(instance, args)
+    ['count'] = function(instance)
         instance.in_progress = instance.data_space:pairs():reduce(count_active, 0)
-        log.info('<count> Found %d active vertices', instance.in_progress)
+        log.info('<count> found %d active vertices', instance.in_progress)
+        return instance.in_progress
     end,
     ['preload'] = function(instance)
-        instance:preload()
+        return instance:preload()
     end
 }, {
-    __index = function(self, op)
-        return function(k)
+    __index = function(_, op)
+        return function()
             error('unknown message type: %s', op)
         end
     end
 })
 
+--- Wait until the instance called `name` exists here and has reached its
+-- master. This is the first thing the master asks of every worker.
+local function wait_ready(name)
+    local deadline = fiber.clock() + WAIT_TIMEOUT
+    while workers[name] == nil do
+        if fiber.clock() > deadline then
+            error("pregel worker '%s' was not created within %d seconds",
+                  tostring(name), WAIT_TIMEOUT)
+        end
+        fiber.sleep(0.01)
+    end
+    local instance = workers[name]
+    if not instance.master:wait_connected(WAIT_TIMEOUT) then
+        error("pregel worker '%s' cannot reach its master within %d seconds",
+              tostring(name), WAIT_TIMEOUT)
+    end
+    return true
+end
+
 local function deliver_msg(name, msg, args)
     if msg == 'wait' then
-        while workers[name] == nil do
-            fiber.yield()
-        end
-        workers[name].master:wait_connected()
-    else
-        local rv = {xpcall_tb(function()
-            local op = info_functions[msg]
-            local instance = workers[name]
-            assert(instance, 'no instance found')
-            return op(instance, args)
-        end)}
-        local status = table.remove(rv, 1)
-        if status == false then
-            local errmsg = tostring(rv[1])
-            error(errmsg)
-        end
-        return unpack(rv)
+        return wait_ready(name)
     end
+    local rv = {xpcall_tb(function()
+        local instance = workers[name]
+        assert(instance, 'no pregel instance found')
+        return info_functions[msg](instance, args)
+    end)}
+    local status = table.remove(rv, 1)
+    if status == false then
+        error(tostring(rv[1]))
+    end
+    return unpack(rv)
 end
 
 local function deliver_batch(name, msgs)
-    local stat, err = xpcall_tb(function()
+    local status, err = xpcall_tb(function()
         local instance = workers[name]
-        assert(instance)
+        assert(instance, 'no pregel instance found')
         for _, msg in ipairs(msgs) do
-            local op = info_functions[msg[1]](instance, msg[2])
+            info_functions[msg[1]](instance, msg[2])
         end
         return #msgs
     end)
-    if stat == false then
+    if status == false then
         error(tostring(err))
     end
+    return #msgs
 end
+
+-------------------------------------------------------------------------------
+-- Topology mutation
+-------------------------------------------------------------------------------
+
+--- Group pending mutations of one type by the vertex they act on.
+--
+-- Everything is read out before anything is applied: applying deletes from the
+-- mutation space, and mutating a space underneath its own iterator is not
+-- something to rely on.
+local function collect_mutations(index, tmtype)
+    local groups, order = {}, {}
+    for _, tuple in index:pairs({tmtype}) do
+        local id, _, name, dest, value = tuple:unpack()
+        local group = groups[name]
+        if group == nil then
+            group = {}
+            groups[name] = group
+            table.insert(order, name)
+        end
+        table.insert(group, {id = id, dest = dest, value = value})
+    end
+    return groups, order
+end
+
+-------------------------------------------------------------------------------
+-- Worker
+-------------------------------------------------------------------------------
 
 local worker_mt = {
     __index = {
         run_superstep = function(self, superstep)
-            local n_count = 0
-
             local function tuple_filter(tuple)
                 local id, halt = tuple:unpack(1, 2)
+                -- A halted vertex with no messages has nothing to do.
                 return not (self.mqueue:len(id) == 0 and halt == true)
             end
 
@@ -150,13 +193,13 @@ local worker_mt = {
                     fiber.yield()
                 end
                 if acc % 10000 == 0 then
-                    log.info('Processed %d/%d vertices', acc,
+                    log.info('processed %d/%d vertices', acc,
                              self.data_space:len())
                 end
                 local vertex_object = self.vertex_pool:pop(tuple)
                 vertex_object.__superstep = superstep
                 vertex_object:vote_halt(false)
-                local rv = vertex_compute(vertex_object)
+                vertex_compute(vertex_object)
                 self.mqueue:delete(vertex_object.__id)
                 self.vertex_pool:push(vertex_object)
                 return acc + 1
@@ -168,7 +211,6 @@ local worker_mt = {
                            :filter(tuple_filter)
                            :reduce(tuple_process, 0)
 
-            -- can't reach, for now
             while self.vertex_pool.count > 0 do
                 fiber.yield()
             end
@@ -179,212 +221,324 @@ local worker_mt = {
             return 'ok'
         end,
         after_superstep = function(self)
-            -- SWAP MESSAGE QUEUES
-            local tmp = self.mqueue
-            self.mqueue = self.mqueue_next
-            self.mqueue_next = tmp
+            -- Swap the message queues: what was delivered during the superstep
+            -- becomes what the next one reads.
+            self.mqueue, self.mqueue_next = self.mqueue_next, self.mqueue
 
-            -- TODO: if mqueue_next is not empty, then execute callback on messages
-            local len = self.mqueue_next:len()
-            if len > 0 then
-                log.info('left %d messages', len)
-                self.mqueue_next.space:pairs():enumerate():each(function(id, tuple)
-                    log.info('msg %d: %s', id, json.encode(tuple))
-                end)
+            local left = self.mqueue_next:len()
+            if left > 0 then
+                log.warn('%d message(s) left unread from the last superstep',
+                         left)
+                for receiver in self.mqueue_next:receiver_closure() do
+                    log.warn('  unread message(s) for %s', tostring(receiver))
+                end
             end
             self.mqueue_next:truncate()
 
-            -- TOPOLOGY MUTATION
-            local tmspace   = self.topology_mutation_space
-            local tmspacein = self.topology_mutation_space.index.name
-            local last_key  = nil
-            log.info('<topology mutation> stats:')
-            log.info('<topology mutation, del_edge>   %d tasks', tmspacein:count(TOPMT_EDGE_DELETE))
-            log.info('<topology mutation, del_vertex> %d tasks', tmspacein:count(TOPMT_VERTEX_DELETE))
-            log.info('<topology mutation, add_vertex> %d tasks', tmspacein:count(TOPMT_VERTEX_STORE))
-            log.info('<topology mutation, add_edge>   %d tasks', tmspacein:count(TOPMT_EDGE_STORE))
-            -- first part  - delete edges
-            -- TODO: conflict resolving if we can't find edge
-            last_key = nil
-            while true do
-                local first = tmspace:select(last_key, {limit=1, iterator='GT'})
-                if first[1] == nil or first[1][2] ~= TOPMT_EDGE_DELETE then
-                    break
-                end
-                local src = first[1][3]
-                last_key = {TOPMT_EDGE_DELETE, src}
-                first = tmspace:select(last_key)
-                local edge_list = self.data_space:get{src}[4]
-                for idx, tuple in ipairs(first) do
-                    local idx, tmtype, src, dest = tuple:unpack()
-                    local is_deleted = false
-                    for idx, edge in ipairs(edge_list) do
-                        if edge[1] == dest then
-                            log.info("<topology mutation, del_edge> edge '%s'->'%s': deleted", src, dest)
-                            table.remove(edge_list, idx)
-                            is_deleted = true
-                            break
-                        end
-                    end
-                    if not is_deleted then
-                        log.info("<topology mutation, del_edge> edge '%s'->'%s': not exists", src, dest)
-                    end
-                    tmspace:delete(idx)
-                end
-                self.data_space:update(src, {{'=', 4, edge_list}})
+            -- In squash_only mode the combiner has not run yet: fold each
+            -- receiver's messages down now, before the next superstep reads
+            -- them and before __messages is counted.
+            self.mqueue:squash()
+
+            self:apply_topology_mutations()
+
+            self.aggregators['__in_progress'](self.in_progress)
+            self.aggregators['__messages'](self.mqueue:len())
+
+            log.info('%d message(s) in mqueue, %d vertices in progress',
+                     self.mqueue:len(), self.in_progress)
+
+            for _, aggr in pairs(self.aggregators) do
+                aggr:inform_master()
             end
-            -- second part - delete vertices
-            -- TODO: conflict resolving if we can't find vertex
-            local to_delete = {}
-            for _, tuple in tmspacein:pairs{TOPMT_VERTEX_DELETE} do
-                local idx, tmtype, vertex_name = tuple:unpack()
-                local rv = self.data_space:delete{vertex_name}
-                if rv == nil then
-                    log.error("<topology mutation, del_vertex> vertex '%s': deleted", vertex_name)
+
+            return 'ok'
+        end,
+        apply_topology_mutations = function(self)
+            local tmspace = self.topology_mutation_space
+            local tmindex = tmspace.index.type_name
+            local processed = {}
+
+            local function done(group)
+                for _, req in ipairs(group) do
+                    table.insert(processed, req.id)
+                end
+            end
+
+            log.info('<topology mutation> del_edge %d, del_vertex %d, ' ..
+                     'add_vertex %d, add_edge %d tasks',
+                     tmindex:count({TOPMT_EDGE_DELETE}),
+                     tmindex:count({TOPMT_VERTEX_DELETE}),
+                     tmindex:count({TOPMT_VERTEX_STORE}),
+                     tmindex:count({TOPMT_EDGE_STORE}))
+
+            -- 1. delete edges
+            local groups, order = collect_mutations(tmindex, TOPMT_EDGE_DELETE)
+            for _, src in ipairs(order) do
+                local group = groups[src]
+                local tuple = self.data_space:get{src}
+                if tuple == nil then
+                    -- The vertex may have been deleted in this same batch, or
+                    -- never have existed. Either way there is nothing to
+                    -- index into, which is what the old code did here.
+                    log.info("<topology mutation, del_edge> vertex '%s' " ..
+                             "does not exist", src)
+                else
+                    local edge_list = tuple:totable()[4]
+                    for _, req in ipairs(group) do
+                        local removed = false
+                        for idx, edge in ipairs(edge_list) do
+                            if edge[1] == req.dest then
+                                table.remove(edge_list, idx)
+                                removed = true
+                                break
+                            end
+                        end
+                        log.info("<topology mutation, del_edge> '%s'->'%s': %s",
+                                 src, tostring(req.dest),
+                                 removed and 'deleted' or 'does not exist')
+                    end
+                    self.data_space:update(src, {{'=', 4, edge_list}})
+                end
+                done(group)
+            end
+
+            -- 2. delete vertices
+            groups, order = collect_mutations(tmindex, TOPMT_VERTEX_DELETE)
+            for _, name in ipairs(order) do
+                local rv = self.data_space:delete{name}
+                if rv ~= nil then
+                    log.info("<topology mutation, del_vertex> '%s': deleted",
+                             name)
+                    -- delete() returns the tuple it removed, so is_halted is
+                    -- readable exactly when there was something to delete --
+                    -- the old code had this branch inverted and indexed nil.
                     if rv[2] == false then
                         self.in_progress = self.in_progress - 1
                     end
                 else
-                    log.error("<topology mutation, del_vertex> vertex '%s': not exists", vertex_name)
+                    log.info("<topology mutation, del_vertex> '%s': " ..
+                             "does not exist", name)
                 end
-                table.insert(to_delete, idx)
+                done(groups[name])
             end
-            while true do
-                local idx = table.remove(to_delete)
-                if idx == nil then break end
-                tmspace:delete(idx)
-            end
-            -- third part - add vertices
-            -- optimization - add all edges (that needed to be added to those
-            -- vertices) at the same time
-            -- TODO: conflict resolving if vertex is already presented
-            for _, tuple in tmspacein:pairs{TOPMT_VERTEX_STORE} do
-                local idx, tmtype, vertex_name, vertex = tuple:unpack()
-                local edges = {}
-                local edge_list = tmspacein:select{TOPMT_EDGE_STORE, vertex_name}
-                for _, tuple in ipairs(edge_list) do
-                    table.insert(edges, {tuple:unpack(4, 5)})
-                    table.insert(to_delete, tuple[1])
-                end
-                if self.data_space:get{vertex_name} ~= nil then
-                    log.info("<topology mutation, add_vertex> vertex '%s': exists", vertex_name)
+
+            -- 3. add vertices, before any edge that points out of them
+            groups, order = collect_mutations(tmindex, TOPMT_VERTEX_STORE)
+            for _, name in ipairs(order) do
+                local group = groups[name]
+                if self.data_space:get{name} ~= nil then
+                    log.info("<topology mutation, add_vertex> '%s': exists",
+                             name)
                 else
-                    self.data_space:replace{vertex_name, false, vertex, edges}
-                    log.info("<topology mutation, add_vertex> vertex '%s': added", vertex_name)
+                    self.data_space:replace{name, false, group[1].value, {}}
+                    log.info("<topology mutation, add_vertex> '%s': added",
+                             name)
                     self.in_progress = self.in_progress + 1
                 end
-                table.insert(to_delete, idx)
+                done(group)
             end
-            while true do
-                local idx = table.remove(to_delete)
-                if idx == nil then break end
-                tmspace:delete(idx)
-            end
-            -- fourth part - add edges
-            -- TODO: conflict resolving if edge is already in list of edges
-            last_key = nil
-            while true do
-                local first = tmspace:select(last_key, {limit=1, iterator='GT'})
-                if first[1] == nil then
-                    break
-                end
-                assert(first[1][2] == TOPMT_EDGE_STORE)
-                local src = first[1][3]
-                last_key = {TOPMT_EDGE_STORE, src}
-                local edge_list = tmspace:select(last_key)
-                local vertex = self.data_space:get{src}
-                if vertex == nil then
-                    log.info("<topology mutation, add_edge> edge '%s'->'*': vertex '%s' doesn't exists", src, src)
+
+            -- 4. add edges
+            groups, order = collect_mutations(tmindex, TOPMT_EDGE_STORE)
+            for _, src in ipairs(order) do
+                local group = groups[src]
+                local tuple = self.data_space:get{src}
+                if tuple == nil then
+                    log.info("<topology mutation, add_edge> vertex '%s' " ..
+                             "does not exist", src)
                 else
-                    local edges = {}
-                    for _, tuple in ipairs(edge_list) do
-                        local dest, value = tuple:unpack(4, 5)
-                        log.info("<topology mutation, add_edge> edge '%s'->'%s': added", src, dest)
-                        table.insert(edges, {dest, value})
+                    local edge_list = tuple:totable()[4]
+                    for _, req in ipairs(group) do
+                        log.info("<topology mutation, add_edge> '%s'->'%s': " ..
+                                 "added", src, tostring(req.dest))
+                        table.insert(edge_list, {req.dest, req.value})
                     end
-                    edge_list = fun.iter(vertex[4]):chain(edges):totable()
                     self.data_space:update(src, {{'=', 4, edge_list}})
                 end
-            end
-            tmspace:truncate()
-
-            -- update internal aggregator values
-            self.aggregators['__in_progress'](self.in_progress)
-            self.aggregators['__messages'](self.mqueue:len())
-
-            log.info('%d messages in mqueue', self.mqueue:len())
-
-            for k, v in pairs(self.aggregators) do
-                v:inform_master()
+                done(group)
             end
 
-            -- TODO: send aggregator's (local) data back to master
-            return 'ok'
+            for _, id in ipairs(processed) do
+                tmspace:delete{id}
+            end
         end,
         add_aggregator = function(self, name, opts)
-            assert(self.aggregators[name] == nil)
+            assert(self.aggregators[name] == nil,
+                   'aggregator already exists: ' .. tostring(name))
             self.aggregators[name] = aggregator.new(name, self, opts)
             return self
         end,
         preload = function(self)
+            if self.preload_func == nil then
+                log.info('no worker preload configured')
+                return 'ok'
+            end
             self.preload_func(self.mpool.self_idx, self.mpool.bucket_cnt)
             self.mpool:flush()
+            return 'ok'
         end,
-        vertex_store = function(self, vertex)
-            local id = self.obtain_name(vertex)
-            self.data_space:replace{id, false, vertex, {}}
+        vertex_store = function(self, value)
+            local id = self.obtain_name(value)
+            self.data_space:replace{id, false, value, {}}
         end,
         edge_store = function(self, from, edges)
-            local tuple = self.data_space:get(from)
-            assert(tuple, 'absence of vertex')
+            local tuple = self.data_space:get{from}
+            if tuple == nil then
+                error("edge.store: vertex '%s' does not exist", tostring(from))
+            end
             tuple = tuple:totable()
             tuple[4] = fun.chain(tuple[4], edges):totable()
             self.data_space:replace(tuple)
         end,
-        vertex_store_delayed = function(self, vertex)
-            log.info('got vertex store')
-            self.topology_mutation_space:auto_increment{
-                TOPMT_VERTEX_STORE, self.obtain_name(vertex), vertex
+        vertex_store_delayed = function(self, value)
+            self.topology_mutation_space:insert{
+                box.NULL, TOPMT_VERTEX_STORE, self.obtain_name(value),
+                box.NULL, value
             }
         end,
         edge_store_delayed = function(self, src, dest, value)
-            self.topology_mutation_space:auto_increment{
-                TOPMT_EDGE_STORE, src, dest, value
+            self.topology_mutation_space:insert{
+                box.NULL, TOPMT_EDGE_STORE, src, dest, value
             }
         end,
         vertex_delete_delayed = function(self, vertex_name)
-            self.topology_mutation_space:auto_increment{
-                TOPMT_VERTEX_DELETE, 2, vertex_name
+            -- The 1.6 version inserted a stray 2 between the type and the
+            -- name, which put the vertex name in the `dest` field and left
+            -- the index looking for a vertex called "2".
+            self.topology_mutation_space:insert{
+                box.NULL, TOPMT_VERTEX_DELETE, vertex_name, box.NULL, box.NULL
             }
         end,
         edge_delete_delayed = function(self, src, dest)
-            self.topology_mutation_space:auto_increment{
-                TOPMT_EDGE_DELETE, src, dest
+            self.topology_mutation_space:insert{
+                box.NULL, TOPMT_EDGE_DELETE, src, dest, box.NULL
             }
+        end,
+        stop = function(self)
+            self.mpool:stop()
+            if self.master ~= nil then
+                self.master:close()
+                self.master = nil
+            end
+            workers[self.name] = nil
         end,
     }
 }
 
--- obtain_name is a function, that'll convert value to key (string)
-local worker_new = function(name, options)
-    -- parse workers
+-------------------------------------------------------------------------------
+-- Schema
+-------------------------------------------------------------------------------
+
+local function create_spaces(name)
+    local data = box.schema.space.create('data_' .. name, {
+        if_not_exists = true,
+        format = {
+            {name = 'id',        type = 'string' },
+            {name = 'is_halted', type = 'boolean'},
+            {name = 'value',     type = 'any'    },
+            {name = 'edges',     type = 'array'  },
+        }
+    })
+    data:create_index('primary', {
+        type          = 'TREE',
+        parts         = {{field = 1, type = 'string'}},
+        if_not_exists = true
+    })
+
+    local tm = box.schema.space.create('topology_mutation_' .. name, {
+        if_not_exists = true,
+        format = {
+            {name = 'id',    type = 'unsigned'},
+            {name = 'type',  type = 'unsigned'},
+            {name = 'name',  type = 'string'  },
+            {name = 'dest',  type = 'any', is_nullable = true},
+            {name = 'value', type = 'any', is_nullable = true},
+        }
+    })
+    -- space:auto_increment() is gone in Tarantool 3; box.NULL in field 1 draws
+    -- from the sequence instead.
+    tm:create_index('primary', {
+        type          = 'TREE',
+        parts         = {{field = 1, type = 'unsigned'}},
+        sequence      = true,
+        if_not_exists = true
+    })
+    tm:create_index('type_name', {
+        type          = 'TREE',
+        parts         = {{field = 2, type = 'unsigned'},
+                         {field = 3, type = 'string'}},
+        unique        = false,
+        if_not_exists = true
+    })
+
+    return data, tm
+end
+
+--- Let `user` call this module's RPC entry points.
+--
+-- Per-function lua_call grants, so a worker exposes exactly three names and
+-- nothing else -- the 1.6 version handed 'execute' on 'universe' to guest,
+-- which is every function in the process.
+local function grant(user)
+    for _, name in ipairs({RPC_DELIVER, RPC_DELIVER_BATCH, RPC_WAIT}) do
+        box.schema.user.grant(user, 'execute', 'lua_call', name,
+                              {if_not_exists = true})
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Construction
+-------------------------------------------------------------------------------
+
+--- Create the worker called `name`.
+--
+-- options.workers        -- array of every worker's net.box URI (required)
+-- options.master         -- the master's net.box URI (required)
+-- options.compute        -- callable(vertex), the compute function (required)
+-- options.obtain_name    -- callable(value) -> vertex name (required)
+-- options.combiner       -- callable(a, b) -> c, folds two messages
+-- options.squash_only    -- run the combiner once per superstep (default false)
+-- options.queue_engine   -- 'space' (default) or 'table'
+-- options.pool_size      -- messages per batch (default 1000)
+-- options.delayed_push   -- back the mpool buckets with spaces (default false)
+-- options.worker_context -- passed through to vertex:get_worker_context()
+-- options.worker_preload -- callable(self, preload_args) -> loader, or a loader
+-- options.preload_args   -- passed to worker_preload
+-- options.user           -- net.box user for the outgoing connections
+-- options.password       -- net.box password for the outgoing connections
+local function worker_new(name, options)
+    assert(type(name) == 'string', 'name must be a string')
+    assert(type(options) == 'table', 'options must be a table')
+
     local worker_uris = options.workers or {}
     local compute     = options.compute
     local combiner    = options.combiner
     local master_uri  = options.master
     local pool_size   = options.pool_size or 1000
     local obtain_name = options.obtain_name
-    local is_delayed  = options.delayed_push
     local wrk_context = options.worker_context
-    if is_delayed == nil then
-        is_delayed = false
-    end
+
+    local is_delayed = options.delayed_push
+    if is_delayed == nil then is_delayed = false end
+
+    -- These two used to be read as undeclared globals inside worker_new, so
+    -- they were always nil and neither option did anything.
+    local squash_only = options.squash_only
+    if squash_only == nil then squash_only = false end
+    local queue_engine = options.queue_engine or 'space'
 
     assert(is_callable(obtain_name),     'options.obtain_name must be callable')
     assert(is_callable(compute),         'options.compute must be callable')
     assert(type(combiner) == 'nil' or is_callable(combiner),
            'options.combiner must be callable or "nil"')
-    assert(type(master_uri) == 'string', 'options.master must be string')
+    assert(type(master_uri) == 'string', 'options.master must be a string')
+    assert(type(squash_only) == 'boolean',
+           'options.squash_only must be boolean or "nil"')
+    assert(queue_engine == 'space' or queue_engine == 'table',
+           'options.queue_engine must be "space", "table" or "nil"')
+
+    local data_space, tm_space = create_spaces(name)
 
     local self = setmetatable({
         name           = name,
@@ -392,109 +546,81 @@ local worker_new = function(name, options)
         master_uri     = master_uri,
         preload_func   = nil,
         mpool          = mpool.new(name, worker_uris, {
-            msg_count    = pool_size,
-            is_delayed   = is_delayed
+            msg_count  = pool_size,
+            is_delayed = is_delayed,
+            user       = options.user,
+            password   = options.password,
         }),
         aggregators    = {},
         in_progress    = 0,
         obtain_name    = obtain_name,
-        worker_context = wrk_context
+        worker_context = wrk_context,
+        data_space              = data_space,
+        topology_mutation_space = tm_space,
     }, worker_mt)
 
     local preload = options.worker_preload
-    if     type(preload) == 'function' then
+    if type(preload) == 'function' then
         preload = preload(self, options.preload_args)
-    elseif type(preload) ~= 'table' and
-           type(preload) ~= 'nil'   then
-        assert(false,
-            ('<worker_preload> expected "function"/"table"/"nil", got "%s"'):format(
-                type(preload)
-            )
-        )
+    elseif type(preload) ~= 'table' and type(preload) ~= 'nil' then
+        error('<worker_preload> expected "function"/"table"/"nil", got "%s"',
+              type(preload))
     end
     self.preload_func = preload
 
-    execute_authorized_mr('guest', function()
-        box.once('pregel_load-' .. name, function()
-            local space = box.schema.create_space('data_' .. name, {
-                format = {
-                    [1] = {name = 'id',        type = 'str'  },
-                    [2] = {name = 'is_halted', type = 'bool' },
-                    [3] = {name = 'value',     type = '*'    },
-                    [4] = {name = 'edges',     type = 'array'}
-                }
-            })
-            space:create_index('primary', {
-                type = 'TREE',
-                parts = {1, 'STR'},
-            })
-        end)
-        box.once('pregel_tm-' .. name, function()
-            local space = box.schema.create_space('topology_mutation_' .. name, {
-                format = {
-                    [1] = {name = 'id',    type = 'num'},
-                    [2] = {name = 'type',  type = 'num'},
-                    [3] = {name = 'name',  type = 'str'},
-                    [4] = {name = 'dest',  type = '*'  },
-                    [5] = {name = 'value', type = '*'  },
-                }
-            })
-            space:create_index('primary', {
-                type  = 'TREE',
-                parts = {1, 'NUM'}
-            })
-            space:create_index('name', {
-                type   = 'TREE',
-                parts  = {2, 'NUM', 3, 'STR'},
-                unique = false
-            })
-        end)
-
-        self.mqueue = queue.new('mqueue_first_' .. name, {
-            combiner    = combiner,
-            squash_only = squash_only,
-            engine      = tube_engine
-        })
-        self.mqueue_next = queue.new('mqueue_second_' .. name, {
-            combiner    = combiner,
-            squash_only = squash_only,
-            engine      = tube_engine
-        })
-        self.vertex_pool = vertex.pool_new{
-            compute = compute,
-            pregel = self
-        }
-    end)
-
-    self.data_space              = box.space['data_' .. name]
-    assert(self.data_space ~= nil)
-    self.topology_mutation_space = box.space['topology_mutation_' .. name]
-    assert(self.topology_mutation_space ~= nil)
+    self.mqueue = queue.new('mqueue_first_' .. name, {
+        combiner    = combiner,
+        squash_only = squash_only,
+        engine      = queue_engine
+    })
+    self.mqueue_next = queue.new('mqueue_second_' .. name, {
+        combiner    = combiner,
+        squash_only = squash_only,
+        engine      = queue_engine
+    })
+    self.vertex_pool = vertex.pool_new{
+        compute = compute,
+        pregel  = self
+    }
 
     self.master = remote.new(master_uri, {
+        user            = options.user,
+        password        = options.password,
         wait_connected  = false,
         reconnect_after = RECONNECT_AFTER
     })
+
     self:add_aggregator('__in_progress', {
         internal = true,
         default  = 0,
-        merge    = function(old, new)
-            return old + new
-        end,
+        merge    = function(old, new) return old + new end,
     }):add_aggregator('__messages', {
         internal = true,
         default  = 0,
-        merge    = function(old, new)
-            return old + new
-        end,
+        merge    = function(old, new) return old + new end,
     })
 
     workers[name] = self
     return self
 end
 
-return {
-    new           = worker_new,
+--- Publish the RPC entry points on _G, where conn:call() can reach them.
+--
+-- vshard does the same with _G.vshard. rawset, because the table may already
+-- exist: master.lua registers into the same one when both run in a process.
+rawset(_G, 'pregel', rawget(_G, 'pregel') or {})
+_G.pregel.worker = {
     deliver       = deliver_msg,
     deliver_batch = deliver_batch,
+    wait          = wait_ready,
+}
+
+return {
+    new           = worker_new,
+    grant         = grant,
+    deliver       = deliver_msg,
+    deliver_batch = deliver_batch,
+    wait          = wait_ready,
+    -- for tests and introspection
+    workers       = workers,
 }

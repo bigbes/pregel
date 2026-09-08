@@ -36,8 +36,20 @@ local function install_registry()
     }
 end
 
+-- _G.pregel is process-wide, and pregel.worker registers into it when the
+-- suite loads. Stubbing it here would otherwise leave every later group
+-- talking to a stub -- or, after the missing-entry test below, to nothing.
+local saved_registry
+
 g.before_all(function()
     URI = box_helper.listen_uri()
+    saved_registry = rawget(_G, 'pregel') and _G.pregel.worker or nil
+end)
+
+g.after_all(function()
+    if rawget(_G, 'pregel') ~= nil then
+        _G.pregel.worker = saved_registry
+    end
 end)
 
 g.before_each(function()
