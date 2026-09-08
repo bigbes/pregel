@@ -686,6 +686,55 @@ g.test_a_never_halting_compute_keeps_running = function()
     drop_worker(w)
 end
 
+-- Defect: vertex:send_message put {receiver, message, sender} on the wire and
+-- this handler dropped args[3] -- the comment above it even named the field it
+-- was throwing away. See docs/api-design.md 3.18.
+g.test_message_deliver_keeps_the_sender = function()
+    local w, name = make_worker()
+    worker.deliver(name, 'message.deliver', {'bob', 'hello', 'alice'})
+
+    local got = {}
+    for sender, message in w.mqueue_next:pairs('bob') do
+        table.insert(got, {sender = sender, message = message})
+    end
+    t.assert_equals(got, {{sender = 'alice', message = 'hello'}})
+    drop_worker(w)
+end
+
+-- The whole path in one process: a compute function sends, the message is
+-- delivered through the pool, and the next superstep reads back who sent it.
+g.test_a_vertex_reads_the_sender_of_its_messages = function()
+    local seen = {}
+    local w, name = make_worker({
+        compute = function(self)
+            if self:get_superstep() == 1 then
+                if self:get_name() == 'a' then
+                    self:send_message('b', 'ping')
+                end
+            else
+                for sender, message in self:pairs_messages() do
+                    table.insert(seen, {
+                        to = self:get_name(), from = sender, message = message,
+                    })
+                end
+            end
+            self:vote_halt(false)
+        end,
+    })
+    w.data_space:replace{'a', false, {name = 'a'}, {}}
+    w.data_space:replace{'b', false, {name = 'b'}, {}}
+    w.in_progress = 2
+    local m = make_master(name)
+
+    w:run_superstep(1)
+    w:after_superstep()
+    w:run_superstep(2)
+
+    t.assert_equals(seen, {{to = 'b', from = 'a', message = 'ping'}})
+    m:stop()
+    drop_worker(w)
+end
+
 -------------------------------------------------------------------------------
 -- A compute that raises
 -------------------------------------------------------------------------------

@@ -212,6 +212,77 @@ g.test_max_supersteps_leaves_a_converging_job_alone = function()
 end
 
 -------------------------------------------------------------------------------
+-- The sender
+-------------------------------------------------------------------------------
+
+-- Defect: the sender was put on the wire by vertex:send_message and dropped by
+-- the worker's message.deliver handler, so a compute function could not answer
+-- whoever asked and every request/response protocol had to carry the sender
+-- inside the payload by hand. See docs/api-design.md 3.18.
+--
+-- A cluster is what makes this worth running: sender and receiver are on
+-- different worker processes as often as not, so the name has to survive the
+-- msgpack round trip and the queue, not just a Lua table.
+local PING_REPLY_COMPUTE = [[
+function(self)
+    local step = self:get_superstep()
+    if step == 1 then
+        for _, dest in self:pairs_edges() do
+            self:send_message(dest, 'ping from ' .. self:get_name())
+        end
+    elseif step == 2 then
+        -- Answer whoever asked, by name, with no sender in the payload.
+        for from in self:pairs_messages() do
+            self:send_message(from, 'pong from ' .. self:get_name())
+        end
+    else
+        local replies = {}
+        for from, message in self:pairs_messages() do
+            table.insert(replies, tostring(from) .. '|' .. tostring(message))
+        end
+        table.sort(replies)
+        local v = self:get_value()
+        self:set_value({id = v.id, name = v.name, value = v.value,
+                        replies = replies})
+    end
+    self:vote_halt(false)
+end
+]]
+
+g.test_a_vertex_answers_the_sender_of_each_message = function()
+    c = cluster.new(WORKER_COUNT)
+    c:create_workers('replying', PING_REPLY_COMPUTE)
+    c:create_master('replying', GRAPH_PATH, {max_supersteps = 3})
+
+    -- Nothing here halts, so the run ends on the limit; three supersteps is
+    -- exactly ping, pong, read.
+    t.assert_error_msg_contains('superstep limit 3 reached', run_bounded)
+
+    local vertices = c:collect_vertices('replying')
+    -- Every vertex of the ring has one inbound edge, so every vertex was
+    -- pinged by exactly one other and must have been answered by it.
+    local checked = 0
+    for _, v in ipairs(VERTICES) do
+        local got = vertices[v.name]
+        t.assert_not_equals(got, nil, 'vertex ' .. v.name .. ' is missing')
+        local replies = got.value.replies
+        t.assert_not_equals(replies, nil, 'vertex ' .. v.name .. ' got no reply')
+        for _, reply in ipairs(replies) do
+            -- The reply names its own sender, and that name is the vertex the
+            -- pong actually came from -- which is the whole claim.
+            local from, message = reply:match('^(.*)|pong from (.*)$')
+            t.assert_not_equals(from, nil, 'malformed reply: ' .. reply)
+            t.assert_equals(from, message,
+                            'reply from ' .. message .. ' arrived as ' .. from)
+            t.assert_not_equals(from, v.name, 'a vertex answered itself')
+            checked = checked + 1
+        end
+    end
+    t.assert_ge(checked, VERTEX_COUNT,
+                'every vertex should have been answered')
+end
+
+-------------------------------------------------------------------------------
 -- A compute that raises
 -------------------------------------------------------------------------------
 

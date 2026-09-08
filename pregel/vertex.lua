@@ -197,8 +197,14 @@ vertex_methods = {
     end,
     --- Iterate the messages sent to this vertex in the previous superstep.
     --
-    -- @return iterator yielding (key, message); only the message is meaningful,
-    --         see pregel.queue's pairs()
+    -- Yields (sender, message): the sender is the name of the vertex that sent
+    -- it, which is how a compute function answers whoever asked, or box.NULL
+    -- for a message that has none -- one a combiner produced, or one delivered
+    -- without a sender. The first value used to be the queue's own iteration
+    -- key and meant nothing to a caller, so `for _, msg in
+    -- self:pairs_messages()` is unaffected by the change.
+    --
+    -- @return iterator yielding (sender, message)
     -- @function pairs_messages
     pairs_messages = function(self)
         return self.__pregel.mqueue:pairs(self.__id)
@@ -209,6 +215,9 @@ vertex_methods = {
     -- worker's *next* message queue, which is swapped in only when the
     -- superstep ends -- so it is unreadable until then even when sender and
     -- receiver live on the same worker.
+    --
+    -- The sender travels with it and is stored with it, so the receiving
+    -- vertex reads it back from pairs_messages() and can answer.
     --
     -- @param receiver destination vertex name
     -- @param msg any value the message queue can hold

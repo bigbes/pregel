@@ -203,6 +203,175 @@ g_space.test_put_rejects_nil = test_put_rejects_nil
 g_table.test_put_rejects_nil = test_put_rejects_nil
 
 -------------------------------------------------------------------------------
+-- the sender
+-------------------------------------------------------------------------------
+
+-- Defect: vertex:send_message put {receiver, message, sender} on the wire and
+-- the worker's message.deliver handler dropped the third element, because
+-- queue:put(receiver, message) had nowhere to keep it. So a compute function
+-- could not answer whoever asked, and every request/response protocol had to
+-- carry the sender inside the payload by hand. See docs/api-design.md 3.18.
+
+--- Collect (sender, message) pairs in the order the queue yields them.
+local function collect_pairs(q, receiver)
+    local rv = {}
+    for sender, message in q:pairs(receiver) do
+        table.insert(rv, {sender = sender, message = message})
+    end
+    return rv
+end
+
+local function test_put_keeps_the_sender(cg)
+    local q = make(cg)
+    q:put('bob', 'hello', 'alice')
+
+    local got = collect_pairs(q, 'bob')
+    t.assert_equals(#got, 1)
+    t.assert_equals(got[1].message, 'hello')
+    t.assert_equals(got[1].sender, 'alice')
+    drop(q)
+end
+g_space.test_put_keeps_the_sender = test_put_keeps_the_sender
+g_table.test_put_keeps_the_sender = test_put_keeps_the_sender
+
+-- Each message keeps its own sender, and the pairing survives several of them.
+local function test_each_message_keeps_its_own_sender(cg)
+    local q = make(cg)
+    q:put('bob', 'from-alice', 'alice')
+    q:put('bob', 'from-carol', 'carol')
+    q:put('bob', 'from-alice-again', 'alice')
+
+    local by_message = {}
+    for _, entry in ipairs(collect_pairs(q, 'bob')) do
+        by_message[entry.message] = entry.sender
+    end
+    t.assert_equals(by_message, {
+        ['from-alice']       = 'alice',
+        ['from-carol']       = 'carol',
+        ['from-alice-again'] = 'alice',
+    })
+    drop(q)
+end
+g_space.test_each_message_keeps_its_own_sender =
+    test_each_message_keeps_its_own_sender
+g_table.test_each_message_keeps_its_own_sender =
+    test_each_message_keeps_its_own_sender
+
+-- The sender is optional: nothing in the library requires one, and a message
+-- put without one reads back as box.NULL rather than as a missing field.
+local function test_put_without_a_sender(cg)
+    local q = make(cg)
+    q:put('bob', 'anonymous')
+
+    local got = collect_pairs(q, 'bob')
+    t.assert_equals(#got, 1)
+    t.assert_equals(got[1].message, 'anonymous')
+    t.assert_equals(got[1].sender, box.NULL)
+    -- The loop shape every example uses keeps working unchanged.
+    t.assert_equals(collect(q, 'bob'), {'anonymous'})
+    drop(q)
+end
+g_space.test_put_without_a_sender = test_put_without_a_sender
+g_table.test_put_without_a_sender = test_put_without_a_sender
+
+-- A combined message has no one sender, so it says so rather than claiming
+-- whichever of its parts happened to be folded in last.
+local function test_a_combined_message_has_no_sender(cg)
+    local q = make(cg, {combiner = function(a, b) return a + b end})
+    q:put('bob', 1, 'alice')
+    q:put('bob', 2, 'carol')
+
+    local got = collect_pairs(q, 'bob')
+    t.assert_equals(#got, 1)
+    t.assert_equals(got[1].message, 3)
+    t.assert_equals(got[1].sender, box.NULL)
+    drop(q)
+end
+g_space.test_a_combined_message_has_no_sender =
+    test_a_combined_message_has_no_sender
+g_table.test_a_combined_message_has_no_sender =
+    test_a_combined_message_has_no_sender
+
+local function test_squash_drops_the_sender_too(cg)
+    local q = make(cg, {
+        combiner = function(a, b) return a + b end,
+        squash_only = true,
+    })
+    q:put('bob', 1, 'alice')
+    q:put('bob', 2, 'carol')
+    -- Not combined yet, and each message still knows who sent it.
+    t.assert_equals(#collect_pairs(q, 'bob'), 2)
+
+    q:squash()
+
+    local got = collect_pairs(q, 'bob')
+    t.assert_equals(#got, 1)
+    t.assert_equals(got[1].message, 3)
+    t.assert_equals(got[1].sender, box.NULL)
+    drop(q)
+end
+g_space.test_squash_drops_the_sender_too = test_squash_drops_the_sender_too
+g_table.test_squash_drops_the_sender_too = test_squash_drops_the_sender_too
+
+-- The counters and the delete path do not care about the sender, but they run
+-- over the same tuples, so verify() has to still agree after a sender is
+-- stored.
+local function test_stats_agree_with_senders_stored(cg)
+    local q = make(cg)
+    q:put('bob', 1, 'alice')
+    q:put('bob', 2, 'carol')
+    q:put('dave', 3, 'alice')
+
+    t.assert_equals({queue.verify(q)}, {true, {}})
+    q:delete('bob')
+    t.assert_equals({queue.verify(q)}, {true, {}})
+    t.assert_equals(collect_pairs(q, 'dave')[1].sender, 'alice')
+    drop(q)
+end
+g_space.test_stats_agree_with_senders_stored =
+    test_stats_agree_with_senders_stored
+g_table.test_stats_agree_with_senders_stored =
+    test_stats_agree_with_senders_stored
+
+-- A queue whose space survived a restart predates the sender field. Adopting
+-- it must widen the format rather than refuse the next put -- and the messages
+-- already in it read back with no sender.
+g_space.test_an_older_space_gains_the_sender_field = function()
+    local name = fresh_name()
+    local space_name = 'pregel_tube_' .. name
+    -- The three-field space an older version of this module created.
+    local space = box.schema.space.create(space_name, {
+        format = {
+            {name = 'id',       type = 'unsigned'},
+            {name = 'receiver', type = 'string'  },
+            {name = 'message',  type = 'any'     },
+        }
+    })
+    space:create_index('primary', {
+        type = 'TREE', parts = {{field = 1, type = 'unsigned'}},
+        sequence = true,
+    })
+    space:create_index('receiver', {
+        type = 'TREE', parts = {{field = 2, type = 'string'}}, unique = false,
+    })
+    space:insert{box.NULL, 'bob', 'from-before'}
+
+    local q = queue.new(name, {engine = 'space'})
+    t.assert_equals(q:len('bob'), 1)
+    local old = collect_pairs(q, 'bob')
+    t.assert_equals(old[1].message, 'from-before')
+    t.assert_equals(old[1].sender, box.NULL)
+
+    q:put('bob', 'from-now', 'alice')
+    local by_message = {}
+    for _, entry in ipairs(collect_pairs(q, 'bob')) do
+        by_message[entry.message] = entry.sender
+    end
+    t.assert_equals(by_message['from-now'], 'alice')
+    drop(q)
+end
+
+-------------------------------------------------------------------------------
 -- receiver_closure
 -------------------------------------------------------------------------------
 

@@ -629,11 +629,21 @@ Base:
 Messaging:
 
 * `vertex:pairs_messages()` — iterate the messages sent to this vertex in the
-  previous superstep. There is no guaranteed order.
+  previous superstep, as `(sender, message)`. There is no guaranteed order.
 * `vertex:send_message(receiver_name, value)` — send to any vertex by name, not
   only to a neighbour. It arrives in the next superstep.
 
+The sender is the name of the vertex that sent the message, which is how a
+request/response protocol answers whoever asked without putting the sender
+inside the payload. It is `box.NULL` for a message that has none: one a
+combiner produced, since a combined message came from everyone who contributed
+to it, and one delivered straight to a queue without a sender.
+
 ```lua
+for from, message in vertex:pairs_messages() do
+    vertex:send_message(from, answer_to(message))
+end
+-- A vertex that does not care who asked ignores the first value.
 for _, message in vertex:pairs_messages() do
     -- ...
 end

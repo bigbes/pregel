@@ -10,6 +10,12 @@
 --
 -- Interface: put, pairs, len, delete, truncate, drop, squash, receiver_closure.
 --
+-- A message is stored with the vertex that sent it, and pairs() yields the two
+-- together: any request/response protocol needs to answer whoever asked, and
+-- before this the sender was put on the wire by vertex:send_message and
+-- dropped on delivery. The sender is optional -- a combined message has none,
+-- since it came from everyone who contributed to it.
+--
 -- A `combiner` folds several messages for one receiver into one. It runs
 -- either on every put (the default) or once per superstep from squash(), when
 -- `squash_only` is set -- combining on put costs a read of the receiver's
@@ -27,6 +33,17 @@ local error       = utils.error
 local fmtstring = string.format
 
 local SPACE_PREFIX = 'pregel_tube_'
+
+-- The 'space' engine's tuple. `sender` is nullable because a message need not
+-- have one -- a combined message has no single sender, and a queue used
+-- directly need not name one -- and because a space written by a version
+-- before this field is widened to this format rather than rebuilt.
+local TUBE_FORMAT = {
+    {name = 'id',       type = 'unsigned'},
+    {name = 'receiver', type = 'string'  },
+    {name = 'message',  type = 'any'     },
+    {name = 'sender',   type = 'string', is_nullable = true},
+}
 
 local tube_list
 
@@ -49,9 +66,11 @@ end
 local tube_space_methods = {
     --- Iterate the messages addressed to one receiver.
     --
-    -- Yields (key, message). The key is whatever the engine iterates by -- the
-    -- index state here, an array position in the table engine -- so a caller
-    -- may only use the second value; `for _, msg in q:pairs(id)`.
+    -- Yields (sender, message). The sender is the vertex name put() was given,
+    -- or box.NULL for a message that has none -- one put without a sender, one
+    -- a combiner produced, or one stored before this field existed. Both
+    -- engines yield the same pair, so `for from, msg in q:pairs(id)` and the
+    -- older `for _, msg in q:pairs(id)` both read what they look like.
     --
     -- @param receiver vertex name
     -- @return iterator function
@@ -66,7 +85,14 @@ local tube_space_methods = {
             if tuple == nil then
                 return nil
             end
-            return state, tuple[3]
+            -- Field 4 is absent on a tuple written before the sender existed,
+            -- and box.NULL is what "nobody in particular" means everywhere
+            -- else here, so the two answer alike.
+            local sender = tuple[4]
+            if sender == nil then
+                sender = box.NULL
+            end
+            return sender, tuple[3]
         end
     end,
     --- Iterate the distinct receivers that currently hold a message.
@@ -97,11 +123,12 @@ local tube_space_methods = {
     --
     -- @param receiver vertex name
     -- @param message any value a tuple field can hold
+    -- @param sender the vertex that sent it, or nil
     -- @return the message actually stored, which is the combined one when a
     --         combiner ran, not the argument
     -- @raise when `receiver` or `message` is nil
     -- @function put
-    put = function(self, receiver, message)
+    put = function(self, receiver, message, sender)
         assert(receiver ~= nil, 'receiver is nil')
         assert(message ~= nil, 'message is nil')
         if self.combiner ~= nil and self.squash_only == false then
@@ -111,9 +138,13 @@ local tube_space_methods = {
             end
             self:delete(receiver)
             message = rv
+            -- A combined message came from everyone who contributed to it, so
+            -- it comes from no one in particular. Keeping the last sender
+            -- would name whichever put happened to run last.
+            sender = nil
         end
         self.stats[receiver] = self.stats[receiver] + 1
-        self.space:insert{box.NULL, receiver, message}
+        self.space:insert{box.NULL, receiver, message, sender or box.NULL}
         return message
     end,
     --- How many messages the queue holds, in total or for one receiver.
@@ -174,7 +205,18 @@ local tube_table_methods = {
         if messages == nil then
             return function() return nil end
         end
-        return pairs(messages)
+        -- Each entry is {message, sender}; the array position it used to yield
+        -- meant nothing to a caller, so nothing is lost by yielding the sender
+        -- in its place.
+        local idx = 0
+        return function()
+            idx = idx + 1
+            local entry = messages[idx]
+            if entry == nil then
+                return nil
+            end
+            return entry[2], entry[1]
+        end
     end,
     --- Iterate the distinct receivers that currently hold a message.
     --
@@ -198,10 +240,11 @@ local tube_table_methods = {
     --
     -- @param receiver vertex name
     -- @param message any Lua value
+    -- @param sender the vertex that sent it, or nil
     -- @return the message actually stored, combined where a combiner ran
     -- @raise when `receiver` or `message` is nil
     -- @function put
-    put = function(self, receiver, message)
+    put = function(self, receiver, message, sender)
         assert(receiver ~= nil, 'receiver is nil')
         assert(message ~= nil, 'message is nil')
         if self.combiner ~= nil and self.squash_only == false then
@@ -211,6 +254,8 @@ local tube_table_methods = {
             end
             self:delete(receiver)
             message = rv
+            -- See the space engine's put(): a combined message has no sender.
+            sender = nil
         end
         self.stats[receiver] = self.stats[receiver] + 1
         local messages = rawget(self.container, receiver)
@@ -218,7 +263,9 @@ local tube_table_methods = {
             messages = {}
             self.container[receiver] = messages
         end
-        table.insert(messages, message)
+        -- A pair rather than the bare message, so a nil sender does not
+        -- shorten the array the way a trailing nil in a flat list would.
+        table.insert(messages, {message, sender or box.NULL})
         return message
     end,
     --- How many messages the queue holds, in total or for one receiver.
@@ -274,7 +321,8 @@ local tube_common_methods = {
     --
     -- Only does anything in squash_only mode; otherwise put() has already
     -- combined and there is nothing left to fold. A receiver whose messages
-    -- fold to nil is left empty rather than re-put.
+    -- fold to nil is left empty rather than re-put. The folded message is
+    -- re-put with no sender, for the reason put() gives.
     --
     -- @function squash
     squash = function(self)
@@ -452,12 +500,15 @@ local function tube_new(name, options)
         local existed = box.space[space_name] ~= nil
         local space = box.schema.space.create(space_name, {
             if_not_exists = true,
-            format = {
-                {name = 'id',       type = 'unsigned'},
-                {name = 'receiver', type = 'string'  },
-                {name = 'message',  type = 'any'     },
-            }
+            format = TUBE_FORMAT
         })
+        -- if_not_exists returns the space that is there without touching its
+        -- format, so a space written before the sender field existed would
+        -- refuse the next four-field insert. Widen it instead: the field is
+        -- nullable, so the tuples already in it stay valid.
+        if #space:format() < #TUBE_FORMAT then
+            space:format(TUBE_FORMAT)
+        end
         -- space:auto_increment() is gone in Tarantool 3; the primary key is
         -- filled by a sequence instead, and box.NULL in field 1 draws from it.
         space:create_index('primary', {

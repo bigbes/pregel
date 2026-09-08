@@ -38,18 +38,28 @@ local function mpool_new()
 end
 
 --- A message queue holding a fixed set of messages per receiver.
-local function mqueue_new(messages)
+--
+-- Yields (sender, message), the same as the real queue: `senders` is a
+-- parallel array per receiver, and a message with no entry in it reads back
+-- as box.NULL -- which is what a message put without a sender, or one a
+-- combiner produced, looks like.
+local function mqueue_new(messages, senders)
     return {
         messages = messages or {},
+        senders  = senders or {},
         pairs = function(self, receiver)
             local list = self.messages[receiver] or {}
+            local from = self.senders[receiver] or {}
             local idx = 0
             return function()
                 idx = idx + 1
                 if list[idx] == nil then
                     return nil
                 end
-                return idx, list[idx]
+                if from[idx] == nil then
+                    return box.NULL, list[idx]
+                end
+                return from[idx], list[idx]
             end
         end,
     }
@@ -58,6 +68,7 @@ end
 --- Build a fake instance.
 --
 -- opts.messages       -- {[receiver] = {message, ...}} for pairs_messages
+-- opts.senders        -- {[receiver] = {sender, ...}}, parallel to messages
 -- opts.aggregators    -- {[name] = callable}
 -- opts.obtain_name    -- value -> name, for add_vertex
 -- opts.worker_context -- whatever get_worker_context should return
@@ -66,7 +77,7 @@ function fake.new(opts)
     return {
         data_space     = data_space_new(),
         mpool          = mpool_new(),
-        mqueue         = mqueue_new(opts.messages),
+        mqueue         = mqueue_new(opts.messages, opts.senders),
         aggregators    = opts.aggregators or {},
         in_progress    = opts.in_progress or 0,
         obtain_name    = opts.obtain_name or function(value)

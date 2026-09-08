@@ -146,8 +146,10 @@ local info_functions = setmetatable({
         return box.snapshot()
     end,
     ['message.deliver'] = function(instance, args)
-        -- args[1] - receiver, args[2] - message, args[3] - sender
-        return instance.mqueue_next:put(args[1], args[2])
+        -- args[1] - receiver, args[2] - message, args[3] - sender. The sender
+        -- used to be dropped here, one line below the comment naming it, so a
+        -- compute function could not answer whoever asked.
+        return instance.mqueue_next:put(args[1], args[2], args[3])
     end,
     ['aggregator.inform'] = function(instance, args)
         -- args[1] - aggregator name, args[2] - the master's merged value.

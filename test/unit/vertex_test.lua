@@ -84,6 +84,34 @@ g.test_pairs_messages = function()
     t.assert_equals(seen, {10, 20, 30})
 end
 
+-- Defect: the sender travelled with every message and was dropped on delivery,
+-- so a compute function could not answer whoever asked -- see
+-- docs/api-design.md 3.18. The first value used to be the queue's own
+-- iteration key, which meant nothing to a caller; it is the sender now, and
+-- the `for _, msg` shape every example uses is unaffected.
+g.test_pairs_messages_yields_the_sender = function()
+    local pool = make(nil, {
+        messages = {alice = {10, 20}},
+        senders  = {alice = {'bob', 'carol'}},
+    })
+    local v = pop(pool, 'alice', false, 0, {})
+    local seen = {}
+    for sender, msg in v:pairs_messages() do
+        table.insert(seen, {sender, msg})
+    end
+    t.assert_equals(seen, {{'bob', 10}, {'carol', 20}})
+end
+
+-- A message with no sender -- one a combiner produced, or one put without a
+-- sender at all -- yields box.NULL rather than a name that is not there.
+g.test_pairs_messages_without_a_sender = function()
+    local pool = make(nil, {messages = {alice = {10}}})
+    local v = pop(pool, 'alice', false, 0, {})
+    local senders = {}
+    for sender in v:pairs_messages() do table.insert(senders, sender) end
+    t.assert_equals(senders, {box.NULL})
+end
+
 g.test_set_value_marks_modified = function()
     local pool = make()
     local v = pop(pool, 'alice', false, 1, {})
