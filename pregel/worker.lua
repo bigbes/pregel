@@ -76,8 +76,12 @@ local info_functions = setmetatable({
         return instance.mqueue_next:put(args[1], args[2])
     end,
     ['aggregator.inform'] = function(instance, args)
-        -- args[1] - aggregator name, args[2] - new value
-        instance.aggregators[args[1]].value = args[2]
+        -- args[1] - aggregator name, args[2] - the master's merged value.
+        -- This used to assign straight to .value, which left the merged value
+        -- sitting in the very accumulator the next superstep contributes to --
+        -- so every worker reported it back and the master added it once per
+        -- worker. See pregel/aggregator.lua.
+        instance.aggregators[args[1]]:receive_global(args[2])
     end,
     ['superstep'] = function(instance, args)
         return instance:run_superstep(args)

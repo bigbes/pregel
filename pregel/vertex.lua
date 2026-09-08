@@ -131,7 +131,12 @@ local vertex_methods = {
         return self.__superstep
     end,
     get_aggregation = function(self, name)
-        return self.__pregel.aggregators[name]()
+        -- The previous superstep's merged value, the same for every vertex of
+        -- this one. Reading the live accumulator instead -- which is what
+        -- aggregators[name]() answers -- gave each vertex whatever its own
+        -- shard had contributed so far, so the answer depended on the order
+        -- the worker happened to walk its own space in.
+        return self.__pregel.aggregators[name]:get_global()
     end,
     set_aggregation = function(self, name, value)
         return self.__pregel.aggregators[name](value)

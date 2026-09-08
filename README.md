@@ -546,9 +546,9 @@ instance:add_aggregator('max_seen', {
 })
 ```
 
-* `default` — the starting value, or a function returning one. The master takes
-  a fresh copy of it before each superstep's reports arrive, so a table default
-  is not shared with the superstep before it.
+* `default` — the starting value, or a function returning one. Both sides take
+  a fresh copy of it every superstep, so a table default is not shared with the
+  superstep before it.
 * `reduce` — `callable(accumulator, contribution)`, folds one vertex's
   contribution into its worker's copy. Defaults to taking the contribution,
   which makes an aggregator with only a `merge` a per-superstep count.
@@ -558,12 +558,19 @@ instance:add_aggregator('max_seen', {
 Both should be commutative and associative: nothing fixes the order workers
 report in.
 
-A worker's copy is *not* reset between supersteps — it is overwritten by the
-merged value, and the next superstep's contributions reduce on top of that. So
-`max` behaves as expected while a summing `reduce` accumulates over the whole
-run: four vertices each contributing 1 over three supersteps leave 12, not 4.
-Reset it in the `reduce` itself, or count with `merge` and let `reduce` take
-the last value.
+An aggregator is per-superstep on both sides. The master takes a fresh default
+before each superstep's reports arrive; a worker's accumulator goes back to the
+default the moment the master hands it the merged value, which is also the
+moment the superstep that produced it ended. So each superstep aggregates its
+own contributions and nothing else: four vertices each contributing 1 over
+three supersteps leave 4, and a summing `reduce` sums that superstep rather
+than the whole run.
+
+The merged value and the accumulator are two different things, and
+`get_aggregation` reads the merged one. A vertex therefore reads the same
+number as every other vertex of its superstep — what the whole graph produced
+in S-1 — rather than however much of its own worker's shard happened to be
+computed before it.
 
 Names beginning with `__` are reserved — pregel counts messages and active
 vertices through `__messages` and `__in_progress`, which is what decides when a

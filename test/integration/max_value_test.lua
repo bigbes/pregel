@@ -259,6 +259,80 @@ g.test_custom_aggregator_across_the_cluster = function()
     t.assert_equals(totals.sum, expected_sum)
 end
 
+-- The test above runs exactly one superstep -- every vertex halts in the first
+-- one -- so it cannot see either half of the defect this one is about: a
+-- summing aggregator that keeps the master's merged value in the accumulator
+-- reports it back, and the master adds it once per worker. Over three
+-- supersteps and three workers that turned 50 into thousands.
+local COUNTING_COMPUTE = [[
+function(self)
+    local step = self:get_superstep()
+    self:set_aggregation('count', 1)
+    local reads = rawget(_G, 'aggr_reads')
+    if reads == nil then
+        reads = {}
+        rawset(_G, 'aggr_reads', reads)
+    end
+    reads[#reads + 1] = {step = step, read = self:get_aggregation('count')}
+    self:vote_halt(step >= 3)
+end
+]]
+
+g.test_sum_aggregator_over_three_supersteps = function()
+    c = cluster.new(WORKER_COUNT)
+
+    c:each_worker(function(name, uris, master_uri, body)
+        local pregel_worker = require('pregel.worker')
+        local w = pregel_worker.new(name, {
+            workers = uris,
+            master = master_uri,
+            compute = assert(loadstring('return ' .. body))(),
+            obtain_name = function(vertex) return vertex.name end,
+            grant_to = 'guest',
+        })
+        local add = function(old, new) return old + new end
+        w:add_aggregator('count', {default = 0, reduce = add, merge = add})
+        _G.worker_instance = w
+        return true
+    end, {'counting', c.worker_uris, c.master_uri, COUNTING_COMPUTE})
+
+    c:create_master('counting', GRAPH_PATH)
+    c.master:exec(function()
+        local add = function(old, new) return old + new end
+        _G.master_instance:add_aggregator('count',
+                                          {default = 0, reduce = add,
+                                           merge = add})
+    end)
+
+    local supersteps = c:run()
+    t.assert_equals(supersteps, 3)
+
+    local count = c.master:exec(function()
+        return _G.master_instance.aggregators['count']()
+    end)
+    -- One superstep's worth of contributions, merged over the three workers --
+    -- not three supersteps' worth, and not three workers' copies of it.
+    t.assert_equals(count, VERTEX_COUNT)
+
+    -- What the vertices read: nothing merged yet in superstep 1, and from then
+    -- on the whole graph's count -- the same number for every vertex on every
+    -- worker, rather than whatever its own shard had reached.
+    local per_step = {}
+    for _, reads in ipairs(c:each_worker(function()
+        return rawget(_G, 'aggr_reads')
+    end)) do
+        t.assert_not_equals(reads, nil, 'a worker never ran the compute')
+        for _, entry in ipairs(reads) do
+            per_step[entry.step] = per_step[entry.step] or {}
+            per_step[entry.step][entry.read] =
+                (per_step[entry.step][entry.read] or 0) + 1
+        end
+    end
+    t.assert_equals(per_step[1], {[0] = VERTEX_COUNT})
+    t.assert_equals(per_step[2], {[VERTEX_COUNT] = VERTEX_COUNT})
+    t.assert_equals(per_step[3], {[VERTEX_COUNT] = VERTEX_COUNT})
+end
+
 -------------------------------------------------------------------------------
 -- Privileges
 -------------------------------------------------------------------------------

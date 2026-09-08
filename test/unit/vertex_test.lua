@@ -4,6 +4,7 @@ local json = require('json')
 local box_helper = require('test.helpers.box')
 local fake_pregel = require('test.helpers.fake_pregel')
 local vertex = require('pregel.vertex')
+local aggregator = require('pregel.aggregator')
 
 local g = t.group('vertex')
 
@@ -95,19 +96,37 @@ g.test_superstep_and_worker_context = function()
     t.assert_equals(v:get_worker_context(), {tag = 'ctx'})
 end
 
-g.test_aggregation_round_trip = function()
-    local stored = 0
-    local aggregators = {
-        sum = function(value)
-            if value == nil then return stored end
-            stored = stored + value
-        end
-    }
-    local pool = make(nil, {aggregators = aggregators})
+-- The two halves of a worker's aggregator are separate on purpose: what a
+-- vertex contributes goes into this superstep's accumulator, what it reads is
+-- the value the master merged out of the previous one. A vertex that read the
+-- accumulator would see whatever its own shard had contributed before it,
+-- which depends on the order the worker walks its space in.
+g.test_aggregation_contributes_to_the_accumulator = function()
+    local sum = aggregator.new('sum', nil, {
+        default = 0,
+        reduce  = function(old, new) return old + new end,
+    })
+    -- As delivered by the master at the end of the previous superstep.
+    sum:receive_global(100)
+
+    local pool = make(nil, {aggregators = {sum = sum}})
     local v = pop(pool, 'alice', false, 0, {})
     v:set_aggregation('sum', 5)
     v:set_aggregation('sum', 3)
-    t.assert_equals(v:get_aggregation('sum'), 8)
+
+    t.assert_equals(sum(), 8, 'the accumulator holds this superstep only')
+    t.assert_equals(v:get_aggregation('sum'), 100,
+                    'a vertex reads the previous superstep')
+end
+
+g.test_aggregation_before_any_superstep_reads_the_default = function()
+    local sum = aggregator.new('sum', nil, {
+        default = 7,
+        reduce  = function(old, new) return old + new end,
+    })
+    local pool = make(nil, {aggregators = {sum = sum}})
+    local v = pop(pool, 'alice', false, 0, {})
+    t.assert_equals(v:get_aggregation('sum'), 7)
 end
 
 -------------------------------------------------------------------------------

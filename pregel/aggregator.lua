@@ -8,6 +8,19 @@
 -- `reduce` folds one vertex's contribution into the worker's copy; `merge`
 -- folds one worker's copy into the master's. They are usually the same
 -- function, and merge defaults to reduce.
+--
+-- A worker's aggregator therefore holds two values, not one:
+--
+--   value  -- what the vertices of the superstep now running have contributed
+--             so far; this is what goes to the master at the end of it
+--   global -- what the master merged out of every worker at the end of the
+--             *previous* superstep; this is what a vertex reads
+--
+-- Keeping them apart is what makes a summing aggregator sum. With a single
+-- value the merged global is still sitting in the accumulator when the next
+-- superstep starts contributing to it, so every worker reports the global
+-- again and the master adds it once per worker: four workers turned a count of
+-- 2000 into 10000 and then 42000. See receive_global below.
 
 local log = require('log')
 
@@ -44,7 +57,24 @@ local aggregator_mt = {
         end,
         merge_master = function(self, value)
             self.value = self.merge(self.value, value)
-        end
+        end,
+        --- A worker takes delivery of the master's merged value.
+        --
+        -- Which is also the moment the superstep that produced it is over, so
+        -- it is the moment to clear the accumulator: from here until the end
+        -- of the next superstep, `value` holds nothing but what that
+        -- superstep's own vertices contribute.
+        receive_global = function(self, value)
+            self.global = value
+            self:make_default()
+        end,
+        --- What vertex:get_aggregation() answers: the whole graph's value from
+        -- the previous superstep, not this worker's running total for the
+        -- current one -- which would make what a vertex reads depend on how
+        -- many vertices of its own shard happened to be computed before it.
+        get_global = function(self)
+            return self.global
+        end,
     },
     --- aggregator()        -> current value
     --  aggregator(value)   -> contribute value
@@ -79,6 +109,9 @@ local function aggregator_new(name, pregel, opts)
         merge      = merge,
         internal   = internal,
         value      = opts.default,
+        -- Read by every vertex of superstep 1, before any master has merged
+        -- anything: the default is the only honest answer there.
+        global     = opts.default,
         default    = opts.default,
         pregel     = pregel,
     }, aggregator_mt)

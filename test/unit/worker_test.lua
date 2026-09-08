@@ -673,6 +673,50 @@ g.test_custom_aggregator_over_a_superstep = function()
     drop_worker(w)
 end
 
+-- Defect: the worker kept the master's merged value in the very field the next
+-- superstep's contributions reduced into, so it reported the global back and
+-- the master added it once per worker -- three vertices contributing 1 each
+-- ended at 9 after three supersteps rather than 3. The second half of the same
+-- defect: get_aggregation() answered that live accumulator, so what a vertex
+-- read depended on how much of its own shard had been computed before it.
+g.test_aggregator_starts_each_superstep_from_the_default = function()
+    local reads = {}
+    local w, name = make_worker({
+        compute = function(self)
+            local step = self:get_superstep()
+            -- Contributed in every superstep, by every vertex.
+            self:set_aggregation('count', 1)
+            reads[step] = reads[step] or {}
+            table.insert(reads[step], self:get_aggregation('count'))
+            self:vote_halt(step >= 3)
+        end,
+    })
+    load_graph(w, {a = 1, b = 2, c = 3}, {})
+
+    local add = function(old, new) return old + new end
+    local aggr_opts = {default = 0, reduce = add, merge = add}
+    w:add_aggregator('count', aggr_opts)
+    local m = master.new(name, {workers = {URI}, obtain_name = obtain_name})
+    m:add_aggregator('count', aggr_opts)
+
+    t.assert_equals(m:start(), 3)
+
+    -- One superstep's worth, not the running total of all three.
+    t.assert_equals(m.aggregators['count'](), 3)
+    -- And the worker's own accumulator is back at the default, ready for a
+    -- superstep that will never come.
+    t.assert_equals(w.aggregators['count'](), 0)
+
+    -- Nothing is merged yet in superstep 1; from then on every vertex reads
+    -- the same number -- the whole graph's, from the superstep before.
+    t.assert_equals(reads[1], {0, 0, 0})
+    t.assert_equals(reads[2], {3, 3, 3})
+    t.assert_equals(reads[3], {3, 3, 3})
+
+    m:stop()
+    drop_worker(w)
+end
+
 g.test_topology_mutation_through_a_superstep = function()
     local w, name = make_worker({
         compute = function(self)
