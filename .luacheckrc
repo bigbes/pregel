@@ -17,6 +17,7 @@ include_files = {
     'test/helpers/*.lua',
     'test/instances/*.lua',
     'examples/**/*.lua',
+    'tools/*.lua',
 }
 
 exclude_files = {
