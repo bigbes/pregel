@@ -52,6 +52,7 @@ than ported — the vendored C Avro binding and the tarantoolctl deployment.
 
 ### Fixed
 
+- A delayed `edge.delete` mutation removed only the first parallel edge to the destination, while the local `delete_edge` path removes every one (pregel-iv7).
 - `pregel.utils.error()` formatted a lone message through `string.format`, so re-raising a caught error whose text contained a `%` reported the formatting failure instead of the message (pregel-2qk.1).
 - `strict.strictify()` keyed its declared-key sets on the address in `tostring()`, which leaked and collided once an address was reused (pregel-2qk.1).
 - The queue's `receiver_closure()` seeded a string index with the number 0 and returned out of its own loop, so it never walked past the first receiver; `pairs()` did not thread the iterator state back; and `squash()` deleted and re-put each receiver while iterating the container it was mutating (pregel-2qk.2).
