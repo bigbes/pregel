@@ -1,35 +1,61 @@
 --- Raw DEFLATE (RFC 1951) for the Avro "deflate" OCF codec.
 --
--- Avro stores deflate blocks without the zlib wrapper. Tarantool's
--- `compress.zlib` almost covers that but not quite:
+-- Avro stores deflate blocks without the zlib wrapper, so both directions want
+-- `window_bits = -15`. `pregel.compress` provides it:
 --
---   * compression honours `window_bits = -15`, so it emits raw RFC 1951 (that
---     is the same byte stream as its framed output minus the two-byte header
---     and the four-byte adler32 trailer);
---   * decompression ignores `window_bits` -- it always expects the zlib frame
---     and verifies the trailing adler32. Re-framing a raw block for it is
---     impossible, because the adler32 is computed over the *decompressed*
---     bytes, which is exactly what is not known yet.
+--   * `compress.zlib` -- Enterprise's module where there is one -- compresses
+--     raw, and that is what `deflate()` uses. The output is the framed stream
+--     minus its two-byte header and four-byte adler32 trailer.
+--   * decompressing raw is the half Enterprise cannot do: its `decompress`
+--     ignores `window_bits` and always verifies the adler32, and re-framing a
+--     raw block for it is impossible because that checksum is computed over
+--     the *decompressed* bytes, which is what is not known yet. So
+--     `decompress()` goes through `compress.ffi.zlib`, the FFI binding, which
+--     honours the option in both directions on every build.
 --
--- So inflate is implemented here, in Lua, and it is the only read path. That
--- also means a deflate-compressed Avro file is readable under Community
--- Tarantool, where `compress.zlib` does not exist at all.
+-- The pure-Lua inflater below stays, and stays the fallback: it is what makes
+-- a deflate container file readable on a host with no loadable libz at all.
+-- `PREGEL_AVRO_PURE_LUA=1` in the environment, or `M.force_pure = true`,
+-- selects it unconditionally, so the slow path keeps being exercised rather
+-- than rotting behind a machine that always has zlib.
 --
--- Compression prefers `compress.zlib` when it is present. Without it the
--- encoder falls back to RFC 1951 stored blocks, which are valid, uncompressed
--- deflate that any Avro implementation reads back.
+-- Compression falls back to RFC 1951 stored blocks when no zlib can be loaded:
+-- valid, uncompressed deflate that any Avro implementation reads back.
 --
 -- @module pregel.avro.deflate
 
 local bit = require('bit')
 local ffi = require('ffi')
 
+local compress = require('pregel.compress')
+
 local M = {}
 
-local ok_zlib, zlib = pcall(require, 'compress.zlib')
+-- Enterprise's zlib where there is one, the FFI binding otherwise. Only the
+-- compressing half of this is used; see below for why the other half is not.
+local ok_zlib = compress.available('zlib')
+
+-- The FFI binding whatever the build, because only it honours window_bits when
+-- decompressing. On Enterprise these two are different objects doing the same
+-- job in one direction and only one of them doing it in the other.
+local ok_raw = compress.ffi.available('zlib')
 
 --- True when a real compressor is available. Reading never needs it.
 M.has_zlib = ok_zlib
+
+--- True when raw deflate can be *decompressed* through zlib rather than by the
+--  pure-Lua inflater. False on a build with no loadable libz, and under
+--  Enterprise only if no libz can be found either -- the Enterprise module
+--  alone is not enough.
+M.has_raw_inflate = ok_raw
+
+--- Force the pure-Lua inflater even where zlib is available.
+--
+-- Set from `PREGEL_AVRO_PURE_LUA` at load, and writable afterwards so a test
+-- can drive both paths over the same fixture in one process. It only affects
+-- `decompress`; `inflate` is the pure path by definition and `deflate` has no
+-- pure alternative worth choosing.
+M.force_pure = (os.getenv('PREGEL_AVRO_PURE_LUA') or '') ~= ''
 
 local function fail(fmt, ...)
     error('avro.deflate: ' .. string.format(fmt, ...), 0)
@@ -116,11 +142,12 @@ local function fixed_tables()
     return FIXED_LIT, FIXED_DIST
 end
 
---- Decompress a raw RFC 1951 stream.
+--- Decompress a raw RFC 1951 stream, in pure Lua.
 --
--- Pure Lua, so it works on any Tarantool build, and it is the only read path
--- -- see the note at the top of the module on why compress.zlib cannot be used
--- for this. Stops at the block marked final and ignores whatever follows.
+-- Works on any Tarantool build with no library to find, which is what makes it
+-- the guaranteed read path -- see `decompress` for the one that is used when a
+-- zlib can be loaded. Stops at the block marked final and ignores whatever
+-- follows.
 --
 -- @param data raw deflate bytes, without a zlib or gzip wrapper
 -- @return the decompressed string
@@ -356,9 +383,9 @@ M.store = store
 
 --- Compress to a raw RFC 1951 stream.
 --
--- Falls back to store() where `compress.zlib` is missing, so the output is
--- always readable but is not always smaller than the input -- check
--- M.has_zlib if that matters.
+-- Falls back to store() where no zlib can be loaded, so the output is always
+-- readable but is not always smaller than the input -- check M.has_zlib if
+-- that matters.
 --
 -- @param data string to compress
 -- @return raw deflate bytes, with no zlib wrapper
@@ -373,7 +400,49 @@ function M.deflate(data)
     end
     -- window_bits = -15 asks zlib for raw deflate, so nothing has to be
     -- stripped off afterwards.
-    return zlib.new({window_bits = -15}):compress(data)
+    return compress.zlib.new({window_bits = -15}):compress(data)
+end
+
+--- Decompress a raw RFC 1951 stream, through zlib where that is possible.
+--
+-- The same bytes as `inflate` returns for the same input; the difference is
+-- speed. zlib is roughly two orders of magnitude faster than the Lua bit
+-- twiddling above, and a container file's blocks are the hot path of every
+-- load, so the pure inflater is the fallback rather than the default.
+--
+-- Which path runs is `M.backend()`, and `M.force_pure` overrides it.
+--
+-- @param data raw deflate bytes, without a zlib or gzip wrapper
+-- @return the decompressed string
+-- @raise as inflate() does, and on whatever zlib reports for a malformed
+--        stream -- the messages differ between the two paths, since one is
+--        this module's prose and the other is zlib's
+-- @function decompress
+function M.decompress(data)
+    if type(data) ~= 'string' then
+        fail('decompress expects a string, got %s', type(data))
+    end
+    if M.force_pure or not ok_raw then
+        return M.inflate(data)
+    end
+    return compress.ffi.zlib.new({window_bits = -15}):decompress(data)
+end
+
+--- Which implementation the two directions use, as strings.
+--
+-- @return the compressor, one of 'enterprise', 'ffi' or 'stored', and the
+--         decompressor, one of 'ffi' or 'pure-lua'
+-- @function backend
+function M.backend()
+    local writer = 'stored'
+    if ok_zlib then
+        writer = compress.implementation
+    end
+    local reader = 'pure-lua'
+    if ok_raw and not M.force_pure then
+        reader = 'ffi'
+    end
+    return writer, reader
 end
 
 return M
