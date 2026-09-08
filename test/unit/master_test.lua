@@ -24,6 +24,14 @@ g.before_all(function()
     URI = box_helper.listen_uri()
 end)
 
+-- The stub gives up after this many supersteps. Nothing here should reach it
+-- -- the highest a test legitimately runs to is 250 -- and it exists because
+-- the subject of half of them is a loop that must *stop*: break the limit
+-- check and the loop has nothing to end it, so without this the tests would
+-- hang the suite rather than fail it. Which is what they did when the check
+-- was mutated out to watch them go red.
+local STUB_LIMIT = 1000
+
 --- A master whose message pool is a stub, so the superstep loop runs with no
 -- worker behind it.
 --
@@ -56,6 +64,11 @@ local function master_with_stub(options, state_at)
         table.insert(self.sent, msg)
         if msg == 'superstep' then
             self.superstep = arg
+            if arg > STUB_LIMIT then
+                error(string.format(
+                    'stub mpool: superstep %d, and nothing has stopped this ' ..
+                    'run', arg), 0)
+            end
             -- One worker's timing report; start() logs v[1] through a numeric
             -- format, so it has to be a number.
             return {{0.0}}
