@@ -185,9 +185,9 @@ over before `tt status` has finished printing: 2 ms to load and 630 ms for the
 `evaluate.lua` runs on the **master**, which owns no graph — the vertices are
 on the workers, in each one's `data_mf` space, and the master already holds a
 net.box connection to every one of them. Those connections are what it walks.
-Nothing new has to be granted: the worker role gives `roles_cfg.user` read and
-write on the spaces it creates, so a plain `conn.space.data_mf:select()` runs on
-exactly the credentials the job already runs on, and the `lua_call` list in
+Nothing new has to be granted: the worker replicasets already grant the pregel
+user read and write on `data_mf`, so a plain `conn.space.data_mf:select()` runs
+on exactly the credentials the job already runs on, and the `lua_call` list in
 `config.yaml` stays the four names every example has.
 
     echo "require('examples.mf.evaluate').evaluate{test = '../../test/fixtures/ratings/test.avro'}" | tt connect mf:master -f -

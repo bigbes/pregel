@@ -107,10 +107,8 @@ g.test_the_accessor_hands_out_the_running_master = function()
     t.assert_equals(seen.status.superstep, seen.supersteps)
 end
 
--- A bound on the superstep loop, passed through to master.new. What happens
--- when the limit is *reached* belongs to pregel/master.lua and is tested with
--- it; what belongs here is that a config carrying the option applies, reaches
--- the master object, and does not disturb a job that converges well inside it.
+-- A bound on the superstep loop, passed through to master.new. A limit no run
+-- comes near changes nothing.
 g.test_a_superstep_limit_reaches_the_master = function()
     local c = Cluster:new(helper.config({autostart = true,
                                          max_supersteps = 100}),
@@ -120,6 +118,25 @@ g.test_a_superstep_limit_reaches_the_master = function()
     local status = helper.wait_state(c, 'done')
     t.assert_le(status.superstep, 100)
     assert_max_value_everywhere(c)
+end
+
+-- And a limit the ring cannot converge inside stops the run. Reaching it is a
+-- failure rather than a finish: the answer is not in the spaces, and a
+-- `status()` of `done` would say it was.
+g.test_a_superstep_limit_that_trips_fails_the_job = function()
+    local c = Cluster:new(helper.config({autostart = true,
+                                         max_supersteps = 2}),
+                          helper.server_opts)
+    c:start()
+
+    local status = helper.wait_state(c, 'failed')
+    t.assert_str_contains(tostring(status.error),
+                          'pregel: superstep limit 2 reached')
+    -- The instance is alive and the job is still there to look at, the same as
+    -- for any other failed run.
+    t.assert_equals(c[helper.MASTER_NAME]:exec(function()
+        return require('config'):info().status
+    end), 'ready')
 end
 
 -------------------------------------------------------------------------------
@@ -421,6 +438,29 @@ g.test_a_config_that_marks_two_pregel_users_is_refused = function()
         "2 users in the cluster config have the credentials role 'pregel' " ..
         "('pregel_other', 'pregel_peer')",
         helper.reload, c, helper.worker_name(1))
+end
+
+-- A compute function that raises reaches the master as a custom box.error
+-- carrying the vertex, the superstep and the traceback -- and the point of
+-- carrying them is that they reach whoever reads status(). Reporting "the job
+-- failed" over an error that names the vertex would throw away the only part
+-- an operator can act on.
+g.test_a_failed_compute_is_reported_with_its_vertex = function()
+    local c = Cluster:new(helper.config({app = 'test.apps.failing',
+                                         autostart = true}),
+                          helper.server_opts)
+    c:start()
+
+    local status = helper.wait_state(c, 'failed')
+    t.assert_str_contains(tostring(status.error),
+                          "pregel: compute failed on vertex 'v003'")
+    t.assert_str_contains(tostring(status.error),
+                          'the app module refused to compute')
+    t.assert_equals(status.vertex, 'v003')
+    t.assert_ge(status.superstep, 1)
+    t.assert_str_contains(tostring(status.traceback), 'stack traceback')
+    -- The app module's own frame is in there, which is the whole use of it.
+    t.assert_str_contains(tostring(status.traceback), 'failing.lua')
 end
 
 -------------------------------------------------------------------------------

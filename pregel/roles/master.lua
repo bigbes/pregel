@@ -173,6 +173,47 @@ local function autostart_traceback(instance)
     end
 end
 
+--- The error type pregel/worker.lua reports a failed compute as.
+--
+-- A custom box.error, so its payload survives the net.box hop from the worker
+-- that raised it to the master that reports it -- and this is the only thing
+-- that tells such an error from any other failure of a superstep.
+local COMPUTE_FAILED_TYPE = 'PregelComputeFailed'
+
+--- What status() should say about a run that ended badly.
+--
+-- A compute failure knows which vertex, in which superstep, and with which
+-- traceback; every other failure is a string. Passing the whole error object
+-- on would be worse than passing nothing -- a cdata box.error does not survive
+-- server:exec() or a console session -- so the fields are read off it here and
+-- reported as plain values.
+--
+-- `superstep` comes from the error rather than from the master's counter when
+-- the error carries one: it is the superstep the vertex was computing, which
+-- is what an operator needs to reproduce the failure.
+--
+-- @param instance the master, for the superstep counter
+-- @param err whatever the autostart fiber caught
+-- @return the `extra` table for set_status('failed', ...)
+local function failure_of(instance, err)
+    local rv = {
+        superstep = instance.superstep_count,
+        error     = tostring(err),
+    }
+    -- `box.error.is` refuses a non-cdata argument on some builds, so the type
+    -- test comes first.
+    if type(err) ~= 'cdata' or not box.error.is(err) or
+       err.type ~= COMPUTE_FAILED_TYPE then
+        return rv
+    end
+    rv.vertex    = err.vertex
+    rv.traceback = err.traceback
+    if err.superstep ~= nil then
+        rv.superstep = err.superstep
+    end
+    return rv
+end
+
 --- Wait for the workers, load the graph, run the supersteps.
 --
 -- Everything here can block for as long as the job takes, which is why it is a
@@ -225,10 +266,7 @@ local function autostart_body(instance, app)
                          instance.name)
                 return
             end
-            set_status('failed', {
-                superstep = instance.superstep_count,
-                error     = tostring(err),
-            })
+            set_status('failed', failure_of(instance, err))
         end
     end
 end
@@ -392,7 +430,16 @@ end
 --
 --   {state = 'idle'|'read_only'|'connecting'|'loading'|'running'|'done'|
 --            'failed',
---    superstep = <number>, error = <string, when failed or connecting>}
+--    superstep = <number>, error = <string, when failed or connecting>,
+--    vertex = <string>, traceback = <string>}
+--
+-- `vertex` and `traceback` appear only for a failure a compute function
+-- caused: pregel/worker.lua raises those as a custom box.error whose payload
+-- crosses the net.box hop, and there is no point in reporting "the job failed"
+-- when the error itself knows which vertex, in which superstep, and where in
+-- the app module. Everything else fails with `error` alone. The fields are
+-- plain strings and numbers rather than the error object, which would not
+-- survive a console session or a server:exec().
 --
 -- It follows the autostart fiber, except while the workers are still being
 -- reached: 'connecting' comes first and nothing can have started before it is
@@ -421,7 +468,12 @@ local function status()
     end
     if state.master ~= nil then
         rv.name = state.master.name
-        rv.superstep = state.master.superstep_count
+        -- Except on a recorded failure, whose superstep is the one the run
+        -- died in: the master's counter may have moved on, and a compute
+        -- failure names the superstep the vertex was computing.
+        if state.status.state ~= 'failed' then
+            rv.superstep = state.master.superstep_count
+        end
     end
     return rv
 end
