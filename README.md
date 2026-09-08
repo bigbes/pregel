@@ -458,6 +458,17 @@ local supersteps = master:wait_up():preload():start()
   returning one, or `nil` for a master that only coordinates.
 * `preload_args` — passed to `master_preload`.
 * `user`, `password` — net.box credentials for the outgoing connections.
+* `max_supersteps` — a positive integer, or `nil` (the default) for no limit.
+  `master:start()` runs while a vertex is active or a message is in flight, so
+  an algorithm that does not converge has nothing to stop it. With a limit set,
+  a run that is still going after that many supersteps raises
+
+  ```
+  pregel: superstep limit 5 reached with 50 active vertices and 0 messages in flight
+  ```
+
+  and the master role reports it as `failed` with that message. A run with no
+  limit logs a warning naming this option every hundred supersteps.
 
 `worker.new(name, options)` takes `workers`, `obtain_name`, `pool_size`,
 `preload_args`, `user` and `password` with the same meaning, plus:
@@ -490,7 +501,8 @@ Lifecycle, on the master:
   instead. A worker's loader is handed its own bucket index and the bucket
   count, so it can load only its share.
 * `master:start()` — run supersteps until no message is in flight and no vertex
-  is active. Returns the number of supersteps.
+  is active. Returns the number of supersteps, or raises when `max_supersteps`
+  runs out first.
 * `master:add_aggregator(name, options)` — see below.
 * `master:save_snapshot()` — tell every worker to `box.snapshot()`.
 * `master:stop()` — stop the message pool and drop this master.

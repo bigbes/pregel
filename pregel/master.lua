@@ -84,15 +84,23 @@ local master_mt = {
             self.mpool:send_wait('wait')
             return self
         end,
-        --- Run supersteps until the graph goes quiet.
+        --- Run supersteps until the graph goes quiet, or until
+        -- options.max_supersteps says otherwise.
         --
         -- Blocks for as long as the algorithm takes -- the caller is a console
         -- session or the master role's autostart fiber, never a config apply.
-        -- Whether it converges at all is the app's business: nothing here
-        -- bounds the number of supersteps.
+        -- Whether it converges at all is the app's business, and an instance
+        -- created without max_supersteps still runs until it does; it says so
+        -- in the log every hundred supersteps rather than silently.
+        --
+        -- The limit is checked after a superstep rather than before one, which
+        -- is what lets the error carry the two numbers that say why the job
+        -- had not finished -- they are the merged aggregators, and they exist
+        -- only once every worker has reported.
         --
         -- @return the number of supersteps run
-        -- @raise whatever a worker raised, through send_wait
+        -- @raise when max_supersteps supersteps have run and the graph is
+        --  still active, and whatever a worker raised, through send_wait
         -- @function start
         start = function(self)
             log.info('master:start(): begin')
@@ -130,6 +138,21 @@ local master_mt = {
                          msg_count, inp_count)
                 if msg_count == 0 and inp_count == 0 then
                     break
+                end
+                if self.max_supersteps ~= nil and
+                   superstep >= self.max_supersteps then
+                    -- Level 0: the message is what the master role's status()
+                    -- reports and what a test compares against, so it must not
+                    -- carry this file's line number.
+                    error(0, 'pregel: superstep limit %d reached with %d ' ..
+                             'active vertices and %d messages in flight',
+                          self.max_supersteps, inp_count, msg_count)
+                end
+                if self.max_supersteps == nil and superstep % 100 == 0 then
+                    log.warn('master:start(): %d supersteps and still ' ..
+                             'running (%d active vertices, %d messages); ' ..
+                             'this job has no options.max_supersteps',
+                             superstep, inp_count, msg_count)
                 end
                 superstep = superstep + 1
             end
@@ -237,6 +260,9 @@ end
 --                           worker; the caller then owns the waiting
 --                           (master.mpool:wait_connected(timeout))
 -- options.connect_timeout-- seconds to wait for the workers when not async
+-- options.max_supersteps -- a positive integer, or nil for no limit: how many
+--                           supersteps start() may run before it gives up on
+--                           a graph that is still active and raises
 --
 -- A worker URI is either a net.box URI string or a {uri = ..., params = ...}
 -- table, the form a Tarantool 3 config uses for a listener with transport
@@ -249,8 +275,9 @@ end
 -- @param options table as above
 -- @return the master object
 -- @raise when name or options are the wrong type, when obtain_name is not
---  callable, when master_preload is neither a function, a table nor nil, and
---  -- unless connect_async -- when a worker did not answer in time
+--  callable, when max_supersteps is not a positive integer, when
+--  master_preload is neither a function, a table nor nil, and -- unless
+--  connect_async -- when a worker did not answer in time
 -- @function new
 local function master_new(name, options)
     assert(type(name) == 'string', 'name must be a string')
@@ -261,6 +288,15 @@ local function master_new(name, options)
     local obtain_name = options.obtain_name
 
     assert(is_callable(obtain_name), 'options.obtain_name must be callable')
+
+    -- Rejected here rather than at the top of the loop: a limit of 0 or 2.5
+    -- would otherwise be discovered by a job that has already loaded its
+    -- graph, and a limit of -1 not at all.
+    local max_supersteps = options.max_supersteps
+    assert(max_supersteps == nil or
+           (type(max_supersteps) == 'number' and
+            max_supersteps > 0 and max_supersteps % 1 == 0),
+           'options.max_supersteps must be a positive integer or nil')
 
     local self = setmetatable({
         name            = name,
@@ -276,6 +312,7 @@ local function master_new(name, options)
         obtain_name     = obtain_name,
         aggregators     = {},
         superstep_count = 0,
+        max_supersteps  = max_supersteps,
     }, master_mt)
 
     local preload = options.master_preload

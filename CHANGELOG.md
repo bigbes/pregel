@@ -13,6 +13,7 @@ than ported — the vendored C Avro binding and the tarantoolctl deployment.
 
 ### Added
 
+- `master.new` option `max_supersteps`: a positive integer, or nil for the unbounded runs that were the only kind. `master:start()` loops while a vertex is active or a message is in flight, so an algorithm that does not converge had nothing to stop it; with a limit set, the run that is still going after that many supersteps raises `pregel: superstep limit <n> reached with <k> active vertices and <m> messages in flight` -- the two counts are the internal aggregators, so the message says whether the job was spreading messages or sitting on vertices that refuse to halt. An unbounded run logs a warning naming the option every hundred supersteps (pregel-3wg).
 - `pregel.roles.master` and `pregel.roles.worker`: Tarantool 3 roles that build a whole job out of `roles_cfg`, with `validate`/`apply`/`stop` plus a `get()` accessor and a `status()` for driving and watching one.
 - `roles_cfg.autostart` on the master role: a background fiber waits for the workers, preloads the graph and runs the supersteps, reporting `idle`/`loading`/`running`/`done`/`failed` through `status()`.
 - Participant discovery: a role whose `roles_cfg` names no `workers` (or no `master`) reads the cluster config and takes every instance running the other role for a job of the same `name`.

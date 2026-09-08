@@ -157,6 +157,60 @@ g.test_max_value_without_an_explicit_vote = function()
     t.assert_equals(c:pending_messages('forgetful'), 0)
 end
 
+-------------------------------------------------------------------------------
+-- max_supersteps
+-------------------------------------------------------------------------------
+
+-- The other end of the halt rule: a compute that votes to stay awake every
+-- time is a job with no reason to ever stop, and the master's loop would
+-- happily run it until the process was killed. Nothing here is a message, so
+-- the loop is kept alive by the active count alone.
+local NEVER_HALTING_COMPUTE = [[
+function(self)
+    self:vote_halt(false)
+end
+]]
+
+g.test_max_supersteps_stops_a_job_that_never_halts = function()
+    c = cluster.new(WORKER_COUNT)
+    c:create_workers('bounded', NEVER_HALTING_COMPUTE)
+    c:create_master('bounded', GRAPH_PATH, {max_supersteps = 5})
+
+    -- Whole-message, so both halves are pinned: the limit that was hit, and
+    -- the state the graph was in when it was. Every one of the 50 vertices is
+    -- still active and no message was ever sent.
+    t.assert_error_msg_contains(
+        'pregel: superstep limit 5 reached with ' .. VERTEX_COUNT ..
+        ' active vertices and 0 messages in flight',
+        run_bounded)
+
+    -- Five supersteps ran; the sixth is the one that did not.
+    t.assert_equals(c.master:exec(function()
+        return _G.master_instance.superstep_count
+    end), 5)
+end
+
+-- The limit does not change a job that converges on its own -- neither the
+-- answer nor the number of supersteps it takes.
+g.test_max_supersteps_leaves_a_converging_job_alone = function()
+    c = cluster.new(WORKER_COUNT)
+    c:create_workers('generous', MAX_VALUE_COMPUTE)
+    -- Comfortably above what the ring needs: this test is about the limit not
+    -- interfering, so it must not sit one superstep away from the answer.
+    c:create_master('generous', GRAPH_PATH, {max_supersteps = VERTEX_COUNT * 2})
+
+    local supersteps = run_bounded()
+
+    local vertices = c:collect_vertices('generous')
+    local best = expected_max()
+    for _, v in ipairs(VERTICES) do
+        t.assert_equals(vertices[v.name].value.value, best, 'vertex ' .. v.name)
+    end
+    -- The same bounds test_max_value_over_a_ring asserts with no limit at all.
+    t.assert_ge(supersteps, 2)
+    t.assert_le(supersteps, VERTEX_COUNT + 2)
+end
+
 -- The whole point of a cluster: the vertices are actually spread over the
 -- worker processes, and every worker holds a share of them.
 g.test_graph_is_sharded_across_workers = function()
