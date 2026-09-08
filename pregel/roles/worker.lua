@@ -13,8 +13,6 @@
 --       delayed_push: false
 --       squash_only: false
 --       queue_engine: space            # 'space' or 'table'
---       user: pregel                   # net.box user for outgoing calls
---       password: secret
 --       app_cfg:                       # opaque, handed to the app module
 --         graph: '../../data/graph.txt'
 --         threshold: 5
@@ -47,14 +45,14 @@
 -- compute function is handed nothing but its vertex, and an app module that
 -- read the config itself would be tied to one deployment.
 --
--- Privileges. Everything that reaches a worker is a conn:call() on one of the
--- entry points below, so the cluster config has to let the pregel user call
--- them -- there is no guest universe grant anywhere in this library:
+-- Credentials. Who pregel connects to its peers as is not written in
+-- roles_cfg: it is the user the cluster config marks with the credentials role
+-- `pregel`, and its password is that user's own. One login for the whole job,
+-- written where every other credential of a Tarantool 3 deployment is written:
 --
 --   credentials:
---     users:
+--     roles:
 --       pregel:
---         password: secret
 --         privileges:
 --           - permissions: [execute]
 --             lua_call:
@@ -62,14 +60,26 @@
 --               - pregel.worker.deliver_batch
 --               - pregel.worker.wait
 --               - pregel.master.deliver
+--     users:
+--       pregel_peer:
+--         password: secret
+--         roles: [pregel]
 --
--- The other half -- read/write on this instance's spaces, because a lua_call
--- runs with the caller's privileges and these entry points write -- cannot be
--- spelled in the config: the spaces are named after the job and do not exist
--- when the credentials applier first runs. So the role grants it itself, to
--- the `user` from roles_cfg, right after creating them. A config that sets no
--- `user` gets no such grant: the peers then connect as guest, and giving guest
--- write access to the graph is a decision for the operator, not for this role.
+-- The user may not be called `pregel` as well: a credentials role and a user
+-- share one namespace, and the applier then dies with "User 'pregel' already
+-- exists" before any role is applied.
+--
+-- Exactly one user must carry the role -- every instance resolves this on its
+-- own, and two of them picking different logins would authenticate to each
+-- other as users with different privileges.
+--
+-- Everything that reaches a worker is a conn:call() on one of the entry points
+-- above, so that lua_call list is the first half of the privileges; there is
+-- no guest universe grant anywhere in this library. The other half is
+-- read/write on this instance's spaces, because a lua_call runs with the
+-- caller's privileges and these entry points write. Those spaces are named
+-- after the job and do not exist when the credentials applier first runs, so
+-- the role grants them itself right after creating them.
 --
 -- @module pregel.roles.worker
 
@@ -178,6 +188,9 @@ local function apply(cfg)
     -- cannot change its worker list, which is what the check above says.
     local workers = cfg.workers or common.discover_workers(ROLE, cfg.name)
     local master_uri = cfg.master or common.discover_master(ROLE, cfg.name)
+    -- Who this instance connects to its peers as: the cluster config's own
+    -- credentials, not a login repeated in every instance's roles_cfg.
+    local user, password = common.pregel_user(ROLE)
 
     local instance = worker.new(cfg.name, {
         workers        = workers,
@@ -193,9 +206,9 @@ local function apply(cfg)
         queue_engine   = cfg.queue_engine,
         pool_size      = cfg.pool_size,
         delayed_push   = cfg.delayed_push,
-        user           = cfg.user,
-        password       = cfg.password,
-        grant_to       = cfg.user,
+        user           = user,
+        password       = password,
+        grant_to       = user,
         -- apply() must not wait for anyone: it runs inside the config
         -- framework's synchronous post_apply. See common.connector.
         connect_async  = true,

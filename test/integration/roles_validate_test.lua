@@ -47,9 +47,19 @@ g.test_a_full_worker_config_is_accepted = function()
         delayed_push = false,
         squash_only  = true,
         queue_engine = 'table',
-        user         = 'pregel',
-        password     = 'secret',
     }))
+end
+
+-- The credentials moved to the `credentials` section of the cluster config, so
+-- a roles_cfg that still spells them is a config written for the old shape and
+-- must say so rather than be ignored.
+g.test_the_credentials_are_not_roles_cfg_options = function()
+    assert_refused(worker_role, worker_cfg({user = 'pregel'}),
+                   "pregel.roles.worker: unknown option 'user'")
+    assert_refused(worker_role, worker_cfg({password = 'secret'}),
+                   "pregel.roles.worker: unknown option 'password'")
+    assert_refused(master_role, {name = 'job', app = APP, user = 'pregel'},
+                   "pregel.roles.master: unknown option 'user'")
 end
 
 g.test_the_uri_options_are_optional = function()
@@ -148,23 +158,9 @@ g.test_the_identifier_options_must_not_be_empty = function()
     assert_refused(worker_role, worker_cfg({master = ''}),
                    "pregel.roles.worker: option 'master' must be a " ..
                    'non-empty string')
-    assert_refused(worker_role, worker_cfg({user = ''}),
-                   "pregel.roles.worker: option 'user' must be a non-empty " ..
-                   'string')
     assert_refused(master_role, {name = '', app = APP},
                    "pregel.roles.master: option 'name' must be a non-empty " ..
                    'string')
-end
-
--- A password with nobody to use it is not a harmless extra: the peers then
--- connect as guest, and the config says in as many words that they should not.
-g.test_a_password_without_a_user_is_refused = function()
-    assert_refused(worker_role, worker_cfg({password = 'secret'}),
-                   "pregel.roles.worker: option 'password' needs a 'user' " ..
-                   'to go with it')
-    -- The other way round is fine: a user with an empty password is a real
-    -- configuration.
-    worker_role.validate(worker_cfg({user = 'pregel'}))
 end
 
 -- The role's own messages are what config:info().alerts shows to whoever wrote

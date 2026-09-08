@@ -2,9 +2,11 @@
 # its own. The master loads the graph and shards it out.
 
 credentials:
-  users:
+  # See examples/max-value/config.yaml for what this section is doing: the
+  # credentials role marks the user pregel connects as and carries what that
+  # user may do, and the user cannot be called `pregel` as well.
+  roles:
     pregel:
-      password: 'secret'
       privileges:
         - permissions: [execute]
           lua_call:
@@ -12,6 +14,10 @@ credentials:
             - pregel.worker.deliver_batch
             - pregel.worker.wait
             - pregel.master.deliver
+  users:
+    pregel_peer:
+      password: 'secret'
+      roles: [pregel]
 
 wal:
   mode: none
@@ -31,8 +37,6 @@ groups:
                 name: wcc
                 app: app
                 autostart: true
-                user: pregel
-                password: 'secret'
                 workers:
                   - '127.0.0.1:3302'
                   - '127.0.0.1:3303'
@@ -65,8 +69,6 @@ groups:
                   - '127.0.0.1:3302'
                   - '127.0.0.1:3303'
                   - '127.0.0.1:3304'
-                user: pregel
-                password: 'secret'
       worker2:
         instances:
           worker2:

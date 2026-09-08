@@ -5,20 +5,27 @@
 # below is what keeps the two copies from drifting.
 
 credentials:
-  users:
+  # See examples/max-value/config.yaml for what this section is doing: the
+  # credentials role marks the user pregel connects as and carries what that
+  # user may do, and the user cannot be called `pregel` as well.
+  #
+  # This example's own spaces are not here and cannot be: they are named after
+  # the tasks in labels.avro, which nobody knows until the file is read. The
+  # app module creates them and grants them itself, to the user the roles hand
+  # it in the job context.
+  roles:
     pregel:
-      password: 'secret'
-      # Everything pregel sends to pregel is a conn:call() on one of these four
-      # entry points. The other half of the privileges -- read/write on the
-      # job's own spaces -- cannot be spelled here (the spaces are named after
-      # the job and do not exist yet) and is granted by the worker role itself.
       privileges:
         - permissions: [execute]
-          lua_call:
+          lua_call: &pregel_entry_points
             - pregel.worker.deliver
             - pregel.worker.deliver_batch
             - pregel.worker.wait
             - pregel.master.deliver
+  users:
+    pregel_peer:
+      password: 'secret'
+      roles: [pregel]
 
 # Nothing in an example outlives the cluster. The per-task training spaces are
 # `temporary` in their own right, so they would stay out of the WAL even here.
@@ -43,12 +50,6 @@ groups:
                 # this the cluster comes up idle and waits for an operator --
                 # see the README.
                 autostart: true
-                user: pregel
-                password: 'secret'
-                workers:
-                  - '127.0.0.1:3302'
-                  - '127.0.0.1:3303'
-                  - '127.0.0.1:3304'
                 app_cfg: &app_cfg
                   # Relative to examples/lookalike/, resolved by the app
                   # module: an instance's own working directory is under
@@ -59,14 +60,14 @@ groups:
                   # one -- the README runs 2000 users, 16 features, 3 tasks.
                   users:  '../../test/fixtures/lookalike/users.avro'
                   labels: '../../test/fixtures/lookalike/labels.avro'
-                  # Must be the same user as roles_cfg.user above. This
-                  # example is the only one that keeps spaces of its own -- one
-                  # per task, for the staged training set -- and a compute
-                  # function runs with the privileges of whoever called the
-                  # RPC it is inside. pregel.worker.grant() covers pregel's own
-                  # four spaces and knows nothing about an app's; an app module
-                  # cannot read roles_cfg; so the name has to be here.
-                  grant_to: pregel
+                  # Must name the user the credentials role marks. This example
+                  # is the only one that keeps spaces of its own -- one per
+                  # task, for the staged training set -- and a compute function
+                  # runs with the privileges of whoever called the RPC it is
+                  # inside. `credentials.roles.pregel` cannot name these spaces
+                  # (they are called after the tasks in labels.avro); an app
+                  # module cannot read the cluster config; so the name is here.
+                  grant_to: pregel_peer
                   # Held out of training, per class, to measure AUC on.
                   test_fraction: 0.25
                   # A task with fewer labels than this reports `failed` with a
@@ -86,6 +87,28 @@ groups:
                   calibration_sample: 100
                   calibration_bucket: 5
       worker1:
+        # The read/write half of the privileges, on the replicasets that own
+        # the spaces -- see examples/max-value/config.yaml for why it is not
+        # global. Respecifying `privileges` here replaces the whole list, so
+        # the entry points come along through the anchor. The app's own
+        # per-task spaces are not here: it grants those itself, once it knows
+        # their names.
+        credentials: &worker_credentials
+          roles:
+            pregel:
+              privileges:
+                - permissions: [execute]
+                  lua_call: *pregel_entry_points
+                - permissions: [read, write]
+                  spaces:
+                    - data_lookalike
+                    - topology_mutation_lookalike
+                    - pregel_tube_mqueue_first_lookalike
+                    - pregel_tube_mqueue_second_lookalike
+                  sequences:
+                    - topology_mutation_lookalike_seq
+                    - pregel_tube_mqueue_first_lookalike_seq
+                    - pregel_tube_mqueue_second_lookalike_seq
         instances:
           worker1:
             iproto:
@@ -96,19 +119,13 @@ groups:
               pregel.roles.worker:
                 name: lookalike
                 app: app
-                master: '127.0.0.1:3301'
-                workers:
-                  - '127.0.0.1:3302'
-                  - '127.0.0.1:3303'
-                  - '127.0.0.1:3304'
-                user: pregel
-                password: 'secret'
                 # The same table as the master's, and here it is load-bearing
                 # on both sides: the workers read the Avro files (the master
                 # has no loader at all) and every hyperparameter is read by a
                 # compute function through the worker context.
                 app_cfg: *app_cfg
       worker2:
+        credentials: *worker_credentials
         instances:
           worker2:
             iproto:
@@ -117,6 +134,7 @@ groups:
             roles: [pregel.roles.worker]
             roles_cfg: *worker_cfg
       worker3:
+        credentials: *worker_credentials
         instances:
           worker3:
             iproto:

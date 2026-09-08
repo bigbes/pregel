@@ -125,14 +125,44 @@ g.test_one_master_and_three_workers_on_distinct_ports = function()
     end
 end
 
+-- The roles are told no login: they look for the one user the credentials
+-- section marks with the `pregel` role, and take its password. A config that
+-- marks nobody -- or two people -- has no login for the graph traffic and the
+-- roles refuse to apply, so this is not cosmetic.
+g.test_exactly_one_user_carries_the_pregel_role = function()
+    for _, example in ipairs(examples()) do
+        local config = config_of(example)
+        local marked = {}
+        for name, user in pairs(config.credentials.users or {}) do
+            for _, role in ipairs(user.roles or {}) do
+                if role == helper.CREDENTIALS_ROLE then
+                    table.insert(marked, name)
+                end
+            end
+        end
+        t.assert_equals(marked, {helper.USER},
+                        example .. ': the users carrying the ' ..
+                        helper.CREDENTIALS_ROLE .. ' credentials role')
+        t.assert_not_equals(
+            config.credentials.users[helper.USER].password, nil,
+            example .. ': the pregel user has no password')
+        -- A role and a user share one namespace, so a config that called them
+        -- both `pregel` would die at startup with "User 'pregel' already
+        -- exists" -- before any role of ours is even loaded.
+        t.assert_equals(config.credentials.users[helper.CREDENTIALS_ROLE], nil,
+                        example .. ': a user is named after the credentials ' ..
+                        'role')
+    end
+end
+
 g.test_the_credentials_grant_what_pregel_calls = function()
     for _, example in ipairs(examples()) do
         local config = config_of(example)
-        local user = config.credentials.users[helper.USER]
-        t.assert_not_equals(user, nil, example .. ': no pregel user')
+        local role = config.credentials.roles[helper.CREDENTIALS_ROLE]
+        t.assert_not_equals(role, nil, example .. ': no pregel credentials role')
 
         local granted = {}
-        for _, privilege in ipairs(user.privileges) do
+        for _, privilege in ipairs(role.privileges) do
             for _, name in ipairs(privilege.lua_call or {}) do
                 granted[name] = true
             end
@@ -143,6 +173,24 @@ g.test_the_credentials_grant_what_pregel_calls = function()
         for _, name in ipairs(helper.LUA_CALL) do
             t.assert(granted[name],
                      example .. ': no lua_call grant for ' .. name)
+        end
+    end
+end
+
+-- The options the roles used to take and no longer do. An example still
+-- spelling one of them does not start at all: an unknown key in roles_cfg is
+-- refused by name, which is the whole point of refusing it.
+g.test_no_roles_cfg_spells_a_login = function()
+    for _, example in ipairs(examples()) do
+        for _, instance in ipairs(instances_of(config_of(example))) do
+            for role, cfg in pairs(instance.roles_cfg) do
+                for _, key in ipairs({'user', 'password'}) do
+                    t.assert_equals(cfg[key], nil,
+                                    example .. ': ' .. instance.name .. ' ' ..
+                                    'still spells ' .. key .. ' in the ' ..
+                                    'roles_cfg of ' .. role)
+                end
+            end
         end
     end
 end

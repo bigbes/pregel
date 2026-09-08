@@ -127,11 +127,6 @@ M.common_spec = {
             return true
         end,
     },
-    user         = {types = {string = true}, check = check_nonempty},
-    -- No non-empty check: an empty password is a real configuration, and the
-    -- one thing that is wrong with a password -- having no user to use it --
-    -- is checked below, where the whole table is in view.
-    password     = {types = {string = true}},
     -- Seconds the role keeps trying to reach its peers. See M.connector.
     connect_timeout = {
         types = {number = true},
@@ -176,7 +171,7 @@ end
 -- @param cfg the role's roles_cfg table
 -- @param spec as built by M.spec
 -- @raise on a non-table cfg, an unknown option, a wrong type, a failed
---  check, a missing required option, or a password with no user
+--  check, or a missing required option
 -- @function check_cfg
 function M.check_cfg(role, cfg, spec)
     if type(cfg) ~= 'table' then
@@ -220,15 +215,122 @@ function M.check_cfg(role, cfg, spec)
             error("%s: option '%s' is required", role, key)
         end
     end
+end
 
-    -- A password with nobody to use it does not fail: net.box connects as
-    -- guest and the graph traffic runs with whatever guest has, which is the
-    -- opposite of what a config that bothered to set a password meant.
-    if cfg.password ~= nil and cfg.user == nil then
-        error("%s: option 'password' needs a 'user' to go with it; without " ..
-              'one the peers connect as guest and the password is unused',
-              role)
+-------------------------------------------------------------------------------
+-- Credentials
+-------------------------------------------------------------------------------
+
+--- The credentials role that marks the user pregel connects as.
+--
+-- The same trick vshard is integrated with: a storage's login is whatever
+-- `iproto.advertise.sharding` names, and the framework checks that user holds
+-- the semi-default credentials role 'sharding' (configdata.lua,
+-- _instance_sharding). Pregel has no advertise entry of its own, so the role
+-- membership is not a check but the whole identification: the pregel user is
+-- the one the config marks with this role.
+--
+-- It is also where the privileges live -- see the header of
+-- pregel/roles/worker.lua -- so the one name ties the login and what it may do
+-- together, and a config cannot grant one without the other.
+M.CREDENTIALS_ROLE = 'pregel'
+
+--- Does `roles` contain M.CREDENTIALS_ROLE, directly or through another role?
+--
+-- Credentials roles nest (`credentials.roles.<r>.roles`), and a deployment
+-- that wraps pregel's role in one of its own is still marking that user.
+-- Mirrors vshard's check_sharding_role, minus its 'super' shortcut: 'super'
+-- means "may do anything", which is true of an administrator who is emphatically
+-- not the user the graph traffic should authenticate as.
+--
+-- `seen` guards against a config whose roles reference each other in a cycle:
+-- the credentials applier refuses one, but this runs before it has had to.
+--
+-- @param config the config module
+-- @param roles an array of credentials role names, or nil
+-- @param seen names already visited, for the recursion
+-- @return true when the pregel role is in there somewhere
+local function has_credentials_role(config, roles, seen)
+    seen = seen or {}
+    for _, name in pairs(roles or {}) do
+        if name == M.CREDENTIALS_ROLE then
+            return true
+        end
+        if not seen[name] then
+            seen[name] = true
+            local nested = config:get({'credentials', 'roles', name, 'roles'})
+            if has_credentials_role(config, nested, seen) then
+                return true
+            end
+        end
     end
+    return false
+end
+
+--- The user pregel connects to its peers as, and its password.
+--
+-- Read from the cluster config rather than from roles_cfg, so the credentials
+-- are written once, where every other credential in a Tarantool 3 deployment
+-- is written, and a password is not repeated in as many roles_cfg blocks as
+-- the cluster has instances.
+--
+-- Every participant resolves this independently and has to arrive at the same
+-- answer, which is why "several such users" is refused rather than resolved by
+-- some rule: two instances picking different logins would authenticate to each
+-- other as users with different privileges, and the failure would show up as a
+-- job that connects and then cannot write.
+--
+-- `config` is a parameter so the resolution can be exercised without a
+-- cluster; every caller in the roles passes nothing and gets the real one.
+--
+-- @param role the role name, which every message opens with
+-- @param config the config module (default: the real one)
+-- @return the login, and the password
+-- @raise when no user carries the credentials role, when more than one does,
+--  or when the one that does has no password
+-- @function pregel_user
+function M.pregel_user(role, config)
+    config = config or require('config')
+    local users = config:get({'credentials', 'users'}) or {}
+
+    local found = {}
+    for name, user in pairs(users) do
+        if type(user) == 'table' and
+           has_credentials_role(config, user.roles) then
+            table.insert(found, name)
+        end
+    end
+    -- Sorted, so a config with two such users always names them in the same
+    -- order: pairs() order would make the message depend on the hash of the
+    -- key, and two instances would then disagree about what they read.
+    table.sort(found)
+
+    if #found == 0 then
+        error("%s: no user in the cluster config has the credentials role " ..
+              "'%s', so there is no login for pregel to reach its peers " ..
+              "with; add 'roles: [%s]' to the user under credentials.users",
+              role, M.CREDENTIALS_ROLE, M.CREDENTIALS_ROLE)
+    end
+    if #found > 1 then
+        local names = {}
+        for _, name in ipairs(found) do
+            table.insert(names, "'" .. name .. "'")
+        end
+        error("%s: %d users in the cluster config have the credentials role " ..
+              "'%s' (%s); exactly one of them is the user pregel connects " ..
+              'as, so leave the role on that one alone', role, #found,
+              M.CREDENTIALS_ROLE, table.concat(names, ', '))
+    end
+
+    local user = found[1]
+    local password = config:get({'credentials', 'users', user, 'password'})
+    if password == nil or password == box.NULL then
+        error("%s: the user '%s' has the credentials role '%s' but no " ..
+              'password; set credentials.users.%s.password, which is what ' ..
+              'pregel authenticates to its peers with', role, user,
+              M.CREDENTIALS_ROLE, user)
+    end
+    return user, password
 end
 
 -------------------------------------------------------------------------------

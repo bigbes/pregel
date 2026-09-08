@@ -4,16 +4,22 @@
 # lambda are read by the compute function through the worker context.
 
 credentials:
-  users:
+  # See examples/max-value/config.yaml for what this section is doing: the
+  # credentials role marks the user pregel connects as and carries what that
+  # user may do, and the user cannot be called `pregel` as well.
+  roles:
     pregel:
-      password: 'secret'
       privileges:
         - permissions: [execute]
-          lua_call:
+          lua_call: &pregel_entry_points
             - pregel.worker.deliver
             - pregel.worker.deliver_batch
             - pregel.worker.wait
             - pregel.master.deliver
+  users:
+    pregel_peer:
+      password: 'secret'
+      roles: [pregel]
 
 wal:
   mode: none
@@ -33,12 +39,6 @@ groups:
                 name: mf
                 app: app
                 autostart: true
-                user: pregel
-                password: 'secret'
-                workers:
-                  - '127.0.0.1:3302'
-                  - '127.0.0.1:3303'
-                  - '127.0.0.1:3304'
                 app_cfg: &app_cfg
                   # Paths are relative to examples/mf/ and resolved by the app
                   # module: an instance's own working directory is under
@@ -61,6 +61,26 @@ groups:
                   decay: 0.99
                   lambda: 0.05
       worker1:
+        # The read/write half of the privileges, on the replicasets that own
+        # the spaces -- see examples/max-value/config.yaml for why it is not
+        # global. Respecifying `privileges` here replaces the whole list, so
+        # the entry points come along through the anchor.
+        credentials: &worker_credentials
+          roles:
+            pregel:
+              privileges:
+                - permissions: [execute]
+                  lua_call: *pregel_entry_points
+                - permissions: [read, write]
+                  spaces:
+                    - data_mf
+                    - topology_mutation_mf
+                    - pregel_tube_mqueue_first_mf
+                    - pregel_tube_mqueue_second_mf
+                  sequences:
+                    - topology_mutation_mf_seq
+                    - pregel_tube_mqueue_first_mf_seq
+                    - pregel_tube_mqueue_second_mf_seq
         instances:
           worker1:
             iproto:
@@ -71,18 +91,12 @@ groups:
               pregel.roles.worker:
                 name: mf
                 app: app
-                master: '127.0.0.1:3301'
-                workers:
-                  - '127.0.0.1:3302'
-                  - '127.0.0.1:3303'
-                  - '127.0.0.1:3304'
-                user: pregel
-                password: 'secret'
                 # The same table as the master's: the paths are ignored here
                 # (this app has no worker_preload) and the hyperparameters are
                 # ignored there. One anchor beats two lists that can drift.
                 app_cfg: *app_cfg
       worker2:
+        credentials: *worker_credentials
         instances:
           worker2:
             iproto:
@@ -91,6 +105,7 @@ groups:
             roles: [pregel.roles.worker]
             roles_cfg: *worker_cfg
       worker3:
+        credentials: *worker_credentials
         instances:
           worker3:
             iproto:

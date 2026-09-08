@@ -24,8 +24,12 @@ local helper = {}
 -- find pregel and the example app modules.
 helper.ROOT = fio.cwd()
 
-helper.USER     = 'pregel'
-helper.PASSWORD = 'secret'
+-- The credentials role the pregel user is marked with, and that user. A role
+-- and a user cannot share a name -- they live in one namespace -- so the user
+-- is not called `pregel`; examples/*/config.yaml spells it the same way.
+helper.CREDENTIALS_ROLE = 'pregel'
+helper.USER             = 'pregel_peer'
+helper.PASSWORD         = 'secret'
 
 helper.MASTER_NAME  = 'master'
 helper.MASTER_ROLE  = 'pregel.roles.master'
@@ -90,12 +94,16 @@ function helper.config(opts)
     local app   = helper.app_module(opts.name)
 
     local builder = cbuilder:new()
-    builder:set_global_option('credentials.users.' .. helper.USER, {
-        password   = helper.PASSWORD,
+    builder:set_global_option('credentials.roles.' ..
+                              helper.CREDENTIALS_ROLE, {
         privileges = {{
             permissions = {'execute'},
             lua_call    = helper.LUA_CALL,
         }},
+    })
+    builder:set_global_option('credentials.users.' .. helper.USER, {
+        password = helper.PASSWORD,
+        roles    = {helper.CREDENTIALS_ROLE},
     })
     builder:set_global_option('wal.mode', 'none')
 
@@ -106,11 +114,9 @@ function helper.config(opts)
 
     local function base_cfg()
         return {
-            name     = job,
-            app      = app,
-            user     = helper.USER,
-            password = helper.PASSWORD,
-            app_cfg  = opts.app_cfg,
+            name    = job,
+            app     = app,
+            app_cfg = opts.app_cfg,
         }
     end
 

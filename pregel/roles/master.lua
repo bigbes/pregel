@@ -10,8 +10,6 @@
 --         - '127.0.0.1:3303'
 --       pool_size: 1000
 --       autostart: false               # run the job as soon as it can
---       user: pregel                   # net.box user for outgoing calls
---       password: secret
 --       app_cfg:                       # opaque, handed to the app module
 --         graph: '../../data/graph.txt'
 --
@@ -39,10 +37,12 @@
 --   local m = require('pregel.roles.master').get()
 --   m:wait_up():preload():start()
 --
--- Privileges: as for pregel.roles.worker, and the same credentials snippet
--- covers both -- see the comment at the top of pregel/roles/worker.lua. The
--- master's own entry point is `pregel.master.deliver`, which is how a worker
--- reports its aggregators back.
+-- Credentials and privileges: as for pregel.roles.worker, and the same
+-- `credentials` section covers both -- see the comment at the top of
+-- pregel/roles/worker.lua. The master connects to its workers as the user the
+-- cluster config marks with the credentials role `pregel`, and its own entry
+-- point is `pregel.master.deliver`, which is how a worker reports its
+-- aggregators back.
 --
 -- @module pregel.roles.master
 
@@ -238,6 +238,9 @@ local function apply(cfg)
 
     -- Resolved once, here: a running job cannot change its worker list.
     local workers = cfg.workers or common.discover_workers(ROLE, cfg.name)
+    -- Who this instance connects to its workers as: the cluster config's own
+    -- credentials, not a login repeated in every instance's roles_cfg.
+    local user, password = common.pregel_user(ROLE)
 
     local instance = master.new(cfg.name, {
         workers        = workers,
@@ -245,20 +248,17 @@ local function apply(cfg)
         master_preload = app.master_preload,
         preload_args   = cfg.app_cfg,
         pool_size      = cfg.pool_size,
-        user           = cfg.user,
-        password       = cfg.password,
+        user           = user,
+        password       = password,
         -- apply() must not wait for anyone: it runs inside the config
         -- framework's synchronous post_apply. See common.connector.
         connect_async  = true,
     })
     common.add_aggregators(instance, app)
-    if cfg.user ~= nil then
-        -- The workers call pregel.master.deliver on this instance to report
-        -- their aggregators. The credentials section should already say so;
-        -- granting it here as well costs nothing and keeps a config that
-        -- forgot it working.
-        master.grant(cfg.user)
-    end
+    -- The workers call pregel.master.deliver on this instance to report their
+    -- aggregators. The credentials section should already say so; granting it
+    -- here as well costs nothing and keeps a config that forgot it working.
+    master.grant(user)
 
     state.master = instance
     state.cfg = table.deepcopy(cfg)

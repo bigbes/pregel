@@ -294,6 +294,84 @@ g.test_giving_up_on_a_peer_is_an_alert_and_not_a_dead_instance = function()
 end
 
 -------------------------------------------------------------------------------
+-- The credentials, read out of the cluster config
+-------------------------------------------------------------------------------
+
+-- The stub-config tests in roles_credentials_test.lua check the reading; this
+-- checks that what is read is what the roles then connect with, against a real
+-- config framework. A wrong login is not a subtle failure -- nothing
+-- authenticates -- so the job finishing is the assertion.
+g.test_the_peers_connect_as_the_user_the_credentials_mark = function()
+    local c = Cluster:new(helper.config({autostart = true}),
+                          helper.server_opts)
+    c:start()
+    helper.wait_state(c, 'done')
+    assert_max_value_everywhere(c)
+
+    -- No roles_cfg anywhere carries a login, and the one that is used is the
+    -- user the `credentials` section marks -- not `guest`, and not the
+    -- replication user the peer URIs would otherwise hand over.
+    -- net.box keeps the login on the connection (and clears the password), so
+    -- this is the login the graph traffic actually authenticated with.
+    local logins = c[helper.worker_name(1)]:exec(function(role)
+        local w = require(role).get()
+        local rv = {}
+        for _, bucket in ipairs(w.mpool.buckets) do
+            -- The bucket for this instance itself has no connection: it calls
+            -- the registry in this process instead of dialling its own
+            -- listener.
+            if bucket.connection ~= nil then
+                rv[tostring(bucket.connection.opts.user)] = true
+            end
+        end
+        rv[tostring(w.master.opts.user)] = true
+        return rv
+    end, {helper.WORKER_ROLE})
+    t.assert_equals(logins, {[helper.USER] = true})
+end
+
+-- The other half of the same property, from the config's side: a cluster whose
+-- credentials mark nobody has no login for the graph traffic, and the role has
+-- to say so rather than fall back to guest. Driven through a reload, because
+-- an error raised from apply() during startup exits the process.
+g.test_a_config_that_marks_no_pregel_user_is_refused = function()
+    local c = Cluster:new(helper.config({drop_worker = 1}), helper.server_opts)
+    c:start()
+
+    local worker1 = helper.worker_name(1)
+    -- The role comes back on worker1, but the credentials no longer mark
+    -- anyone: the pregel user is there, with its password, and only the role
+    -- membership is gone.
+    local credentials = helper.credentials()
+    credentials['users.' .. helper.USER].roles = nil
+    c:sync(helper.config({credentials = credentials}))
+
+    t.assert_error_msg_contains(
+        "pregel.roles.worker: no user in the cluster config has the " ..
+        "credentials role 'pregel'",
+        helper.reload, c, worker1)
+    t.assert_equals(helper.worker_registered(c, worker1), false,
+                    'the role built a job without a login')
+end
+
+-- Two marked users is the case that cannot be resolved by a rule: every
+-- instance reads the config for itself, so two of them may pick different
+-- logins.
+g.test_a_config_that_marks_two_pregel_users_is_refused = function()
+    local c = Cluster:new(helper.config({drop_worker = 1}), helper.server_opts)
+    c:start()
+
+    c:sync(helper.config({
+        credentials = helper.credentials({extra_user = 'pregel_other'}),
+    }))
+
+    t.assert_error_msg_contains(
+        "2 users in the cluster config have the credentials role 'pregel' " ..
+        "('pregel_other', 'pregel_peer')",
+        helper.reload, c, helper.worker_name(1))
+end
+
+-------------------------------------------------------------------------------
 -- (5): discovery
 -------------------------------------------------------------------------------
 
@@ -331,15 +409,15 @@ end
 -- config:instance_uri('peer', ...) hands out the login and password from
 -- iproto.advertise.peer -- the replication user in a stock config -- and
 -- discovery drops them on purpose: replication has no lua_call grant and no
--- business getting one. Nothing said so, because net.box's opts.user wins over
--- a URI's own userinfo and every other test sets roles_cfg.user, so the
--- property was held by mpool's option rather than by discovery
--- (pregel-9vt, M6). Here there is no roles_cfg.user at all: the peers connect
--- as guest, which the config grants, and a URI carrying 'replicator:secret@'
--- would authenticate as a user with neither the lua_call nor the spaces.
+-- business getting one.
+--
+-- The assertion is on the URI itself rather than on the job running, and has
+-- to be: net.box's opts.user wins over a URI's own userinfo, so a URI that did
+-- carry 'replicator:secret@' would still authenticate as the pregel user and
+-- the job would finish either way (pregel-9vt, M6). What is under test is what
+-- peer_uri returns, so that is what is read.
 g.test_discovery_does_not_borrow_the_replication_login = function()
-    local c = Cluster:new(helper.config({autostart = true, discovery = true,
-                                         no_user = true}),
+    local c = Cluster:new(helper.config({autostart = true, discovery = true}),
                           helper.server_opts)
     c:start()
 

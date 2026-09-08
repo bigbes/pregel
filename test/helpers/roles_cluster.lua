@@ -28,8 +28,12 @@ helper.WORKER_COUNT = 3
 helper.MASTER_ROLE = 'pregel.roles.master'
 helper.WORKER_ROLE = 'pregel.roles.worker'
 
-helper.USER     = 'pregel'
-helper.PASSWORD = 'secret'
+-- The credentials role that marks the user pregel connects as, and the user
+-- itself. They cannot share a name: a credentials role and a user live in one
+-- namespace, and the applier dies with "User 'pregel' already exists".
+helper.CREDENTIALS_ROLE = 'pregel'
+helper.USER             = 'pregel_peer'
+helper.PASSWORD         = 'secret'
 
 --- Every entry point the two roles publish.
 --
@@ -43,6 +47,50 @@ helper.LUA_CALL = {
     'pregel.worker.wait',
     'pregel.master.deliver',
 }
+
+--- What a test cluster adds to the `credentials` section.
+--
+-- The shape an operator writes: one credentials role carrying the privileges,
+-- one user carrying that role. The roles find the user by the role, so the
+-- role's name is fixed (helper.CREDENTIALS_ROLE) while the user's is not.
+--
+-- Keyed by the path *under* `credentials`, one entry per object, because
+-- cbuilder's own base config already puts `replicator` and `client` in
+-- credentials.users -- and setting the whole `credentials.users` table would
+-- take them out, which leaves luatest unable to connect to its own cluster.
+-- Those two are also what makes this a realistic test: the config holds three
+-- users and only one of them is pregel's.
+--
+-- opts.user       -- the user carrying the role (default helper.USER)
+-- opts.password   -- its password (default helper.PASSWORD); false leaves the
+--                    password out, which is a configuration error the roles
+--                    report
+-- opts.extra_user -- a second user carrying the role, which is also one
+--
+-- @return a table to hand to helper.config as opts.credentials
+function helper.credentials(opts)
+    opts = opts or {}
+    local rv = {
+        ['roles.' .. helper.CREDENTIALS_ROLE] = {
+            privileges = {{
+                permissions = {'execute'},
+                lua_call    = helper.LUA_CALL,
+            }},
+        },
+        ['users.' .. (opts.user or helper.USER)] = {
+            password = opts.password ~= false and
+                       (opts.password or helper.PASSWORD) or nil,
+            roles    = {helper.CREDENTIALS_ROLE},
+        },
+    }
+    if opts.extra_user then
+        rv['users.' .. opts.extra_user] = {
+            password = helper.PASSWORD,
+            roles    = {helper.CREDENTIALS_ROLE},
+        }
+    end
+    return rv
+end
 
 --- Options for every luatest.Server the cluster starts.
 --
@@ -120,31 +168,19 @@ helper.GHOST_URI = 'unix/:./ghost.iproto'
 --                        turns the WAL on, since replication needs one.
 -- opts.ssl          -- {cert = <path>, key = <path>}: make every instance
 --                      listen with `transport: ssl` (Enterprise only)
--- opts.no_user      -- leave user/password out of roles_cfg, so the peers
---                      connect as guest; guest is granted what they need
+-- opts.credentials  -- replace the whole `credentials` section, for the tests
+--                      about resolving the pregel user from it
 function helper.config(opts)
     opts = opts or {}
     local job     = opts.job or helper.JOB
     local count   = opts.worker_count or helper.WORKER_COUNT
     local builder = cbuilder:new()
 
-    builder:set_global_option('credentials.users.' .. helper.USER, {
-        password   = helper.PASSWORD,
-        privileges = {{
-            permissions = {'execute'},
-            lua_call    = helper.LUA_CALL,
-        }},
-    })
-    if opts.no_user then
-        -- With no roles_cfg.user the peers connect as guest, and the role
-        -- issues no space grants of its own -- giving guest write access to
-        -- the graph is the operator's decision, so it has to be in the config.
-        builder:set_global_option('credentials.users.guest', {
-            privileges = {
-                {permissions = {'execute'}, lua_call = helper.LUA_CALL},
-                {permissions = {'read', 'write'}, universe = true},
-            },
-        })
+    -- Who the instances connect to each other as, and what that login may do.
+    -- Both halves hang off one credentials role: the roles look for the user
+    -- carrying it, and the privileges of the role are what that user gets.
+    for name, value in pairs(opts.credentials or helper.credentials()) do
+        builder:set_global_option('credentials.' .. name, value)
     end
     -- Nothing in these tests outlives the cluster -- but a replica has to read
     -- its leader's WAL, so a replicated cluster pays for one.
@@ -179,8 +215,6 @@ function helper.config(opts)
         return {
             name            = job,
             app             = helper.APP,
-            user            = not opts.no_user and helper.USER or nil,
-            password        = not opts.no_user and helper.PASSWORD or nil,
             connect_timeout = opts.connect_timeout,
         }
     end

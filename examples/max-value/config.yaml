@@ -3,14 +3,17 @@
 # graph, not copies of each other, so nothing here replicates.
 
 credentials:
-  users:
+  roles:
+    # The credentials role does two things at once: it marks the user pregel
+    # connects to its peers as -- the roles look for the one user carrying it,
+    # and take that user's password -- and it carries what that user may do.
+    #
+    # Everything pregel sends to pregel is a conn:call() on one of these four
+    # entry points; there is no universe grant anywhere in the library. The
+    # other half of the privileges, read/write on the job's own spaces, cannot
+    # be spelled here (the spaces are named after the job and do not exist yet)
+    # and is granted by the worker role itself.
     pregel:
-      password: 'secret'
-      # Everything pregel sends to pregel is a conn:call() on one of these four
-      # entry points -- there is no universe grant anywhere in the library. The
-      # other half of the privileges, read/write on the job's own spaces,
-      # cannot be spelled here (the spaces are named after the job and do not
-      # exist yet) and is granted by the worker role itself.
       privileges:
         - permissions: [execute]
           lua_call:
@@ -18,6 +21,13 @@ credentials:
             - pregel.worker.deliver_batch
             - pregel.worker.wait
             - pregel.master.deliver
+  users:
+    # Not called `pregel`: a credentials role and a user share one namespace,
+    # and the applier then dies with "User 'pregel' already exists" before any
+    # role is applied.
+    pregel_peer:
+      password: 'secret'
+      roles: [pregel]
 
 # Nothing in an example outlives the cluster, and a graph load writes every
 # vertex once: keeping it out of the WAL is most of the load time.
@@ -42,8 +52,6 @@ groups:
                 # this the cluster comes up idle and waits for an operator --
                 # see the README.
                 autostart: true
-                user: pregel
-                password: 'secret'
                 workers:
                   - '127.0.0.1:3302'
                   - '127.0.0.1:3303'
@@ -75,8 +83,6 @@ groups:
                   - '127.0.0.1:3302'
                   - '127.0.0.1:3303'
                   - '127.0.0.1:3304'
-                user: pregel
-                password: 'secret'
       worker2:
         instances:
           worker2:
