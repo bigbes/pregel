@@ -70,6 +70,47 @@ local function drop_worker(w)
     end
 end
 
+-- Defect: worker:stop() left its two queues in the queue.new cache, so a
+-- worker created afterwards under the same name got the stopped instance's
+-- queues -- with the old combiner, the old squash_only and the old engine, and
+-- no error. A restart in place with a different combiner computed with the old
+-- one and returned wrong answers quietly.
+g.test_new_after_stop_honours_the_queue_options = function()
+    local first = function(a, b) return a + b end
+    local second = function(a, b) return a > b and a or b end
+
+    local w1, name = make_worker({combiner = first})
+    t.assert_is(w1.mqueue.combiner, first)
+    t.assert_equals(w1.mqueue.squash_only, false)
+    t.assert_equals(w1.mqueue.engine, 'space')
+    w1:stop()
+
+    local w2 = worker.new(name, {
+        workers      = {URI},
+        master       = URI,
+        obtain_name  = obtain_name,
+        compute      = function() end,
+        combiner     = second,
+        squash_only  = true,
+        queue_engine = 'table',
+    })
+    for _, q in ipairs({w2.mqueue, w2.mqueue_next}) do
+        t.assert_is(q.combiner, second)
+        t.assert_equals(q.squash_only, true)
+        t.assert_equals(q.engine, 'table')
+    end
+
+    drop_worker(w2)
+    -- The first worker's spaces outlive it: that is what the 'space' engine is
+    -- for, and w2 asked for 'table'.
+    for _, space_name in ipairs({'pregel_tube_mqueue_first_' .. name,
+                                 'pregel_tube_mqueue_second_' .. name}) do
+        if box.space[space_name] ~= nil then
+            box.space[space_name]:drop()
+        end
+    end
+end
+
 local function vertices_of(w)
     local rv = {}
     for _, tuple in w.data_space:pairs() do

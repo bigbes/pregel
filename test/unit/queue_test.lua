@@ -93,6 +93,42 @@ end
 g_space.test_create_is_cached = test_create_is_cached
 g_table.test_create_is_cached = test_create_is_cached
 
+-- Defect: the cache answered every second call, whatever it was asked for, so
+-- a worker restarted in place with a different combiner went on computing with
+-- the old one -- and asking for the 'table' engine after a 'space' run kept the
+-- space. Identical options are still a cache hit; different ones are a mistake
+-- and now say so.
+local function test_reopen_with_other_options_is_refused(cg)
+    local name = fresh_name()
+    local engine = cg.params.engine
+    local other_engine = engine == 'space' and 'table' or 'space'
+    local combiner = function(a, b) return a + b end
+
+    local q = queue.new(name, {engine = engine, combiner = combiner})
+    -- The same options are the cache doing its job.
+    t.assert_is(queue.new(name, {engine = engine, combiner = combiner}), q)
+
+    t.assert_error_msg_contains('combiner', function()
+        queue.new(name, {engine = engine,
+                         combiner = function(a, b) return a - b end})
+    end)
+    t.assert_error_msg_contains('squash_only', function()
+        queue.new(name, {engine = engine, combiner = combiner,
+                         squash_only = true})
+    end)
+    t.assert_error_msg_contains('engine', function()
+        queue.new(name, {engine = other_engine, combiner = combiner})
+    end)
+    -- The queue that was already there is untouched by any of that.
+    t.assert_is(queue.list[name], q)
+    t.assert_is(q.combiner, combiner)
+    drop(q)
+end
+g_space.test_reopen_with_other_options_is_refused =
+    test_reopen_with_other_options_is_refused
+g_table.test_reopen_with_other_options_is_refused =
+    test_reopen_with_other_options_is_refused
+
 local function test_rejects_bad_options(cg)
     t.assert_error_msg_contains('options.engine', function()
         queue.new(fresh_name(), {engine = 'mmap'})

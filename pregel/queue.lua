@@ -18,7 +18,9 @@
 local log = require('log')
 
 local collections = require('pregel.utils.collections')
-local is_callable = require('pregel.utils').is_callable
+local utils       = require('pregel.utils')
+local is_callable = utils.is_callable
+local error       = utils.error
 
 local fmtstring = string.format
 
@@ -283,9 +285,11 @@ end
 -- options.squash_only -- run the combiner from squash() only (default false)
 -- options.engine      -- 'space' (default) or 'table'
 --
--- A queue that already exists is returned as it is; the options of the second
--- call are ignored, which is what makes queue.list a cache rather than a
--- factory.
+-- A queue that already exists is returned as it is, which is what makes
+-- queue.list a cache rather than a factory -- but only when the second call
+-- asks for the same options. Asking for different ones used to be a cache hit
+-- too, silently: a worker restarted in place with another combiner went on
+-- computing with the old one.
 local function tube_new(name, options)
     assert(type(name) == 'string', 'queue name must be a string')
     assert(type(options) == 'nil' or type(options) == 'table',
@@ -307,6 +311,21 @@ local function tube_new(name, options)
 
     local self = rawget(tube_list, name)
     if self ~= nil then
+        local mismatch
+        if self.engine ~= engine then
+            mismatch = string.format('engine %q, the existing one has %q',
+                                     engine, self.engine)
+        elseif self.combiner ~= combiner then
+            mismatch = 'a different combiner'
+        elseif self.squash_only ~= squash_only then
+            mismatch = string.format(
+                'squash_only %s, the existing one has %s',
+                tostring(squash_only), tostring(self.squash_only))
+        end
+        if mismatch ~= nil then
+            error("queue '%s' is already open with other options: asked for %s",
+                  name, mismatch)
+        end
         return self
     end
 

@@ -425,6 +425,19 @@ local worker_mt = {
                 self.master:close()
                 self.master = nil
             end
+            -- Take the queues out of queue.new's cache without dropping their
+            -- spaces. Leaving them there meant a worker created afterwards
+            -- under the same name inherited this instance's combiner, engine
+            -- and squash_only whatever it asked for -- and queue.new now
+            -- refuses a mismatch, so leaving them there would turn a restart
+            -- in place with new options into an error instead. The spaces
+            -- outlive the instance on purpose: that is what the 'space' engine
+            -- is for, and queue.new rebuilds the counters from what is in them.
+            for _, q in ipairs({self.mqueue, self.mqueue_next}) do
+                if q ~= nil and q.name ~= nil then
+                    rawset(queue.list, q.name, nil)
+                end
+            end
             workers[self.name] = nil
         end,
     }
