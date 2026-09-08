@@ -2,7 +2,7 @@ package = 'pregel'
 version = 'scm-1'
 source = {
     url    = 'git+https://github.com/bigbes/pregel.git',
-    branch = 'tarantool3',
+    branch = 'bigbes/gh-no-tarantool-v3',
 }
 description = {
     summary  = 'Pregel graph processing model for Tarantool',
