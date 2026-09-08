@@ -78,7 +78,7 @@ that is one writer walking its own ratings, not two writers racing.
 One consequence worth knowing before reading a transcript: the order a vertex
 reads its messages in is the order they arrived, so two runs of the same
 configuration end at slightly different models. Three runs of the fixture below
-scored 0.4773, 0.4777 and 0.4781.
+scored 0.5872, 0.5877 and 0.5884.
 
 ## What is global, and how it gets there
 
@@ -152,7 +152,7 @@ same breath as it prints `NOT RUNNING` for all four. Give it a second.
      mf:worker3  RUNNING  37554  RW    ready   running  --
 
 The committed `config.yaml` trains on `test/fixtures/ratings` — 50 users, 30
-items, 363 training and 91 held-out ratings — for 30 epochs at rank 3. It is
+items, 378 training and 95 held-out ratings — for 30 epochs at rank 3. It is
 over before `tt status` has finished printing: 2 ms to load and 130 ms for the
 31 supersteps.
 
@@ -175,15 +175,15 @@ exactly the credentials the job already runs on, and the `lua_call` list in
 
     echo "require('examples.mf.evaluate').evaluate{test = '../../test/fixtures/ratings/test.avro'}" | tt connect mf:master -f -
     ---
-    - mu: 3.4132231404959
-      ratings: 91
+    - mu: 3.4960317460317
+      ratings: 95
       items: 30
       users: 50
-      rmse: 0.47777244308092
+      rmse: 0.58721719973898
       missing: 0
     ...
 
-0.478 on ratings the job never saw. The number to compare it against is 0.561,
+0.587 on ratings the job never saw. The number to compare it against is 0.680,
 which is what answering every held-out rating with `mu` scores — that is the
 floor a recommender that has learnt nothing lands on, and the margin is the
 whole of what the factors bought.
@@ -199,19 +199,19 @@ module's name is what `roles_cfg.app` says — `app`, resolved through
 
     echo "local h = require('app').train_history() local rv = {} for _, e in ipairs(h) do if e.epoch % 5 == 0 or e.epoch == 1 then table.insert(rv, {epoch = e.epoch, count = e.count, rmse = e.rmse}) end end return rv" | tt connect mf:master -f -
     ---
-    - - {'count': 363, 'rmse': 0.5647533400965, 'epoch': 1}
-      - {'count': 363, 'rmse': 0.39096157278837, 'epoch': 5}
-      - {'count': 363, 'rmse': 0.37754998302149, 'epoch': 10}
-      - {'count': 363, 'rmse': 0.37388727020105, 'epoch': 15}
-      - {'count': 363, 'rmse': 0.3702125270194, 'epoch': 20}
-      - {'count': 363, 'rmse': 0.36586773244599, 'epoch': 25}
-      - {'count': 363, 'rmse': 0.35963134921066, 'epoch': 30}
+    - - {'count': 378, 'rmse': 0.57253719208603, 'epoch': 1}
+      - {'count': 378, 'rmse': 0.44129972581071, 'epoch': 5}
+      - {'count': 378, 'rmse': 0.42979143021465, 'epoch': 10}
+      - {'count': 378, 'rmse': 0.42135247156449, 'epoch': 15}
+      - {'count': 378, 'rmse': 0.40672742063519, 'epoch': 20}
+      - {'count': 378, 'rmse': 0.38255819770215, 'epoch': 25}
+      - {'count': 378, 'rmse': 0.3538011091483, 'epoch': 30}
     ...
 
-`count` is 363 in every row, and that is worth more than it looks: it is the
+`count` is 378 in every row, and that is worth more than it looks: it is the
 number of training ratings, counted once each. Both directions of every rating
 are in the graph, so a version that accumulated the error on the item side too
-would report 726 here — and a train RMSE that is quietly the same number, since
+would report 756 here — and a train RMSE that is quietly the same number, since
 the same errors would be averaged over twice as many of them.
 
 The shards, for the record. A vertex name is hashed onto one of the `workers`
@@ -240,10 +240,10 @@ directories too.
     tarantool tools/gen-ratings.lua /tmp/mf-500x200 \
         --users 500 --items 200 --rank 5 --density 0.1 --seed 11
 
-    /tmp/mf-500x200/train.avro: 8126 ratings
-    /tmp/mf-500x200/test.avro: 2032 ratings (0 moved back to train for a user or item train.avro would not have held)
+    /tmp/mf-500x200/train.avro: 7939 ratings
+    /tmp/mf-500x200/test.avro: 1985 ratings (0 moved back to train for a user or item train.avro would not have held)
     /tmp/mf-500x200/truth.json: mu 3.5, 500 user and 200 item factors of rank 5
-    density: 10158 of 100000 pairs (0.1016), seed: 11, noise: 0.2, codec: null
+    density: 9924 of 100000 pairs (0.0992), seed: 11, noise: 0.2, codec: null
 
 Point `app_cfg` at it — five lines of `config.yaml`, and the anchor carries them
 to the workers:
@@ -268,33 +268,33 @@ still worth something at epoch 60. Then start it exactly as above.
 
     echo "require('examples.mf.evaluate').evaluate{test = '/tmp/mf-500x200/test.avro'}" | tt connect mf:master -f -
     ---
-    - mu: 3.5326729017967
-      ratings: 2032
+    - mu: 3.5076835873536
+      ratings: 1985
       items: 200
       users: 500
-      rmse: 0.49984600762435
+      rmse: 0.47038771006798
       missing: 0
     ...
 
-0.500 against 0.756 for predicting the mean — a wider margin than on the small
-fixture, because 8126 ratings support ten factors per vertex far better than
-363 support six.
+0.470 against 0.711 for predicting the mean — a wider margin than on the small
+fixture, because 7939 ratings support ten factors per vertex far better than
+378 support six.
 
     echo "local h = require('app').train_history() local rv = {} for _, e in ipairs(h) do if e.epoch == 1 or e.epoch % 15 == 0 then table.insert(rv, {epoch = e.epoch, count = e.count, rmse = e.rmse}) end end return rv" | tt connect mf:master -f -
     ---
-    - - {'count': 8126, 'rmse': 0.71512897589337, 'epoch': 1}
-      - {'count': 8126, 'rmse': 0.5095299471584, 'epoch': 15}
-      - {'count': 8126, 'rmse': 0.35025086879895, 'epoch': 30}
-      - {'count': 8126, 'rmse': 0.31077394080523, 'epoch': 45}
-      - {'count': 8126, 'rmse': 0.28937200618377, 'epoch': 60}
+    - - {'count': 7939, 'rmse': 0.69081754521155, 'epoch': 1}
+      - {'count': 7939, 'rmse': 0.49986273006126, 'epoch': 15}
+      - {'count': 7939, 'rmse': 0.34341295579343, 'epoch': 30}
+      - {'count': 7939, 'rmse': 0.29854835452582, 'epoch': 45}
+      - {'count': 7939, 'rmse': 0.27633548216756, 'epoch': 60}
     ...
 
-Loading the 8126 ratings — 700 vertices and 16252 edges — takes 54 ms, and the
-61 supersteps 2.5 s. The graph spreads evenly over the three workers:
+Loading the 7939 ratings — 700 vertices and 15878 edges — takes 53 ms, and the
+61 supersteps 2.8 s. The graph spreads evenly over the three workers:
 
-    ... | tt connect mf:worker1 -f -   → vertices: 250, users: 187, items: 63, edges: 5531
-    ... | tt connect mf:worker2 -f -   → vertices: 219, users: 149, items: 70, edges: 5309
-    ... | tt connect mf:worker3 -f -   → vertices: 231, users: 164, items: 67, edges: 5412
+    ... | tt connect mf:worker1 -f -   → vertices: 250, users: 187, items: 63, edges: 5545
+    ... | tt connect mf:worker2 -f -   → vertices: 219, users: 149, items: 70, edges: 5131
+    ... | tt connect mf:worker3 -f -   → vertices: 231, users: 164, items: 67, edges: 5202
 
 ## The test
 

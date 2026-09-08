@@ -34,9 +34,9 @@ local JOB     = 'mf'
 local RANK   = 3
 local EPOCHS = 30
 
--- test/fixtures/ratings: 50 users, 30 items, 363 train and 91 test ratings.
-local TRAIN_RATINGS = 363
-local TEST_RATINGS  = 91
+-- test/fixtures/ratings: 50 users, 30 items, 378 train and 95 test ratings.
+local TRAIN_RATINGS = 378
+local TEST_RATINGS  = 95
 local USERS         = 50
 local ITEMS         = 30
 
@@ -52,12 +52,11 @@ local TEST  = '../../test/fixtures/ratings/test.avro'
 -- and on every shard count -- but the order a vertex reads its messages in is
 -- the order they arrived, and a vertex chains its own updates as it walks
 -- them, so a different interleaving is a slightly different model. Three runs
--- of this cluster gave 0.4773, 0.4777 and 0.4781; shuffling the order
--- deliberately, over six trials outside the cluster, spanned 0.4762 to 0.4810.
+-- of this cluster gave 0.5872, 0.5877 and 0.5884.
 --
--- 0.50 is about four times that spread above the top of it, and well below the
--- 0.5606 a model that learnt nothing scores -- see baseline_rmse.
-local TEST_RMSE_MAX = 0.50
+-- 0.60 is about ten times that spread above the top of it, and well below the
+-- 0.6801 a model that learnt nothing scores -- see baseline_rmse.
+local TEST_RMSE_MAX = 0.60
 
 local function app_cfg(overrides)
     local cfg = {
@@ -154,7 +153,7 @@ g.test_the_training_error_falls_every_epoch = function()
 
     -- Every training rating goes into the error of every epoch exactly once.
     -- Both directions of each rating are in the graph, so a version that
-    -- accumulated on the item side too would report 726 here and a train RMSE
+    -- accumulated on the item side too would report 756 here and a train RMSE
     -- that is quietly the same number.
     for _, epoch in ipairs(history) do
         t.assert_equals(epoch.count, TRAIN_RATINGS,

@@ -37,10 +37,13 @@ local AVRO = {
 local TASKS = {'task1', 'task2'}
 local USERS = 200
 
--- The fixture's own Bayes error is 2 flipped labels of 60 for task1 and 7 of
+-- The fixture's own Bayes error is 4 flipped labels of 60 for task1 and 7 of
 -- 60 for task2, so a perfect model does not reach AUC 1 on either. Measured on
--- this fixture: task1 0.955, task2 0.945.
-local MIN_AUC = 0.9
+-- this fixture: task1 0.944, task2 0.841. task2 is the harder of the two and
+-- the reason the threshold is not tighter: 15 of its 60 labels are positive,
+-- so a quarter held out leaves an AUC measured over 4 positives against 11
+-- negatives -- 44 pairs, one of which is worth 0.023 of the score.
+local MIN_AUC = 0.75
 -- Nine weights (a bias and eight features), so 0.8 is "at least eight of the
 -- nine". Measured: 9 of 9 for both tasks.
 local MIN_AGREEMENT = 0.8

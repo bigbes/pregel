@@ -167,6 +167,62 @@ g.test_labels_only_name_users_that_users_avro_declares = function()
 end
 
 --------------------------------------------------------------------------------
+-- The seed
+--------------------------------------------------------------------------------
+
+--- The first weight of task1 is the very first draw of the stream, so it is
+--- the one place a seeding mistake is visible in the output: `weights[1]` is
+--- `2 * u - 1` for the stream's first uniform `u`, exactly, because the
+--- weights are quantised to 12 places and 2u-1 is representable there.
+--
+-- A linear congruential generator started at `seed + 1` returns
+-- `A * (seed + 1) / M` first, which for every seed a human types is a fixed
+-- tiny number rising with the seed -- so the first parameter of the hidden
+-- model would be a near-extreme draw, the same near-extreme draw, for seed 1
+-- and seed 10 alike. Ten seeds are enough to see it: a real uniform stream
+-- has a 2/10! chance of coming out sorted and a vanishing chance of staying
+-- inside a thousandth of the range.
+local function first_weights(seeds)
+    local out = {}
+    for i, seed in ipairs(seeds) do
+        local dir = generate('seed-' .. seed, {
+            '--users', 4, '--features', 1, '--tasks', 1, '--seed', seed,
+        })
+        out[i] = read_truth(dir).tasks.task1.weights[1]
+    end
+    return out
+end
+
+g.test_small_seeds_do_not_all_draw_the_same_extreme_first_weight = function()
+    local seeds = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+    local w = first_weights(seeds)
+
+    local up, down = true, true
+    for i = 2, #w do
+        if w[i] <= w[i - 1] then
+            up = false
+        end
+        if w[i] >= w[i - 1] then
+            down = false
+        end
+    end
+    t.assert(not up and not down,
+             'task1 weights[1] is monotone in the seed: ' ..
+             json.encode(w))
+
+    local lo, hi = w[1], w[1]
+    for i = 2, #w do
+        lo = math.min(lo, w[i])
+        hi = math.max(hi, w[i])
+    end
+    -- Ten uniforms on [-1, 1] span more than half the range with probability
+    -- 1 - 11 * 4^-9 ~ 0.99996.
+    t.assert_gt(hi - lo, 1.0,
+                ('seeds 1..10 draw their first weight from [%f, %f], a %f ' ..
+                 'slice of [-1, 1]'):format(lo, hi, hi - lo))
+end
+
+--------------------------------------------------------------------------------
 -- Determinism
 --------------------------------------------------------------------------------
 

@@ -1,7 +1,7 @@
 # Ratings fixture
 
-A synthetic ratings matrix from hidden rank-3 factors: 50 users, 30 items, 454
-of the 1500 pairs rated, split 363 train / 91 test. Produced from the
+A synthetic ratings matrix from hidden rank-3 factors: 50 users, 30 items, 473
+of the 1500 pairs rated, split 378 train / 95 test. Produced from the
 repository root by
 
     tarantool tools/gen-ratings.lua test/fixtures/ratings \
@@ -24,7 +24,7 @@ multiple of 0.5 between 1 and 5.
      "noise": 0.2, "seed": 7, "test_fraction": 0.2,
      "biases":  {"users": {"u1": ...}, "items": {"i1": ...}},
      "factors": {"users": {"u1": [3 doubles]}, "items": {"i1": [...]}},
-     "counts":  {"ratings": 454, "train": 363, "test": 91,
+     "counts":  {"ratings": 473, "train": 378, "test": 95,
                  "moved_to_train": 0}}
 
 A rating is
@@ -42,7 +42,7 @@ ratings are computed, so reading them back out of JSON — whose encoder keeps
 
 The rating histogram is
 
-    1.5:1  2:10  2.5:41  3:123  3.5:160  4:92  4.5:21  5:6
+    1:1  2:6  2.5:33  3:135  3.5:149  4:102  4.5:36  5:11
 
 — centred on the global mean of 3.5 and spread by the biases and the factors,
 with the tails thinned by the clip at 1 and 5. All 50 users and all 30 items
@@ -59,3 +59,10 @@ machine: the generator has its own Park–Miller (MINSTD) generator rather than
 `math.random`, and it derives the Avro sync marker — otherwise 16 random bytes
 per file — from the parameters. Across machines the bytes may differ in the
 last place, because the normals are made out of libm's `log` and `cos`.
+
+The seed reaches that generator through a splitmix32 mix and a 16-draw warm-up
+rather than as the state itself: MINSTD returns `48271 * state / 2^31` first,
+so a state of `seed + 1` would make the first draw tiny and, through
+Box–Muller, `u1`'s bias a four-sigma draw for every seed a human types.
+Changing that changed these files, so the numbers above are not the ones an
+older checkout produced from the same command.

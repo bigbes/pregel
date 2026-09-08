@@ -241,6 +241,53 @@ g.test_moving_a_rating_back_keeps_the_total = function()
 end
 
 --------------------------------------------------------------------------------
+-- The seed
+--------------------------------------------------------------------------------
+
+--- u1's bias is the first thing the generator draws, so it is where a seeding
+--- mistake shows in the output: it is `0.3 * N(0,1)` built by Box-Muller from
+--- the stream's first two uniforms.
+--
+-- A linear congruential generator started at `seed + 1` returns
+-- `A * (seed + 1) / M` first, which for every seed a human types is of the
+-- order of 1e-4 -- and Box-Muller turns a first uniform that small into
+-- `sqrt(-2 ln u) > 4`, so u1's bias comes out four standard deviations wide
+-- for seed 1 and for seed 10 alike. Under the documented N(0, 0.3) a draw
+-- beyond two standard deviations happens 4.6% of the time, so at most a
+-- couple of ten seeds should manage it.
+local function first_user_biases(seeds)
+    local out = {}
+    for i, seed in ipairs(seeds) do
+        local dir = generate('seed-' .. seed, {
+            '--users', 4, '--items', 4, '--rank', 1, '--density', 1,
+            '--seed', seed,
+        })
+        out[i] = read_truth(dir).biases.users.u1
+    end
+    return out
+end
+
+g.test_small_seeds_do_not_all_draw_an_extreme_first_bias = function()
+    local seeds = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+    local biases = first_user_biases(seeds)
+
+    local extreme, total = 0, 0
+    for _, b in ipairs(biases) do
+        total = total + math.abs(b)
+        if math.abs(b) > 0.6 then
+            extreme = extreme + 1
+        end
+    end
+    t.assert_le(extreme, 3,
+                ('%d of 10 small seeds put u1 beyond two standard ' ..
+                 'deviations: %s'):format(extreme, json.encode(biases)))
+    -- E|N(0, 0.3)| is 0.239; a mean of ten such draws above 0.45 is far off.
+    t.assert_lt(total / #biases, 0.45,
+                'the mean first bias over seeds 1..10 is ' ..
+                tostring(total / #biases) .. ', not the 0.24 of N(0, 0.3)')
+end
+
+--------------------------------------------------------------------------------
 -- Determinism
 --------------------------------------------------------------------------------
 
@@ -388,10 +435,10 @@ g.test_the_committed_fixture_matches_its_readme = function()
     t.assert_equals(truth.rank, 3)
     t.assert_equals(truth.seed, 7)
     t.assert_equals(truth.noise, 0.2)
-    t.assert_equals(truth.counts, {ratings = 454, train = 363, test = 91,
+    t.assert_equals(truth.counts, {ratings = 473, train = 378, test = 95,
                                    moved_to_train = 0})
-    t.assert_equals(#train, 363)
-    t.assert_equals(#test, 91)
+    t.assert_equals(#train, 378)
+    t.assert_equals(#test, 95)
     assert_no_cold_start(dir)
     -- Noise 0.2 against a rounding of 0.25, so most ratings still land on the
     -- half point the hidden model predicts.

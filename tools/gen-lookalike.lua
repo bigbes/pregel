@@ -41,6 +41,7 @@
 -- significant digits -- returns the very doubles the labels were computed
 -- from, and a test can recompute the labels exactly.
 
+local bit    = require('bit')
 local fio    = require('fio')
 local json   = require('json')
 local digest = require('digest')
@@ -105,12 +106,56 @@ end
 local RNG_A = 48271
 local RNG_M = 2147483647
 
+-- MINSTD's first output is A * state / M, so a state near zero returns a
+-- uniform near zero. Taking `seed + 1` as the state -- the obvious thing --
+-- therefore makes the first draw 2.2e-5 * (seed + 1) for every seed a human
+-- types, and the first parameter drawn from it a fixed extreme value that
+-- merely creeps with the seed: the first weight below would be -0.9999 for
+-- seed 1 and -0.9995 for seed 10, never a uniform on [-1, 1] at all.
+--
+-- So the seed is scrambled before it becomes a state (splitmix32's finalizer,
+-- primed with the golden-ratio constant so that adjacent and doubled seeds do
+-- not stay related through it), and the stream is then run forward
+-- RNG_WARMUP times before anything reads it. Both halves are cheap and both
+-- are needed: the mix breaks the seed's magnitude, the warm-up costs nothing
+-- and covers whatever structure the mix leaves behind.
+local RNG_WARMUP = 16
+local RNG_GOLDEN = 0x9e3779b9
+
+--- a * b over the 32-bit integers, in two 16-bit halves. A double holds the
+--- product of two 32-bit numbers only up to 2^53, which 0xffffffff squared
+--- exceeds, so the top half is dropped before it can round.
+local function mul32(a, b)
+    local ahi, alo = math.floor(a / 65536), a % 65536
+    local bhi, blo = math.floor(b / 65536), b % 65536
+    return (alo * blo + ((ahi * blo + alo * bhi) % 65536) * 65536) % 4294967296
+end
+
+--- x ^ (x >> n), unsigned.
+local function xorshift(x, n)
+    return bit.bxor(bit.tobit(x), bit.tobit(math.floor(x / 2 ^ n)))
+        % 4294967296
+end
+
+local function mix32(x)
+    x = (x + RNG_GOLDEN) % 4294967296
+    x = xorshift(x, 16)
+    x = mul32(x, 0x21f0aaad)
+    x = xorshift(x, 15)
+    x = mul32(x, 0xd35a2d97)
+    return xorshift(x, 15)
+end
+
 local function rng_new(seed)
-    local s = math.floor(seed) % (RNG_M - 1)
+    local s = math.floor(seed) % 4294967296
     if s < 0 then
-        s = s + (RNG_M - 1)
+        s = s + 4294967296
     end
-    return {state = s + 1}
+    local r = {state = mix32(s) % (RNG_M - 1) + 1}
+    for _ = 1, RNG_WARMUP do
+        r.state = (RNG_A * r.state) % RNG_M
+    end
+    return r
 end
 
 local function uniform(r)

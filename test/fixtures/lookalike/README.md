@@ -39,10 +39,10 @@ exactly rather than approximately.
 
 ## The numbers to expect
 
-`task1` has 17 of its 60 labels positive and `task2` has 42, so the two tasks
+`task1` has 35 of its 60 labels positive and `task2` has 15, so the two tasks
 lean opposite ways and a model that learns nothing but the majority class
 cannot look good on both. Against the noiseless sign of the score, noise 0.5
-flips 2 of task1's labels and 7 of task2's: that is the Bayes error a learner
+flips 4 of task1's labels and 7 of task2's: that is the Bayes error a learner
 on this fixture cannot get below, and it is deliberately non-zero so the
 example is not scored against a target it could reach exactly.
 
@@ -57,3 +57,10 @@ machine: the generator has its own Park–Miller (MINSTD) generator rather than
 `math.random`, and it derives the Avro sync marker — otherwise 16 random bytes
 per file — from the parameters. Across machines the bytes may differ in the
 last place, because the normals are made out of libm's `log` and `cos`.
+
+The seed reaches that generator through a splitmix32 mix and a 16-draw warm-up
+rather than as the state itself: MINSTD returns `48271 * state / 2^31` first,
+so a state of `seed + 1` would make the first draw — and with it `task1`'s
+bias — a near-extreme value that merely creeps with the seed. Changing that
+changed these files, so the numbers above are not the ones an older checkout
+produced from the same command.
