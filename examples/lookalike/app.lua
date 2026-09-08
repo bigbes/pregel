@@ -38,6 +38,8 @@
 -- Configured through roles_cfg.app_cfg:
 --
 --   users, labels       the two Avro files, relative to this directory
+--   grant_to            the user roles_cfg.user names, so the job can reach
+--                       the per-task staging spaces this module creates
 --   test_fraction       held out of training, per class          (0.25)
 --   min_labels          fewer than this and the task fails       (20)
 --   learning_rate       initial rate of the inverse-decay schedule (0.1)
@@ -170,30 +172,49 @@ end
 
 local context_mt
 
---- The space a task stages its training set in.
+local function space_name_of(task)
+    return 'task_' .. task:gsub('%W', '_') .. '_ds'
+end
+
+--- Create the space a task stages its training set in, and let the job reach
+--- it.
 --
--- One space per task, created on first use and named after it. `temporary`
--- because it is scratch: it is written from the answers to one round of FETCH
--- messages, read a few hundred times by the gradient descent loop and once
--- more for the AUC, and a job that has to be restarted rebuilds it from the
--- labels rather than from a WAL.
+-- **This is only possible while the role is applying its config**, which is
+-- why worker_context() calls it and nothing else does. Everything else an app
+-- module runs -- its loader, its compute function -- happens inside the
+-- `pregel.worker.deliver` / `pregel.worker.preload` RPC and therefore with the
+-- privileges of `roles_cfg.user`, and that user has:
 --
--- Called from the loader for every task this worker owns, so the DDL normally
--- happens before the first superstep rather than inside one; the lazy path is
--- what a task vertex created by add_vertex mid-job would take.
-local function space_for(self, task)
-    local space = self.spaces[task]
-    if space ~= nil then
-        return space
-    end
-    local name = 'task_' .. task:gsub('%W', '_') .. '_ds'
+--   * no write access to `_space`, so `box.schema.space.create` raises
+--     "Write access to space '_space' is denied for user 'pregel'"
+--   * no access to a space it was not granted, and pregel.worker.grant() only
+--     covers pregel's own four
+--
+-- Hence both halves here: the DDL, and a grant of the app's own space to the
+-- same user roles_cfg names. The app module cannot read roles_cfg, so that
+-- user's name has to arrive through app_cfg -- see `grant_to` in config.yaml.
+-- A job whose peers connect as guest with a universe grant needs neither and
+-- leaves it unset.
+--
+-- `temporary`, because the space is scratch: it is written once from the
+-- answers to a round of FETCH messages, read a few hundred times by the
+-- gradient descent loop and once more for the AUC. A restarted job rebuilds it
+-- from the labels rather than from a WAL.
+--
+-- Every worker gets a space for every task, not only for the tasks whose
+-- vertices it owns. Which those are is a hash of the vertex name against the
+-- worker list, and the mpool that computes it does not exist yet at the one
+-- moment DDL is allowed. An unused one costs an empty space.
+local function ensure_space(self, task)
+    local name = space_name_of(task)
     local owner = self.space_owner[name]
-    if owner ~= nil then
+    if owner ~= nil and owner ~= task then
         error(string.format(
             "lookalike: tasks %q and %q both want the space %q; task names " ..
             'must differ in more than punctuation', owner, task, name))
     end
-    space = box.space[name]
+
+    local space = box.space[name]
     if space == nil then
         space = box.schema.space.create(name, {
             temporary = true,
@@ -210,21 +231,89 @@ local function space_for(self, task)
                      {field = 2, type = 'string'}},
         })
     end
+    if self.grant_to ~= nil then
+        box.schema.user.grant(self.grant_to, 'read,write', 'space', name,
+                              {if_not_exists = true})
+    end
     self.space_owner[name] = task
     self.spaces[task] = space
     return space
 end
 
-context_mt = {__index = {space_for = space_for}}
+--- The space `ensure_space` made, or a readable error.
+--
+-- Separate from creating it because the two happen in different sessions with
+-- different privileges, and "there is no space for this task" is a
+-- configuration problem worth naming rather than a denied DDL three frames
+-- down.
+local function space_for(self, task)
+    local space = self.spaces[task]
+    if space == nil then
+        error(string.format(
+            'lookalike: no staging space for task %q; it was not in %s when ' ..
+            'this worker applied its config', task, space_name_of(task)))
+    end
+    return space
+end
 
+--- Delete every row of a task's staging space.
+--
+-- Not space:truncate(): truncate writes to the `_truncate` system space and is
+-- refused for the same reason the DDL above is. Collect the keys first --
+-- deleting from under an open iterator is not defined.
+local function clear_space(space)
+    local keys = {}
+    for _, tuple in space:pairs() do
+        table.insert(keys, {tuple.split, tuple.vid})
+    end
+    for _, key in ipairs(keys) do
+        space:delete(key)
+    end
+end
+
+context_mt = {__index = {space_for = space_for, ensure_space = ensure_space}}
+
+--- Read labels.avro into {task -> array of {vid, target}} and a sorted roster.
+local function read_labels(path)
+    local by_task, order = {}, {}
+    local reader = ocf.open(path, {mode = 'r'})
+    for record in reader:records() do
+        if by_task[record.task] == nil then
+            by_task[record.task] = {}
+            table.insert(order, record.task)
+        end
+        table.insert(by_task[record.task],
+                     {vid = record.vid, target = record.target})
+    end
+    reader:close()
+    -- The roster the master starts, and the order the tasks are reported in:
+    -- the file's own order would make it depend on how the labels happened to
+    -- be written.
+    table.sort(order)
+    return by_task, order
+end
+
+--- Built once per worker, while the role applies its config.
+--
+-- It reads labels.avro rather than leaving that to the loader, because it has
+-- to: the task names are what the staging spaces are named after, and this is
+-- the only moment at which a space can be created. The loader then works from
+-- what is here, so the file is still read once per worker.
 function app.worker_context(app_cfg)
-    local cfg = common.cfg(app_cfg)
+    local cfg = common.cfg(app_cfg, {'labels'})
     local resolved = {}
     for key, fallback in pairs(DEFAULTS) do
         resolved[key] = cfg[key] or fallback
     end
-    return setmetatable({
-        cfg = resolved,
+
+    local labels, roster =
+        read_labels(common.resolve(HERE, cfg.labels, 'labels'))
+
+    local context = setmetatable({
+        cfg      = resolved,
+        labels   = labels,
+        roster   = roster,
+        grant_to = cfg.grant_to,
         -- Every user vertex this worker owns, filled by the loader. A task
         -- draws the part of its calibration sample the labels do not cover
         -- from here; see calibration_targets.
@@ -232,27 +321,34 @@ function app.worker_context(app_cfg)
         spaces      = {},
         space_owner = {},
     }, context_mt)
+
+    for _, task in ipairs(roster) do
+        context:ensure_space(task)
+    end
+    return context
 end
 
 -------------------------------------------------------------------------------
 -- Loading
 -------------------------------------------------------------------------------
 
---- Read both Avro files on every worker and keep this worker's share.
+--- Turn the input into vertices, on every worker at once.
 --
--- Run through worker:preload(), so every worker does this at once and each
--- keeps only the vertices whose names hash to it -- the same split
--- loader.avro_files does, spelled out here because that loader wants a
--- vertex file and an edge file and this job has no edges at all.
+-- Run through worker:preload(), so each worker keeps only the vertices whose
+-- names hash to it -- the same split loader.avro_files does, spelled out here
+-- because that loader wants a vertex file and an edge file, and this job has
+-- no edges at all.
 --
--- The whole label file is read on every worker even though most of it is
--- someone else's: a task vertex needs *all* of its own labels, and they are
--- scattered through the file. That is the training set, so it is small by
--- construction -- the population in users.avro is the part that is not.
+-- users.avro is read whole by every worker even though most of it is someone
+-- else's share; that is the price of a partitioned load with no index over the
+-- file. The labels are already in the worker context, which read them at
+-- config-apply time (see worker_context) -- a task vertex needs *all* of its
+-- own labels and they are scattered through the file, so there was never a
+-- partition to make there. That is the training set, so it is small by
+-- construction; the population in users.avro is the part that is not.
 function app.worker_preload(instance, app_cfg)
     local cfg = common.cfg(app_cfg, {'users', 'labels'})
-    local users_path  = common.resolve(HERE, cfg.users, 'users')
-    local labels_path = common.resolve(HERE, cfg.labels, 'labels')
+    local users_path = common.resolve(HERE, cfg.users, 'users')
 
     return loader.new(instance, function(self, worker_idx)
         local context = instance.worker_context
@@ -278,31 +374,14 @@ function app.worker_preload(instance, app_cfg)
         end
         reader:close()
 
-        local by_task, order = {}, {}
-        reader = ocf.open(labels_path, {mode = 'r'})
-        for record in reader:records() do
-            if by_task[record.task] == nil then
-                by_task[record.task] = {}
-                table.insert(order, record.task)
-            end
-            table.insert(by_task[record.task],
-                         {vid = record.vid, target = record.target})
-        end
-        reader:close()
-        -- The roster the master starts, and the order the tasks are reported
-        -- in: the file's own order would make it depend on how the labels
-        -- happened to be written.
-        table.sort(order)
-
-        for _, task in ipairs(order) do
+        for _, task in ipairs(context.roster) do
             local name = task_name(task)
             if owns(name) then
-                context:space_for(task)
                 self:store_vertex({
                     name     = name,
                     type     = 'task',
                     task     = task,
-                    labelled = by_task[task],
+                    labelled = context.labels[task],
                     phase    = PHASE_NEW,
                 })
                 stored = stored + 1
@@ -313,7 +392,7 @@ function app.worker_preload(instance, app_cfg)
             self:store_vertex({
                 name    = MASTER_NAME,
                 type    = 'master',
-                roster  = order,
+                roster  = context.roster,
                 reports = {},
             })
             stored = stored + 1
@@ -515,7 +594,7 @@ end
 -- @return the number of rows written, and the train/test sizes
 local function stage_dataset(context, task, messages)
     local space = context:space_for(task)
-    space:truncate()
+    clear_space(space)
 
     local rows = {}
     for _, message in ipairs(messages) do
@@ -641,6 +720,16 @@ local function compute_task(self)
         end
     end
 
+    -- A question asked in superstep S is read in S+1 and answered into S+2, so
+    -- a phase that sent messages has one superstep of nothing to do before the
+    -- answers exist. `await` is the superstep they are due in, and without it
+    -- the phase runs immediately on an empty inbox and concludes that nobody
+    -- answered -- which is exactly what the 2016 code's "Master didn't receive
+    -- any messages, waiting one superstep" branch was papering over, one
+    -- superstep at a time and with no way to tell a slow round trip from a
+    -- question nobody could answer.
+    local due = value.await == nil or self:get_superstep() >= value.await
+
     if value.phase == PHASE_NEW and started then
         -- SELECTION. The label travels with the request, so the answer can
         -- carry it back and the task needs no second lookup to pair a feature
@@ -659,10 +748,11 @@ local function compute_task(self)
                 })
             end
             value.phase = PHASE_TRAINING
+            value.await = self:get_superstep() + 2
             self:set_value(value)
         end
 
-    elseif value.phase == PHASE_TRAINING then
+    elseif value.phase == PHASE_TRAINING and due then
         local answered = {}
         for _, message in ipairs(messages) do
             if message.command == FEATURES then
@@ -711,10 +801,11 @@ local function compute_task(self)
             end
             value.report.calibration_sent = #targets
             value.phase = PHASE_CALIBRATION
+            value.await = self:get_superstep() + 2
             self:set_value(value)
         end
 
-    elseif value.phase == PHASE_CALIBRATION then
+    elseif value.phase == PHASE_CALIBRATION and due then
         local counter = percentile.new()
         for _, message in ipairs(messages) do
             if message.command == SCORE then

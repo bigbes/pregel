@@ -59,6 +59,14 @@ groups:
                   # one -- the README runs 2000 users, 16 features, 3 tasks.
                   users:  '../../test/fixtures/lookalike/users.avro'
                   labels: '../../test/fixtures/lookalike/labels.avro'
+                  # Must be the same user as roles_cfg.user above. This
+                  # example is the only one that keeps spaces of its own -- one
+                  # per task, for the staged training set -- and a compute
+                  # function runs with the privileges of whoever called the
+                  # RPC it is inside. pregel.worker.grant() covers pregel's own
+                  # four spaces and knows nothing about an app's; an app module
+                  # cannot read roles_cfg; so the name has to be here.
+                  grant_to: pregel
                   # Held out of training, per class, to measure AUC on.
                   test_fraction: 0.25
                   # A task with fewer labels than this reports `failed` with a
