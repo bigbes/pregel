@@ -1,4 +1,7 @@
 *.snap
 *.xlog
+*.vylog
 .*.swp
+.rocks/
+test/var/
 var
