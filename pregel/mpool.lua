@@ -39,6 +39,10 @@ local CONNECT_TIMEOUT  = 30
 -- How long a producer blocked on a full bucket sleeps before re-checking. The
 -- flush broadcasts, so this is only a backstop against a lost wakeup.
 local FULL_POLL        = 0.1
+-- How long send_wait waits for one bucket's answer before checking that the
+-- fiber that owes it is still alive. A superstep can legitimately take very
+-- much longer than this: the check is about liveness, not about a deadline.
+local HANDLER_POLL     = 1
 
 local WORKER_DELIVER       = 'pregel.worker.deliver'
 local WORKER_DELIVER_BATCH = 'pregel.worker.deliver_batch'
@@ -463,6 +467,21 @@ local waitpool_mt = {
         stop = function(self)
             self.channel_in:close()
             self.fpool = {}
+        end,
+        --- Refuse to keep waiting for a handler that is gone.
+        --
+        -- The pcall in waitpool_handler is what normally keeps one alive, but
+        -- a fiber can also be cancelled, and a handler that dies holding its
+        -- task never answers on channel_out. __call used to wait for that
+        -- answer forever -- in production, and in the very test that covers
+        -- the pcall, where it hung the whole suite instead of failing it.
+        check_handlers = function(self)
+            for id, handler in ipairs(self.fpool) do
+                if handler:status() == 'dead' then
+                    error('mpool: waitpool handler %d is dead, bucket %d ' ..
+                          'will never answer', id, id)
+                end
+            end
         end
     },
     __call = function(self, msg, args)
@@ -470,11 +489,16 @@ local waitpool_mt = {
         self.errors = {}
         self.msg    = msg
         self.args   = args
+        -- An answer left over from a call that gave up on a dead handler would
+        -- otherwise be read as one of this call's.
+        while self.channel_out:get(0) ~= nil do end
         for i = 1, self.fpool_cnt do
             self.channel_in:put(i)
         end
         for _ = 1, self.fpool_cnt do
-            self.channel_out:get()
+            while self.channel_out:get(HANDLER_POLL) == nil do
+                self:check_handlers()
+            end
         end
         local failures = {}
         for id, err in pairs(self.errors) do

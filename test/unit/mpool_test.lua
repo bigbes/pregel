@@ -70,6 +70,30 @@ local function quiet_pool(n, options)
     return pool
 end
 
+--- Run `fn` in a fiber and fail the test if it has not returned in `seconds`.
+--
+-- luatest has no per-test timeout, so a defect whose shape is "nobody ever
+-- answers" used to hang the whole suite rather than fail one test -- which in
+-- CI is a killed job with no test name in it. Anything here that could wait on
+-- another fiber goes through this.
+local function within(seconds, fn)
+    local rv
+    local runner = fiber.new(function()
+        local ok, res = pcall(fn)
+        rv = {ok, res}
+    end)
+    runner:set_joinable(true)
+    local returned = pcall(t.helpers.retrying,
+                           {timeout = seconds, delay = 0.01},
+                           function() t.assert_not_equals(rv, nil) end)
+    if not returned then
+        runner:cancel()
+        t.fail(string.format('did not return within %s second(s)', seconds))
+    end
+    runner:join()
+    return rv[1], rv[2]
+end
+
 local function drop_delayed(pool)
     for _, bucket in ipairs(pool.buckets) do
         bucket:drop()
@@ -310,7 +334,10 @@ g.test_put_blocks_on_a_full_bucket = function()
     fiber.sleep(0.05)
     t.assert_equals(done, false, 'put must wait while the bucket is full')
 
-    bucket:flush()
+    -- Bounded: this test is about a producer that waits, so an unbounded call
+    -- here is the one thing that could turn a failure into a hung suite.
+    local flushed, err = within(10, function() bucket:flush() end)
+    t.assert_equals(flushed, true, tostring(err))
     t.helpers.retrying({timeout = 5}, function()
         t.assert_equals(done, true)
     end)
@@ -599,15 +626,40 @@ end
 -- ever put on the output channel and send_wait waited for it forever.
 g.test_send_wait_reports_a_failing_bucket = function()
     local pool = quiet_pool(2)
-    local ok, err = pcall(function() return pool:send_wait('boom', {}) end)
+    -- Bounded, because the defect this covers manifests as "send_wait never
+    -- returns": without the bound the test hangs instead of failing.
+    local ok, err = within(10, function() return pool:send_wait('boom', {}) end)
     t.assert_equals(ok, false)
     err = tostring(err)
     t.assert_str_contains(err, 'boom')
     t.assert_str_contains(err, 'deliver refused')
 
     -- And the pool still works afterwards.
-    local rv = pool:send_wait('count', {})
+    local ok2, rv = within(10, function() return pool:send_wait('count', {}) end)
+    t.assert_equals(ok2, true, tostring(rv))
     t.assert_equals(#rv, 2)
+    pool:stop()
+end
+
+-- The other half of the same story: the pcall in waitpool_handler is what keeps
+-- a handler alive through a failing bucket, but a fiber can also be cancelled,
+-- and a handler that dies holding its task never answers. send_wait waited for
+-- that answer forever -- so a broken pcall did not fail a test, it hung the
+-- suite, and in production a dead handler hung the master.
+g.test_send_wait_does_not_wait_for_a_dead_handler = function()
+    local pool = quiet_pool(1)
+
+    -- A handler that is simply gone. The pcall inside the handler covers a
+    -- bucket that raises -- it even survives being cancelled mid-send, which
+    -- is why this kills it between tasks instead.
+    pool.waitpool.fpool[1]:cancel()
+    t.helpers.retrying({timeout = 5}, function()
+        t.assert_equals(pool.waitpool.fpool[1]:status(), 'dead')
+    end)
+
+    local ok, err = within(15, function() return pool:send_wait('count', {}) end)
+    t.assert_equals(ok, false)
+    t.assert_str_contains(tostring(err), 'handler')
     pool:stop()
 end
 
