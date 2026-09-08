@@ -1,0 +1,6 @@
+{
+  "canonical": "{\"name\":\"pregel.test.Defaults\",\"type\":\"record\",\"fields\":[{\"name\":\"a\",\"type\":\"int\"},{\"name\":\"b\",\"type\":\"string\"},{\"name\":\"c\",\"type\":[\"null\",\"long\"]},{\"name\":\"d\",\"type\":{\"type\":\"array\",\"items\":\"int\"}}]}",
+  "fastavro": "1.12.2",
+  "fingerprint": "c501295b697e3111",
+  "records": 2
+}

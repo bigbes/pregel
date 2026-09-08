@@ -1,0 +1,6 @@
+{
+  "canonical": "{\"name\":\"pregel.test.Logical\",\"type\":\"record\",\"fields\":[{\"name\":\"d\",\"type\":\"int\"},{\"name\":\"ts\",\"type\":\"long\"},{\"name\":\"dec\",\"type\":\"bytes\"}]}",
+  "fastavro": "1.12.2",
+  "fingerprint": "e000b16d5c3fb567",
+  "records": 3
+}

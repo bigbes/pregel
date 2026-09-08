@@ -1,0 +1,6 @@
+{
+  "canonical": "{\"name\":\"pregel.test.EnumFixed\",\"type\":\"record\",\"fields\":[{\"name\":\"suit\",\"type\":{\"name\":\"pregel.test.Suit\",\"type\":\"enum\",\"symbols\":[\"SPADES\",\"HEARTS\",\"DIAMONDS\",\"CLUBS\"]}},{\"name\":\"digest\",\"type\":{\"name\":\"pregel.test.MD5\",\"type\":\"fixed\",\"size\":16}}]}",
+  "fastavro": "1.12.2",
+  "fingerprint": "3d0e9f8f5d49c4e7",
+  "records": 3
+}

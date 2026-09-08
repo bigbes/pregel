@@ -1,0 +1,6 @@
+{
+  "canonical": "{\"name\":\"pregel.test.Primitives\",\"type\":\"record\",\"fields\":[{\"name\":\"f_null\",\"type\":\"null\"},{\"name\":\"f_boolean\",\"type\":\"boolean\"},{\"name\":\"f_int\",\"type\":\"int\"},{\"name\":\"f_long\",\"type\":\"long\"},{\"name\":\"f_float\",\"type\":\"float\"},{\"name\":\"f_double\",\"type\":\"double\"},{\"name\":\"f_bytes\",\"type\":\"bytes\"},{\"name\":\"f_string\",\"type\":\"string\"}]}",
+  "fastavro": "1.12.2",
+  "fingerprint": "4eb6aa64d468543d",
+  "records": 4
+}

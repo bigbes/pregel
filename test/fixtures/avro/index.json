@@ -1,0 +1,12 @@
+{
+  "cases": [
+    "primitives",
+    "nested",
+    "enum_fixed",
+    "array_map",
+    "union",
+    "logical",
+    "defaults"
+  ],
+  "fastavro": "1.12.2"
+}

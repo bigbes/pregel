@@ -1,0 +1,3 @@
+{"int_or_string": 1, "maybe_int": null, "maybe_record": null, "maybe_string": null}
+{"int_or_string": "text", "maybe_int": 42, "maybe_record": {"v": 7}, "maybe_string": "hi"}
+{"int_or_string": 0, "maybe_int": -1, "maybe_record": {"v": -9007199254740993}, "maybe_string": ""}

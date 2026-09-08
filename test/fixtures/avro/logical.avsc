@@ -1,0 +1,30 @@
+{
+  "type": "record",
+  "name": "Logical",
+  "namespace": "pregel.test",
+  "fields": [
+    {
+      "name": "d",
+      "type": {
+        "type": "int",
+        "logicalType": "date"
+      }
+    },
+    {
+      "name": "ts",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      }
+    },
+    {
+      "name": "dec",
+      "type": {
+        "type": "bytes",
+        "logicalType": "decimal",
+        "precision": 9,
+        "scale": 2
+      }
+    }
+  ]
+}

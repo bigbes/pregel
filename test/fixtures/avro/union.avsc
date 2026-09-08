@@ -1,0 +1,44 @@
+{
+  "type": "record",
+  "name": "Unions",
+  "namespace": "pregel.test",
+  "fields": [
+    {
+      "name": "maybe_int",
+      "type": [
+        "null",
+        "int"
+      ]
+    },
+    {
+      "name": "maybe_string",
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    {
+      "name": "int_or_string",
+      "type": [
+        "int",
+        "string"
+      ]
+    },
+    {
+      "name": "maybe_record",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "Payload",
+          "fields": [
+            {
+              "name": "v",
+              "type": "long"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

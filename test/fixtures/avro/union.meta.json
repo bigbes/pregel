@@ -1,0 +1,6 @@
+{
+  "canonical": "{\"name\":\"pregel.test.Unions\",\"type\":\"record\",\"fields\":[{\"name\":\"maybe_int\",\"type\":[\"null\",\"int\"]},{\"name\":\"maybe_string\",\"type\":[\"null\",\"string\"]},{\"name\":\"int_or_string\",\"type\":[\"int\",\"string\"]},{\"name\":\"maybe_record\",\"type\":[\"null\",{\"name\":\"pregel.test.Payload\",\"type\":\"record\",\"fields\":[{\"name\":\"v\",\"type\":\"long\"}]}]}]}",
+  "fastavro": "1.12.2",
+  "fingerprint": "22b4667d48470c1c",
+  "records": 3
+}

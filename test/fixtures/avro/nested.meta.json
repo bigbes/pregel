@@ -1,0 +1,6 @@
+{
+  "canonical": "{\"name\":\"pregel.test.Outer\",\"type\":\"record\",\"fields\":[{\"name\":\"id\",\"type\":\"long\"},{\"name\":\"inner\",\"type\":{\"name\":\"pregel.test.Inner\",\"type\":\"record\",\"fields\":[{\"name\":\"label\",\"type\":\"string\"},{\"name\":\"weight\",\"type\":\"double\"}]}},{\"name\":\"again\",\"type\":\"pregel.test.Inner\"}]}",
+  "fastavro": "1.12.2",
+  "fingerprint": "0b358b4d826c2bec",
+  "records": 2
+}

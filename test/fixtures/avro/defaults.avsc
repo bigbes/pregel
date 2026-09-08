@@ -1,0 +1,35 @@
+{
+  "type": "record",
+  "name": "Defaults",
+  "namespace": "pregel.test",
+  "fields": [
+    {
+      "name": "a",
+      "type": "int"
+    },
+    {
+      "name": "b",
+      "type": "string",
+      "default": "fallback"
+    },
+    {
+      "name": "c",
+      "type": [
+        "null",
+        "long"
+      ],
+      "default": null
+    },
+    {
+      "name": "d",
+      "type": {
+        "type": "array",
+        "items": "int"
+      },
+      "default": [
+        1,
+        2
+      ]
+    }
+  ]
+}

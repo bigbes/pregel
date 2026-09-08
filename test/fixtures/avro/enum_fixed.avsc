@@ -1,0 +1,28 @@
+{
+  "type": "record",
+  "name": "EnumFixed",
+  "namespace": "pregel.test",
+  "fields": [
+    {
+      "name": "suit",
+      "type": {
+        "type": "enum",
+        "name": "Suit",
+        "symbols": [
+          "SPADES",
+          "HEARTS",
+          "DIAMONDS",
+          "CLUBS"
+        ]
+      }
+    },
+    {
+      "name": "digest",
+      "type": {
+        "type": "fixed",
+        "name": "MD5",
+        "size": 16
+      }
+    }
+  ]
+}

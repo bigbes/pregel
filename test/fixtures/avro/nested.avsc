@@ -1,0 +1,32 @@
+{
+  "type": "record",
+  "name": "Outer",
+  "namespace": "pregel.test",
+  "fields": [
+    {
+      "name": "id",
+      "type": "long"
+    },
+    {
+      "name": "inner",
+      "type": {
+        "type": "record",
+        "name": "Inner",
+        "fields": [
+          {
+            "name": "label",
+            "type": "string"
+          },
+          {
+            "name": "weight",
+            "type": "double"
+          }
+        ]
+      }
+    },
+    {
+      "name": "again",
+      "type": "Inner"
+    }
+  ]
+}

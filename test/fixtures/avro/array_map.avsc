@@ -1,0 +1,38 @@
+{
+  "type": "record",
+  "name": "Collections",
+  "namespace": "pregel.test",
+  "fields": [
+    {
+      "name": "ints",
+      "type": {
+        "type": "array",
+        "items": "int"
+      }
+    },
+    {
+      "name": "strings",
+      "type": {
+        "type": "array",
+        "items": "string"
+      }
+    },
+    {
+      "name": "counts",
+      "type": {
+        "type": "map",
+        "values": "long"
+      }
+    },
+    {
+      "name": "nested",
+      "type": {
+        "type": "map",
+        "values": {
+          "type": "array",
+          "items": "string"
+        }
+      }
+    }
+  ]
+}

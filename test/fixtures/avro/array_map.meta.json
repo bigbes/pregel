@@ -1,0 +1,6 @@
+{
+  "canonical": "{\"name\":\"pregel.test.Collections\",\"type\":\"record\",\"fields\":[{\"name\":\"ints\",\"type\":{\"type\":\"array\",\"items\":\"int\"}},{\"name\":\"strings\",\"type\":{\"type\":\"array\",\"items\":\"string\"}},{\"name\":\"counts\",\"type\":{\"type\":\"map\",\"values\":\"long\"}},{\"name\":\"nested\",\"type\":{\"type\":\"map\",\"values\":{\"type\":\"array\",\"items\":\"string\"}}}]}",
+  "fastavro": "1.12.2",
+  "fingerprint": "a9c04b2bdf9b2033",
+  "records": 3
+}

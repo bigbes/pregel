@@ -1,0 +1,2 @@
+{"again": {"label": "b", "weight": -0.5}, "id": 1, "inner": {"label": "a", "weight": 0.5}}
+{"again": {"label": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "weight": 1e+100}, "id": -1, "inner": {"label": "", "weight": 0.0}}
