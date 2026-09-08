@@ -220,6 +220,15 @@ local bucket_instant_methods = {
     end,
     flush = function(self)
         self:check_failure()
+        -- One sender at a time. The background pusher and a caller's own
+        -- flush() would otherwise be in flight together, and the batch started
+        -- second can arrive first: a preload's edge.store overtaking its
+        -- vertex.store is refused outright ("vertex does not exist"). Checking
+        -- and setting the flag never yields in between, so this is a lock.
+        while self.sending do
+            self.idle:wait(FULL_POLL)
+            self:check_failure()
+        end
         -- Copy the batch out of the accumulation buffer and reset the buffer
         -- before the first yield. The slots are reused by the next put(), so a
         -- batch that merely referenced them would be rewritten underneath the
@@ -237,7 +246,10 @@ local bucket_instant_methods = {
         self.count = 0
         self.not_full:broadcast()
 
+        self.sending = true
         local ok, err = pcall(self.deliver_batch, self, msgs)
+        self.sending = false
+        self.idle:broadcast()
         if not ok then
             -- The batch is lost with the exception -- it was copied out of a
             -- buffer that put() has been free to reuse since the line above.
@@ -248,6 +260,27 @@ local bucket_instant_methods = {
             self.not_full:broadcast()
             error(tostring(err))
         end
+    end,
+    --- Everything this bucket was given is on the far side, acknowledged.
+    --
+    -- Not what flush() alone does: a batch the pusher has taken has already
+    -- reset the counter, so a bucket with nothing accumulated may still have
+    -- one travelling. That is the whole BSP barrier -- run_superstep, preload
+    -- and the master's inform_workers all end here -- and skipping a bucket
+    -- because its count is 0 is what let a superstep's messages land in the
+    -- next one.
+    drain = function(self)
+        while true do
+            self:flush()
+            if self.count == 0 and not self.sending then
+                break
+            end
+            -- Only reachable if something is still producing into this bucket
+            -- while the phase is supposed to be over; wait for it and re-check
+            -- rather than returning on a bucket that is not actually empty.
+            self.idle:wait(FULL_POLL)
+        end
+        self:check_failure()
     end,
     start = function(self)
         self.worker = fiber.create(pusher_handler(self))
@@ -282,6 +315,14 @@ local bucket_delayed_methods = {
             end
         end
         self.count = 0
+    end,
+    --- Nothing travels behind a delayed bucket's back: it has no pusher fiber
+    -- and flush() only returns once every batch has been acknowledged, so the
+    -- barrier is already flush()'s own doing.
+    drain = function(self)
+        if self.count > 0 then
+            self:flush()
+        end
     end,
     start = function(self)
         self.space_name = string.format('pregel_mpool_%s_%02d', self.name,
@@ -360,6 +401,10 @@ local function bucket_new(id, name, srv, options)
         count        = 0,
         connection   = conn,
         not_full     = fiber.cond(),
+        -- A batch is in flight: set around the RPC, waited on by flush() and
+        -- drain(). The cond is broadcast when it clears.
+        sending      = false,
+        idle         = fiber.cond(),
         is_local     = is_local,
         is_delayed   = is_delayed,
         max_count    = msg_count,
@@ -477,16 +522,16 @@ local mpool_mt = {
         by_id = function(self, name)
             return self.buckets[guava_name(name, self.bucket_cnt)]
         end,
+        --- The BSP barrier: return only once every bucket's messages are on
+        -- the far side.
+        --
+        -- Every phase boundary in the library is a call to this. It used to
+        -- skip a bucket whose count was 0, which is exactly what a bucket the
+        -- background pusher has taken a batch from looks like -- so the phase
+        -- ended with messages still travelling.
         flush = function(self)
             for _, bucket in ipairs(self.buckets) do
-                -- Unconditionally, even for a bucket that looks empty: a batch
-                -- the background pusher took has already reset the counter, so
-                -- `count == 0` says nothing about whether the bucket's last
-                -- delivery got through.
-                bucket:check_failure()
-                if bucket.count > 0 then
-                    bucket:flush()
-                end
+                bucket:drain()
             end
         end,
         --- Send one message to every bucket and wait for all the answers.

@@ -23,8 +23,11 @@ fio.mktree(work_dir)
 box.cfg{
     work_dir  = work_dir,
     listen    = listen,
-    -- Nothing here outlives the test, and a WAL would only make it slower.
-    wal_mode  = 'none',
+    -- Nothing here outlives the test, and a WAL would only make it slower --
+    -- but 'write' is Tarantool's own default and it makes every space write
+    -- yield, which is what a test of the superstep barrier needs. So the mode
+    -- is the test's to choose and 'none' is only the cheap default.
+    wal_mode  = os.getenv('TARANTOOL_WAL_MODE') or 'none',
     log_level = tonumber(os.getenv('TARANTOOL_LOG_LEVEL')) or 5,
     memtx_memory = 128 * 1024 * 1024,
 }

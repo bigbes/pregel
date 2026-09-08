@@ -32,7 +32,8 @@ local counter = 0
 -- the lua_call grants.
 local HARNESS_CREDENTIALS = {user = 'luatest', password = 'luatest'}
 
-local function server_new(alias)
+local function server_new(alias, options)
+    options = options or {}
     counter = counter + 1
     return Server:new({
         alias = string.format('%s_%d', alias, counter),
@@ -41,18 +42,24 @@ local function server_new(alias)
         env = {
             PREGEL_ROOT = PREGEL_ROOT,
             TARANTOOL_LOG_LEVEL = '5',
+            TARANTOOL_WAL_MODE = options.wal_mode,
         },
     })
 end
 
 --- Start a master and `worker_count` workers.
-function cluster.new(worker_count)
+--
+-- options.wal_mode -- box.cfg.wal_mode for every instance; 'none' unless said
+--                     otherwise. 'write' is Tarantool's own default and makes
+--                     every space write yield, which is what a test of the
+--                     superstep barrier needs.
+function cluster.new(worker_count, options)
     local self = setmetatable({
-        master  = server_new('pmaster'),
+        master  = server_new('pmaster', options),
         workers = {},
     }, cluster_mt)
     for i = 1, worker_count do
-        self.workers[i] = server_new('pworker' .. i)
+        self.workers[i] = server_new('pworker' .. i, options)
     end
 
     -- Server:start() only waits for readiness on its own accord when the

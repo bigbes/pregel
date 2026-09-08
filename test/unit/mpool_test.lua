@@ -318,6 +318,72 @@ g.test_put_blocks_on_a_full_bucket = function()
     pool:stop()
 end
 
+-------------------------------------------------------------------------------
+-- The BSP barrier
+-------------------------------------------------------------------------------
+
+-- Defect: mpool:flush() skipped a bucket whose count was 0, and a bucket the
+-- pusher has taken a batch from has a count of 0 -- so flush() returned while
+-- the batch was still travelling. Everything downstream of a flush is a BSP
+-- phase boundary (run_superstep, preload, the master's inform_workers), so a
+-- batch that outlives one lands in the next phase: read a superstep late, or
+-- dropped by the queue swap, or counted while half of it is applied.
+g.test_flush_waits_for_a_batch_the_pusher_took = function()
+    local pool = mpool.new('unit', {URI})
+    local bucket = pool.buckets[1]
+
+    local delivered = 0
+    _G.pregel.worker.deliver_batch = function(_, msgs)
+        -- The far side of a real connection yields -- every space write under
+        -- a WAL does -- and that is the whole window this test is about.
+        fiber.sleep(0.2)
+        delivered = delivered + #msgs
+        return #msgs
+    end
+
+    bucket:put('message.deliver', {'alice', 1})
+    t.helpers.retrying({timeout = 5}, function()
+        t.assert_equals(bucket.count, 0, 'the pusher has not taken the batch')
+    end)
+
+    pool:flush()
+    t.assert_equals(delivered, 1,
+                    'flush() returned with a batch still in flight')
+    pool:stop()
+end
+
+-- And the batch flush() sends itself must not overtake the one already in
+-- flight: a preload sends vertex.store before edge.store, and an edge that
+-- arrives first is refused outright ("vertex does not exist").
+g.test_flush_does_not_overtake_the_batch_in_flight = function()
+    local pool = mpool.new('unit', {URI}, {msg_count = 1})
+    local bucket = pool.buckets[1]
+
+    local order = {}
+    _G.pregel.worker.deliver_batch = function(_, msgs)
+        -- The slow one goes first, so a second send started while it is in
+        -- flight arrives before it and the reordering is visible rather than
+        -- merely possible.
+        if msgs[1][1] == 'first' then
+            fiber.sleep(0.3)
+        end
+        for _, m in ipairs(msgs) do
+            table.insert(order, m[1])
+        end
+        return #msgs
+    end
+
+    bucket:put('first', {1})
+    t.helpers.retrying({timeout = 5}, function()
+        t.assert_equals(bucket.count, 0, 'the pusher has not taken the batch')
+    end)
+    bucket:put('second', {2})
+
+    pool:flush()
+    t.assert_equals(order, {'first', 'second'})
+    pool:stop()
+end
+
 -- Defect: a background flush that raised killed the pusher fiber, and nothing
 -- ever noticed -- the batch was gone (flush() had already reset the counter),
 -- the superstep reported 'ok', and the next producer to fill the bucket waited
