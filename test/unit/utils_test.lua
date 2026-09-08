@@ -17,7 +17,19 @@ local g = t.group('utils')
 g.test_error_single_argument_is_not_formatted = function()
     local ok, err = pcall(utils.error, 'literal 100% of the time')
     t.assert_equals(ok, false)
-    t.assert_str_contains(tostring(err), 'literal 100% of the time')
+    err = tostring(err)
+    t.assert_str_contains(err, 'literal 100% of the time')
+    -- The substring on its own is not enough: without the lone-argument guard
+    -- the message becomes 'literal 100% of the time [format failed: ...]',
+    -- which still contains it, and the test passed over the reintroduced
+    -- defect.
+    t.assert_not_str_contains(err, 'format failed')
+
+    -- At level 0 there is no position prefix, so the message can be checked
+    -- for equality -- nothing added, nothing lost.
+    local ok0, err0 = pcall(utils.error, 0, 'literal 100% of the time')
+    t.assert_equals(ok0, false)
+    t.assert_equals(tostring(err0), 'literal 100% of the time')
 end
 
 g.test_error_formats_when_given_arguments = function()

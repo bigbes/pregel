@@ -516,9 +516,13 @@ local waitpool_mt = {
 local function waitpool_new(pool)
     local self = setmetatable({
         fpool_cnt   = pool.bucket_cnt,
-        -- Capacity equal to the fan-out: __call must be able to hand out every
-        -- task without first knowing that a handler fiber has reached its
-        -- get(), which a zero-capacity channel would require.
+        -- Capacity equal to the fan-out, so handing out the tasks cannot
+        -- block: a zero-capacity put() waits for a receiver, and a handler
+        -- that is gone is never going to be one -- __call would then hang in
+        -- put() and never reach the check_handlers() that exists to catch
+        -- exactly that. Measured: with fiber.channel(0) here,
+        -- test_send_wait_does_not_wait_for_a_dead_handler waits out its 15s
+        -- bound instead of getting an error.
         channel_in  = fiber.channel(pool.bucket_cnt),
         channel_out = fiber.channel(pool.bucket_cnt),
         rval        = {},

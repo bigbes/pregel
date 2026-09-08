@@ -367,6 +367,18 @@ g.test_delete_vertex_with_edges_is_not_implemented = function()
     t.assert_error_msg_contains('not implemented', function() compute(v) end)
 end
 
+-- The flag-first form, which is the whole reason delete_vertex looks at the
+-- type of its first argument. Nothing covered it, so deleting that branch left
+-- the suite green: `true` then became the vertex *name*, the assert on the
+-- flag passed, and the request was routed by hashing a boolean.
+g.test_delete_vertex_with_the_flag_alone = function()
+    local pool = make(function(self)
+        self:delete_vertex(true)
+    end)
+    local v = pop(pool, 'alice', false, 0, {})
+    t.assert_error_msg_contains('not implemented', function() compute(v) end)
+end
+
 -------------------------------------------------------------------------------
 -- compute / persistence
 -------------------------------------------------------------------------------
