@@ -111,9 +111,20 @@ end
 -- it can see before the dying instance's log has reached the file. Grepping
 -- once is therefore a race, and it is one that loses: with two refusal cases
 -- in this file it failed about one run in two, on whichever of them ran.
+-- Any worker, not worker1, and with retries: cluster:start() gives up as soon
+-- as the first instance dies and luatest then kills the rest, so a worker can
+-- be gone before its role has applied and logged anything, and the one that
+-- did log may not have flushed yet. Demanding it of worker1 at once failed
+-- about one run in three.
 local function wait_for_log(cluster, pattern, what)
     t.helpers.retrying({timeout = 10, delay = 0.1}, function()
-        t.assert(cluster[helper.worker_name(1)]:grep_log(pattern), what)
+        local said = false
+        for i = 1, helper.WORKER_COUNT do
+            if cluster[helper.worker_name(i)]:grep_log(pattern) then
+                said = true
+            end
+        end
+        t.assert(said, what)
     end)
 end
 
@@ -526,7 +537,7 @@ g.test_a_labels_file_with_no_task_is_refused_at_startup = function()
     -- applied at startup exits the process.
     t.assert_str_contains(tostring(err), 'Process is terminated')
     wait_for_log(cluster, 'names no task',
-                 'the worker did not say why it refused the config')
+                 'no worker said why it refused the config')
 
     fio.rmtree(dir)
 end
