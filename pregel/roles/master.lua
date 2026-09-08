@@ -41,6 +41,12 @@
 -- point is `pregel.master.deliver`, which is how a worker reports its
 -- aggregators back.
 --
+-- The master owns no spaces, so the read/write half of those privileges is not
+-- its business and must not reach it: an instance whose config grants
+-- read/write on a space it never creates warns about it for ever. That is why
+-- the worker spaces are granted at the worker replicasets rather than
+-- globally.
+--
 -- @module pregel.roles.master
 
 local log   = require('log')
@@ -70,6 +76,8 @@ local state = {
     fiber   = nil,
     -- The fiber that waits for the workers; see common.connector.
     connect = nil,
+    -- The fiber that checks the privileges; see common.grant_check.
+    grants  = nil,
     -- This instance is a read-only replica, so the role is inert here.
     read_only = false,
     status  = {state = 'idle'},
@@ -252,10 +260,6 @@ local function apply(cfg)
         connect_async  = true,
     })
     common.add_aggregators(instance, app)
-    -- The workers call pregel.master.deliver on this instance to report their
-    -- aggregators. The credentials section should already say so; granting it
-    -- here as well costs nothing and keeps a config that forgot it working.
-    master.grant(user)
 
     state.master = instance
     state.cfg = table.deepcopy(cfg)
@@ -277,6 +281,16 @@ local function apply(cfg)
             state.fiber = fiber.create(autostart_body(instance, app))
         end,
     }):start()
+    -- The master owns no spaces, so what a config has to grant for this side
+    -- is the entry point the workers report their aggregators through. It used
+    -- to be granted from here as well; the credentials section is the only
+    -- place it comes from now, and this says so when it does not.
+    state.grants = common.grant_check(ROLE, {
+        user    = user,
+        job     = cfg.name,
+        wanted  = common.required_privileges('master'),
+        timeout = cfg.connect_timeout,
+    }):start()
     log.info("%s: job '%s' is configured over %d worker(s), autostart %s",
              ROLE, cfg.name, #workers, tostring(cfg.autostart or false))
 end
@@ -294,6 +308,7 @@ local function stop()
     local instance = state.master
     local worker_fiber = state.fiber
     local connect = state.connect
+    local grants = state.grants
     -- Cleared before the cancel below, so the autostart fiber's error path can
     -- tell "the job I belong to is gone" from "the job failed" -- setting the
     -- terminal state first was what left status() at failed/'fiber is
@@ -302,10 +317,14 @@ local function stop()
     state.fiber = nil
     state.cfg = nil
     state.connect = nil
+    state.grants = nil
     state.read_only = false
 
     if connect ~= nil then
         connect:stop()
+    end
+    if grants ~= nil then
+        grants:stop()
     end
     if worker_fiber ~= nil and worker_fiber:status() ~= 'dead' then
         -- Cancelling is the only way out: the fiber may be blocked on a
@@ -359,6 +378,13 @@ local function status()
     if connect ~= nil and connect.state ~= 'connected' then
         rv.state = connect.state
         rv.error = connect.error
+    end
+    -- A missing privilege wins over a worker that has not answered: it is a
+    -- broken configuration rather than a wait.
+    local grants = state.grants
+    if grants ~= nil and grants.state == 'failed' then
+        rv.state = 'failed'
+        rv.error = grants.error
     end
     if state.master ~= nil then
         rv.name = state.master.name

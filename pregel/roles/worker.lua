@@ -74,13 +74,42 @@
 -- own, and two of them picking different logins would authenticate to each
 -- other as users with different privileges.
 --
--- Everything that reaches a worker is a conn:call() on one of the entry points
--- above, so that lua_call list is the first half of the privileges; there is
--- no guest universe grant anywhere in this library. The other half is
--- read/write on this instance's spaces, because a lua_call runs with the
--- caller's privileges and these entry points write. Those spaces are named
--- after the job and do not exist when the credentials applier first runs, so
--- the role grants them itself right after creating them.
+-- Privileges. Everything that reaches a worker is a conn:call() on one of the
+-- entry points above, so that lua_call list is the first half; there is no
+-- guest universe grant anywhere in this library. The other half is read/write
+-- on the job's spaces, because a lua_call runs with the caller's privileges
+-- and these entry points write:
+--
+--   groups: {g: {replicasets: {worker1: {credentials: {roles: {pregel:
+--     privileges:
+--       - permissions: [execute]
+--         lua_call: [...the four above...]
+--       - permissions: [read, write]
+--         spaces:
+--           - data_maxvalue
+--           - topology_mutation_maxvalue
+--           - pregel_tube_mqueue_first_maxvalue
+--           - pregel_tube_mqueue_second_maxvalue
+--         sequences:                     # data_<job> has a string primary
+--           - topology_mutation_maxvalue_seq        # key and no sequence
+--           - pregel_tube_mqueue_first_maxvalue_seq
+--           - pregel_tube_mqueue_second_maxvalue_seq
+--
+-- Two things about that. It goes on the *worker replicasets*, not next to the
+-- entry points at global scope: the master never creates those spaces, and an
+-- instance whose config grants read/write on an object that never appears
+-- keeps a `warn` alert about it and reports config:info().status as
+-- 'check_warnings' for good. And respecifying `privileges` at a narrower scope
+-- replaces the whole list, so the entry points are repeated there.
+--
+-- The role grants none of this itself, though the spaces do not exist when the
+-- credentials applier first runs: the applier keeps on_replace triggers on
+-- _space and _sequence and grants what the config lists as soon as the object
+-- appears -- 8.9 ms after the role creates it on CE 3.9, 9.1 ms on EE 3.7. A
+-- privilege the config does not grant is reported by status() and as an alert,
+-- naming the privilege, the object and credentials.roles.pregel; see
+-- common.grant_check. With delayed_push the bucket spaces
+-- (pregel_mpool_<job>_NN and their _seq) need the same treatment.
 --
 -- @module pregel.roles.worker
 
@@ -120,6 +149,8 @@ local state = {
     worker  = nil,
     -- The fiber that waits for the peers; see common.connector.
     connect = nil,
+    -- The fiber that checks the privileges; see common.grant_check.
+    grants  = nil,
     -- This instance is a read-only replica, so the role is inert here.
     read_only = false,
 }
@@ -200,7 +231,9 @@ local function apply(cfg)
         delayed_push   = cfg.delayed_push,
         user           = user,
         password       = password,
-        grant_to       = user,
+        -- No grant_to: the privileges come from credentials.roles.pregel, and
+        -- the credentials applier hands them out for the spaces below as soon
+        -- as they exist. state.grants checks that it did.
         -- apply() must not wait for anyone: it runs inside the config
         -- framework's synchronous post_apply. See common.connector.
         connect_async  = true,
@@ -212,6 +245,15 @@ local function apply(cfg)
     state.connect = common.connector(ROLE, {
         job     = cfg.name,
         pool    = instance.mpool,
+        timeout = cfg.connect_timeout,
+    }):start()
+    -- The spaces exist now, so what the peers need in order to write to them
+    -- is decidable -- and a missing privilege reported here is a missing
+    -- privilege named, rather than an access error from inside a superstep.
+    state.grants = common.grant_check(ROLE, {
+        user    = user,
+        job     = cfg.name,
+        wanted  = common.required_privileges('worker', cfg.name),
         timeout = cfg.connect_timeout,
     }):start()
     -- The URIs are not logged: roles_cfg may spell one as
@@ -235,12 +277,17 @@ end
 local function stop()
     local instance = state.worker
     local connect = state.connect
+    local grants = state.grants
     state.worker = nil
     state.cfg = nil
     state.connect = nil
+    state.grants = nil
     state.read_only = false
     if connect ~= nil then
         connect:stop()
+    end
+    if grants ~= nil then
+        grants:stop()
     end
     if instance == nil then
         return
@@ -295,6 +342,14 @@ local function status()
     if connect ~= nil and connect.state ~= 'connected' then
         rv.state = connect.state
         rv.error = connect.error
+    end
+    -- A missing privilege wins over a peer that has not answered: it is a
+    -- broken configuration rather than a wait, and it is usually why the peer
+    -- is not answering.
+    local grants = state.grants
+    if grants ~= nil and grants.state == 'failed' then
+        rv.state = 'failed'
+        rv.error = grants.error
     end
     return rv
 end

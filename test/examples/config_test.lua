@@ -45,21 +45,44 @@ local function config_of(example)
 end
 
 --- Every instance of a config, as {name, roles, roles_cfg, listen}.
+--
+-- `credentials` is the replicaset's, not the instance's: the read/write half
+-- of the privileges is written at replicaset scope, where the spaces are.
 local function instances_of(config)
     local rv = {}
     for _, group in pairs(config.groups or {}) do
         for _, replicaset in pairs(group.replicasets or {}) do
             for name, instance in pairs(replicaset.instances or {}) do
                 table.insert(rv, {
-                    name      = name,
-                    roles     = instance.roles or {},
-                    roles_cfg = instance.roles_cfg or {},
-                    listen    = instance.iproto and instance.iproto.listen,
+                    name        = name,
+                    roles       = instance.roles or {},
+                    roles_cfg   = instance.roles_cfg or {},
+                    listen      = instance.iproto and instance.iproto.listen,
+                    credentials = replicaset.credentials,
                 })
             end
         end
     end
     table.sort(rv, function(a, b) return a.name < b.name end)
+    return rv
+end
+
+--- Every object a privileges list grants `permission` on, by type.
+local function granted(privileges, permission)
+    local rv = {lua_call = {}, spaces = {}, sequences = {}}
+    for _, privilege in ipairs(privileges or {}) do
+        local wanted = false
+        for _, name in ipairs(privilege.permissions or {}) do
+            wanted = wanted or name == permission
+        end
+        if wanted then
+            for kind in pairs(rv) do
+                for _, object in ipairs(privilege[kind] or {}) do
+                    rv[kind][object] = true
+                end
+            end
+        end
+    end
     return rv
 end
 
@@ -161,19 +184,83 @@ g.test_the_credentials_grant_what_pregel_calls = function()
         local role = config.credentials.roles[helper.CREDENTIALS_ROLE]
         t.assert_not_equals(role, nil, example .. ': no pregel credentials role')
 
-        local granted = {}
-        for _, privilege in ipairs(role.privileges) do
-            for _, name in ipairs(privilege.lua_call or {}) do
-                granted[name] = true
-            end
-        end
+        local calls = granted(role.privileges, 'execute').lua_call
         -- Nothing else lets one instance reach another: these four names are
         -- the whole protocol, and a config missing one fails at the first
         -- message rather than at apply time.
         for _, name in ipairs(helper.LUA_CALL) do
-            t.assert(granted[name],
+            t.assert(calls[name],
                      example .. ': no lua_call grant for ' .. name)
         end
+    end
+end
+
+-- The other half. A lua_call runs with the caller's privileges and the entry
+-- points write, so a config that grants only the calls produces a job that
+-- connects, starts, and then fails inside a superstep. The roles do not hand
+-- these out any anymore -- the credentials applier does, from the trigger it
+-- keeps on _space and _sequence -- so a missing name here is a broken example.
+--
+-- The scope matters as much as the list: on the master, which never creates
+-- these spaces, a grant on them is a `warn` alert that never clears and a
+-- config:info().status stuck at 'check_warnings'.
+g.test_the_workers_are_granted_their_own_spaces = function()
+    for _, example in ipairs(examples()) do
+        local config = config_of(example)
+        t.assert_equals(granted(config.credentials.roles[
+                                    helper.CREDENTIALS_ROLE].privileges,
+                                'write').spaces, {},
+                        example .. ': the global credentials role grants ' ..
+                        'read/write on spaces, which the master never creates')
+
+        local checked = 0
+        for _, instance in ipairs(instances_of(config)) do
+            for _, role in ipairs(instance.roles) do
+                if role == helper.WORKER_ROLE then
+                    local job = instance.roles_cfg[role].name
+                    t.assert_not_equals(instance.credentials, nil,
+                                        example .. ': ' .. instance.name ..
+                                        ' runs a worker and its replicaset ' ..
+                                        'grants it nothing')
+                    local writable = granted(
+                        instance.credentials.roles[helper.CREDENTIALS_ROLE]
+                            .privileges, 'write')
+                    -- Named after the job, and every one of them is written to
+                    -- by an entry point the peers call.
+                    for _, space in ipairs({'data_', 'topology_mutation_',
+                                            'pregel_tube_mqueue_first_',
+                                            'pregel_tube_mqueue_second_'}) do
+                        t.assert(writable.spaces[space .. job],
+                                 example .. ': ' .. instance.name ..
+                                 ' is not granted ' .. space .. job)
+                    end
+                    -- data_<job> has a string primary key and no sequence.
+                    for _, sequence in ipairs({'topology_mutation_',
+                                               'pregel_tube_mqueue_first_',
+                                               'pregel_tube_mqueue_second_'})
+                    do
+                        t.assert(writable.sequences[sequence .. job .. '_seq'],
+                                 example .. ': ' .. instance.name ..
+                                 ' is not granted ' .. sequence .. job ..
+                                 '_seq')
+                    end
+                    -- Replacing `privileges` at a narrower scope replaces the
+                    -- whole list, so the entry points have to be repeated
+                    -- there -- and an example that forgot would grant its
+                    -- workers no lua_call at all.
+                    local calls = granted(
+                        instance.credentials.roles[helper.CREDENTIALS_ROLE]
+                            .privileges, 'execute').lua_call
+                    for _, name in ipairs(helper.LUA_CALL) do
+                        t.assert(calls[name], example .. ': ' ..
+                                 instance.name .. ' lost the lua_call grant ' ..
+                                 'for ' .. name)
+                    end
+                    checked = checked + 1
+                end
+            end
+        end
+        t.assert_gt(checked, 0, example .. ': no worker was checked')
     end
 end
 

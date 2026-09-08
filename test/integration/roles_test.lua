@@ -409,6 +409,101 @@ g.test_a_config_that_marks_two_pregel_users_is_refused = function()
 end
 
 -------------------------------------------------------------------------------
+-- The privileges, granted by the credentials applier
+-------------------------------------------------------------------------------
+
+-- Nothing in this suite grants a privilege from Lua any more: the roles hand
+-- none out, and every job here runs on what `credentials.roles.pregel` says.
+-- That is the whole of the deliberate change, so it is worth one test that
+-- reads the schema rather than trusting a job that finished -- a leftover
+-- role-issued grant would make every other test pass just as well.
+g.test_the_job_runs_on_privileges_the_config_granted = function()
+    local c = Cluster:new(helper.config({autostart = true}),
+                          helper.server_opts)
+    c:start()
+    helper.wait_state(c, 'done')
+
+    local function assert_granted(label)
+        local seen = helper.privileges(c, helper.worker_name(1))
+        -- The user itself holds nothing but its role memberships and the
+        -- session bits every user has: a grant issued to it directly would be
+        -- a role granting behind the config's back.
+        t.assert_equals(seen.own, {'role', 'role', 'universe', 'user'},
+                        label .. ': the user holds a direct grant')
+        -- And the role carries both halves, for the objects the job created
+        -- after the credentials applier had already run.
+        for _, space in ipairs(helper.job_spaces()) do
+            t.assert_equals(seen.granted['space ' .. space], 3,
+                            label .. ': read,write on ' .. space)
+        end
+        for _, sequence in ipairs(helper.job_sequences()) do
+            t.assert_equals(seen.granted['sequence ' .. sequence], 3,
+                            label .. ': read,write on ' .. sequence)
+        end
+        for _, name in ipairs(helper.LUA_CALL) do
+            t.assert_equals(seen.granted['lua_call ' .. name], 4,
+                            label .. ': execute on ' .. name)
+        end
+    end
+
+    assert_granted('after the job ran')
+
+    -- A reload re-runs every applier, the credentials one included, and the
+    -- job's objects are exactly the ones it could not grant when it first ran.
+    helper.reload(c, helper.worker_name(1))
+    assert_granted('after config:reload()')
+
+    -- And a role that is taken off the instance and put back keeps them: it
+    -- leaves the spaces where they are, and nothing revokes what the config
+    -- still grants.
+    c:sync(helper.config({autostart = true, drop_worker = 1}))
+    helper.reload(c, helper.worker_name(1))
+    c:sync(helper.config({autostart = true}))
+    helper.reload(c, helper.worker_name(1))
+    assert_granted('after the role was stopped and started')
+    t.assert_equals(helper.worker_registered(c, helper.worker_name(1)), true,
+                    'the restarted role built no job')
+end
+
+-- The other half: a config that grants the entry points and not the spaces.
+-- The job would connect, start, and fail somewhere inside a superstep with an
+-- access error from a remote call, so the role says what is missing instead --
+-- the privilege, the object, and where to write it.
+g.test_a_missing_space_privilege_is_named = function()
+    local c = Cluster:new(helper.config({no_space_privileges = true,
+                                         connect_timeout = 1}),
+                          helper.server_opts)
+    c:start()
+
+    local worker1 = helper.worker_name(1)
+    local status = helper.wait_role_state(c, function(cluster)
+        return helper.worker_status(cluster, worker1)
+    end, 'failed', 30)
+
+    t.assert_str_contains(tostring(status.error),
+                          "the user 'pregel_peer' is missing")
+    t.assert_str_contains(tostring(status.error),
+                          "read,write on space 'data_" .. helper.JOB .. "'")
+    t.assert_str_contains(tostring(status.error), 'credentials.roles.pregel')
+
+    -- And an operator sees it without asking the role: it is a warn alert,
+    -- and the instance stays up -- raising from apply() at startup would take
+    -- the process down over a privilege that might still be on its way.
+    local info = helper.config_info(c, worker1)
+    local said = false
+    for _, alert in ipairs(info.alerts) do
+        if alert.message:find('credentials.roles.pregel', 1, true) ~= nil then
+            said = true
+            t.assert_equals(alert.type, 'warn')
+        end
+    end
+    t.assert_equals(said, true, 'no alert names the missing privilege')
+    t.assert_equals(c[worker1]:exec(function()
+        return box.info.status
+    end), 'running')
+end
+
+-------------------------------------------------------------------------------
 -- (5): discovery
 -------------------------------------------------------------------------------
 

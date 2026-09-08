@@ -818,9 +818,15 @@ end
 -- them on the caller's behalf. mpool.new() has already created them by the
 -- time worker_new() grants.
 --
+-- Exported, because it is also the list a cluster config has to spell out
+-- under `credentials.roles.pregel`: pregel/roles/common.lua checks the pregel
+-- user against it, and a second copy of the naming convention there would be a
+-- second copy that can drift.
+--
 -- @param name the instance name
 -- @return array of space names: the four fixed ones whether or not they exist
 --  yet, plus every bucket space that does
+-- @function space_names
 local function space_names(name)
     local names = {
         'data_' .. name,
@@ -1063,6 +1069,7 @@ _G.pregel.worker = {
 return {
     new           = worker_new,
     grant         = grant,
+    space_names   = space_names,
     deliver       = deliver_msg,
     deliver_batch = deliver_batch,
     wait          = wait_ready,

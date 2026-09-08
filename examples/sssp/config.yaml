@@ -10,7 +10,7 @@ credentials:
     pregel:
       privileges:
         - permissions: [execute]
-          lua_call:
+          lua_call: &pregel_entry_points
             - pregel.worker.deliver
             - pregel.worker.deliver_batch
             - pregel.worker.wait
@@ -43,6 +43,26 @@ groups:
                 # autostart sees a worker_preload instead and asks every worker
                 # to load its own share.
       worker1:
+        # The read/write half of the privileges, on the replicasets that own
+        # the spaces -- see examples/max-value/config.yaml for why it is not
+        # global. Respecifying `privileges` here replaces the whole list, so
+        # the entry points come along through the anchor.
+        credentials: &worker_credentials
+          roles:
+            pregel:
+              privileges:
+                - permissions: [execute]
+                  lua_call: *pregel_entry_points
+                - permissions: [read, write]
+                  spaces:
+                    - data_sssp
+                    - topology_mutation_sssp
+                    - pregel_tube_mqueue_first_sssp
+                    - pregel_tube_mqueue_second_sssp
+                  sequences:
+                    - topology_mutation_sssp_seq
+                    - pregel_tube_mqueue_first_sssp_seq
+                    - pregel_tube_mqueue_second_sssp_seq
         instances:
           worker1:
             iproto:
@@ -66,6 +86,7 @@ groups:
                   edges: '../../test/fixtures/graphs/small/weighted9/edges.avro'
                   source: 'a'
       worker2:
+        credentials: *worker_credentials
         instances:
           worker2:
             iproto:
@@ -74,6 +95,7 @@ groups:
             roles: [pregel.roles.worker]
             roles_cfg: *worker_cfg
       worker3:
+        credentials: *worker_credentials
         instances:
           worker3:
             iproto:

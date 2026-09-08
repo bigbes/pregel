@@ -10,13 +10,12 @@ credentials:
     #
     # Everything pregel sends to pregel is a conn:call() on one of these four
     # entry points; there is no universe grant anywhere in the library. The
-    # other half of the privileges, read/write on the job's own spaces, cannot
-    # be spelled here (the spaces are named after the job and do not exist yet)
-    # and is granted by the worker role itself.
+    # other half of the privileges -- read/write on the job's own spaces -- is
+    # on the worker replicasets below, because that is where those spaces are.
     pregel:
       privileges:
         - permissions: [execute]
-          lua_call:
+          lua_call: &pregel_entry_points
             - pregel.worker.deliver
             - pregel.worker.deliver_batch
             - pregel.worker.wait
@@ -64,6 +63,39 @@ groups:
                   # ten-vertex graph whose answer can be read at a glance.
                   graph: '../../test/fixtures/graphs/soc-Epinions-custom.txt'
       worker1:
+        # The job's own spaces. A lua_call runs with the caller's privileges
+        # and the entry points above write, so the pregel user needs these as
+        # well -- and they are granted here, on the replicasets that create
+        # them, rather than globally: the master never creates them, and an
+        # instance whose config grants read/write on an object that never
+        # appears warns about it for ever and reports
+        # config:info().status = 'check_warnings'.
+        #
+        # The spaces are named after the job and do not exist when the
+        # credentials applier first runs; it grants them a few milliseconds
+        # after the worker role creates them, from its own on_replace trigger
+        # on _space and _sequence.
+        #
+        # Respecifying `privileges` at a narrower scope replaces the whole
+        # list, so the entry points come along through the anchor.
+        credentials: &worker_credentials
+          roles:
+            pregel:
+              privileges:
+                - permissions: [execute]
+                  lua_call: *pregel_entry_points
+                - permissions: [read, write]
+                  spaces:
+                    - data_maxvalue
+                    - topology_mutation_maxvalue
+                    - pregel_tube_mqueue_first_maxvalue
+                    - pregel_tube_mqueue_second_maxvalue
+                  # data_<job> has a string primary key and therefore no
+                  # sequence; the other three are sequence-backed.
+                  sequences:
+                    - topology_mutation_maxvalue_seq
+                    - pregel_tube_mqueue_first_maxvalue_seq
+                    - pregel_tube_mqueue_second_maxvalue_seq
         instances:
           worker1:
             iproto:
@@ -75,6 +107,7 @@ groups:
                 name: maxvalue
                 app: app
       worker2:
+        credentials: *worker_credentials
         instances:
           worker2:
             iproto:
@@ -83,6 +116,7 @@ groups:
             roles: [pregel.roles.worker]
             roles_cfg: *worker_cfg
       worker3:
+        credentials: *worker_credentials
         instances:
           worker3:
             iproto:

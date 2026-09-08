@@ -48,6 +48,62 @@ helper.LUA_CALL = {
     'pregel.master.deliver',
 }
 
+--- The spaces one worker of `job` owns, and their sequences.
+--
+-- The read/write half of the privileges, which a cluster config has to spell
+-- out because a lua_call runs with the caller's privileges and the entry
+-- points write. Keep in step with worker.space_names(): a name listed here
+-- that no instance ever creates is not harmless -- the credentials applier
+-- retries it for ever, keeps a `warn` alert about it, and holds
+-- config:info().status at 'check_warnings'.
+--
+-- `data_<job>` has a string primary key and therefore no sequence; the other
+-- three are sequence-backed. The delayed_push bucket spaces are not here: no
+-- test turns delayed_push on, and listing spaces that are never created is
+-- exactly the mistake above.
+function helper.job_spaces(job)
+    job = job or helper.JOB
+    return {
+        'data_' .. job,
+        'topology_mutation_' .. job,
+        'pregel_tube_mqueue_first_' .. job,
+        'pregel_tube_mqueue_second_' .. job,
+    }
+end
+
+function helper.job_sequences(job)
+    job = job or helper.JOB
+    return {
+        'topology_mutation_' .. job .. '_seq',
+        'pregel_tube_mqueue_first_' .. job .. '_seq',
+        'pregel_tube_mqueue_second_' .. job .. '_seq',
+    }
+end
+
+--- The `credentials` a worker replicaset carries on top of the global one.
+--
+-- Written at replicaset scope rather than globally, and it has to be: the
+-- master never creates the job's spaces, so a global grant on them would leave
+-- that instance warning about objects that will never appear. Replacing the
+-- whole `privileges` list is what the config framework does with an option
+-- respecified at a narrower scope, so the entry points are repeated here.
+function helper.worker_credentials(job)
+    return {
+        roles = {
+            [helper.CREDENTIALS_ROLE] = {
+                privileges = {
+                    {permissions = {'execute'}, lua_call = helper.LUA_CALL},
+                    {
+                        permissions = {'read', 'write'},
+                        spaces      = helper.job_spaces(job),
+                        sequences   = helper.job_sequences(job),
+                    },
+                },
+            },
+        },
+    }
+end
+
 --- What a test cluster adds to the `credentials` section.
 --
 -- The shape an operator writes: one credentials role carrying the privileges,
@@ -163,8 +219,11 @@ helper.MASTER_NAME = 'master'
 --                        turns the WAL on, since replication needs one.
 -- opts.ssl          -- {cert = <path>, key = <path>}: make every instance
 --                      listen with `transport: ssl` (Enterprise only)
--- opts.credentials  -- replace the whole `credentials` section, for the tests
+-- opts.credentials  -- replace the global `credentials` entries, for the tests
 --                      about resolving the pregel user from it
+-- opts.no_space_privileges -- leave the read/write half off the worker
+--                      replicasets, so the pregel user may call the entry
+--                      points and not write to the spaces they write to
 function helper.config(opts)
     opts = opts or {}
     local job     = opts.job or helper.JOB
@@ -231,6 +290,11 @@ function helper.config(opts)
             roles, roles_cfg = {}, {}
         end
         builder:use_replicaset('r_worker' .. i)
+        -- The job's own spaces, granted where they are created.
+        if not opts.no_space_privileges then
+            builder:set_replicaset_option('credentials',
+                                          helper.worker_credentials(job))
+        end
         if opts.replica_worker then
             builder:set_replicaset_option('leader', helper.worker_name(i))
         end
@@ -433,6 +497,42 @@ function helper.master_fibers(cluster)
         table.sort(rv)
         return rv
     end)
+end
+
+--- What the pregel user and the pregel credentials role hold on one instance.
+--
+-- `own` is the object types granted to the user itself, sorted -- a role that
+-- granted something from Lua would show up here. `granted` maps
+-- '<object type> <object name>' to the permission bits the credentials role
+-- carries, so an assertion can name the space rather than its id.
+function helper.privileges(cluster, instance_name)
+    return cluster[instance_name]:exec(function(user, role)
+        local own = {}
+        for _, tuple in box.space._priv:pairs({
+            box.space._user.index.name:get({user})[1]
+        }) do
+            table.insert(own, tostring(tuple[3]))
+        end
+        table.sort(own)
+
+        local granted = {}
+        for _, tuple in box.space._priv:pairs({
+            box.space._user.index.name:get({role})[1]
+        }) do
+            local name = tostring(tuple[4])
+            if tuple[3] == 'space' then
+                name = box.space[tuple[4]].name
+            elseif tuple[3] == 'sequence' then
+                for _, sequence in box.space._sequence:pairs() do
+                    if sequence[1] == tuple[4] then
+                        name = sequence[3]
+                    end
+                end
+            end
+            granted[tuple[3] .. ' ' .. name] = tuple[5]
+        end
+        return {own = own, granted = granted}
+    end, {helper.USER, helper.CREDENTIALS_ROLE})
 end
 
 --- Is the job present in pregel.worker's own registry on this instance?

@@ -105,6 +105,36 @@ function helper.config(opts)
         password = helper.PASSWORD,
         roles    = {helper.CREDENTIALS_ROLE},
     })
+    -- The read/write half of the privileges, on the replicasets that create
+    -- the objects. Globally it would also reach the master, which never
+    -- creates them -- and an instance whose config grants read/write on a
+    -- space that never appears warns about it for ever and reports
+    -- config:info().status = 'check_warnings'.
+    local worker_credentials = {
+        roles = {
+            [helper.CREDENTIALS_ROLE] = {
+                privileges = {
+                    {permissions = {'execute'}, lua_call = helper.LUA_CALL},
+                    {
+                        permissions = {'read', 'write'},
+                        spaces      = {
+                            'data_' .. job,
+                            'topology_mutation_' .. job,
+                            'pregel_tube_mqueue_first_' .. job,
+                            'pregel_tube_mqueue_second_' .. job,
+                        },
+                        -- data_<job> has a string primary key and no
+                        -- sequence; the other three are sequence-backed.
+                        sequences   = {
+                            'topology_mutation_' .. job .. '_seq',
+                            'pregel_tube_mqueue_first_' .. job .. '_seq',
+                            'pregel_tube_mqueue_second_' .. job .. '_seq',
+                        },
+                    },
+                },
+            },
+        },
+    }
     builder:set_global_option('wal.mode', 'none')
 
     local function base_cfg()
@@ -129,6 +159,7 @@ function helper.config(opts)
         local worker_cfg = base_cfg()
         worker_cfg.squash_only = opts.squash_only
         builder:use_replicaset('r_worker' .. i)
+        builder:set_replicaset_option('credentials', worker_credentials)
         builder:add_instance(helper.worker_name(i), {
             roles     = {helper.WORKER_ROLE},
             roles_cfg = {[helper.WORKER_ROLE] = worker_cfg},

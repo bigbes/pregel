@@ -12,6 +12,7 @@
 --
 -- @module pregel.roles.common
 
+local bit   = require('bit')
 local log   = require('log')
 local clock = require('clock')
 local fiber = require('fiber')
@@ -300,6 +301,298 @@ function M.pregel_user(role, config)
               M.CREDENTIALS_ROLE, user)
     end
     return user, password
+end
+
+-------------------------------------------------------------------------------
+-- Privileges
+-------------------------------------------------------------------------------
+
+--- The permission bits box keeps in _priv, for the three pregel asks for.
+local PERMISSION = {read = 1, write = 2, execute = 4}
+
+--- How long the check waits for a privilege before reporting it missing.
+--
+-- The credentials applier grants an object's privileges from an on_replace
+-- trigger on _space/_sequence, so a grant for a space the role has just
+-- created lands a few milliseconds later -- 8.9 ms on CE 3.9 and 9.1 ms on EE
+-- 3.7, measured against a config whose `credentials.roles.pregel` named a
+-- space that did not exist when the applier first ran. This is not sized for
+-- that; it is sized for an instance under load, and for the fact that the
+-- answer after it is "the config does not grant this", which had better not be
+-- said about a grant that was merely late.
+M.GRANT_TIMEOUT = 30
+
+--- Everything `name` may do, its roles included.
+--
+-- box.schema.user.info() answers with the user's *own* privileges and its role
+-- memberships, not with what those roles carry -- so a user whose whole
+-- privilege set comes from `roles: [pregel]`, which is exactly the shape this
+-- library asks for, looks like a user with nothing. The roles are therefore
+-- walked here.
+--
+-- @param name a user or role name
+-- @return a map of object type to object id to permission bits, or nil when
+--  there is no such user
+local function effective_privileges(name)
+    local row = box.space._user.index.name:get({name})
+    if row == nil then
+        return nil
+    end
+    local held, seen, queue = {}, {}, {row[1]}
+    while #queue > 0 do
+        local uid = table.remove(queue)
+        if not seen[uid] then
+            seen[uid] = true
+            -- The primary key of _priv is (grantee, object_type, object_id),
+            -- so a one-part key selects everything granted to this one.
+            for _, tuple in box.space._priv:pairs({uid}) do
+                local object_type, object, bits = tuple[3], tuple[4], tuple[5]
+                if object_type == 'role' then
+                    table.insert(queue, object)
+                end
+                held[object_type] = held[object_type] or {}
+                held[object_type][object] =
+                    bit.bor(held[object_type][object] or 0, bits)
+            end
+        end
+    end
+    return held
+end
+
+--- Does `held` cover `bits` on this object?
+--
+-- A grant on 'universe' covers every object of every type, which is what a
+-- deployment that gave the pregel user `universe: true` has done -- broader
+-- than this library asks for, and not something to then report as missing.
+local function holds(held, bits, object_type, object)
+    local universe = (held.universe or {})[0] or 0
+    if bit.band(universe, bits) == bits then
+        return true
+    end
+    return bit.band((held[object_type] or {})[object] or 0, bits) == bits
+end
+
+--- The entry points a config has to let the pregel user call, for one side.
+--
+-- Read out of the registry the modules publish rather than listed here: a
+-- fifth entry point would otherwise be one this check does not know about, and
+-- the config would be wrong in a way nothing reports until the first call that
+-- uses it.
+--
+-- @param kind 'worker' or 'master'
+-- @return array of dotted names, sorted
+-- @function entry_points
+function M.entry_points(kind)
+    local rv = {}
+    for name in pairs((rawget(_G, 'pregel') or {})[kind] or {}) do
+        table.insert(rv, 'pregel.' .. kind .. '.' .. name)
+    end
+    table.sort(rv)
+    return rv
+end
+
+--- What the pregel user needs on this instance to serve one job.
+--
+-- Two halves, and both have to be in the cluster config now that the roles
+-- grant nothing themselves. The lua_call half is the entry points; the
+-- read/write half is the job's own spaces and their sequences, which exist by
+-- the time this is called (worker.new has created them) and are therefore
+-- listed by what is actually there rather than by what the naming convention
+-- would predict -- a job with delayed_push has bucket spaces and one without
+-- does not.
+--
+-- @param kind 'worker' or 'master'
+-- @param job the job name, or nil for the entry points alone
+-- @return array of {permissions = 'read,write', object_type = ..., object = ...}
+-- @function required_privileges
+function M.required_privileges(kind, job)
+    local rv = {}
+    for _, name in ipairs(M.entry_points(kind)) do
+        table.insert(rv, {permissions = 'execute', object_type = 'lua_call',
+                          object = name})
+    end
+    if job == nil then
+        return rv
+    end
+    for _, space in ipairs(require('pregel.worker').space_names(job)) do
+        if box.space[space] ~= nil then
+            table.insert(rv, {permissions = 'read,write',
+                              object_type = 'space', object = space})
+        end
+        local sequence = space .. '_seq'
+        if box.sequence[sequence] ~= nil then
+            table.insert(rv, {permissions = 'read,write',
+                              object_type = 'sequence', object = sequence})
+        end
+    end
+    return rv
+end
+
+--- Which of `wanted` the user does not hold.
+--
+-- @param user the login to check
+-- @param wanted as returned by M.required_privileges
+-- @return array of the entries of `wanted` that are not covered
+-- @function missing_privileges
+function M.missing_privileges(user, wanted)
+    local held = effective_privileges(user)
+    if held == nil then
+        -- No such user at all: every privilege is missing, and saying so is
+        -- more use than a message about the first object in the list.
+        return wanted
+    end
+    local rv = {}
+    for _, want in ipairs(wanted) do
+        local bits = 0
+        for permission in want.permissions:gmatch('[^,]+') do
+            bits = bit.bor(bits, PERMISSION[permission] or 0)
+        end
+        -- Spaces and sequences are named by id in _priv; a lua_call is named
+        -- by the string itself.
+        local object = want.object
+        if want.object_type == 'space' then
+            object = box.space[want.object] ~= nil and box.space[want.object].id
+        elseif want.object_type == 'sequence' then
+            object = box.sequence[want.object] ~= nil and
+                     box.sequence[want.object].id
+        end
+        if object == false then
+            object = nil
+        end
+        if object ~= nil and not holds(held, bits, want.object_type, object)
+        then
+            table.insert(rv, want)
+        end
+    end
+    return rv
+end
+
+--- Spell a missing privilege the way the config spells it.
+local function privilege_text(want)
+    return string.format("%s on %s '%s'", want.permissions, want.object_type,
+                         want.object)
+end
+
+local grants_mt = {
+    __index = {
+        --- Wait for the privileges, and report the ones that never arrive.
+        --
+        -- A loop rather than a single look, because the grants are lazy: see
+        -- M.GRANT_TIMEOUT. It does not raise -- a missing grant is reported
+        -- the same way a peer that is down is, through status() and an alert,
+        -- because raising from apply() at startup exits the process and
+        -- because the grant may still be on its way.
+        --
+        -- @function run
+        run = function(self)
+            local deadline = clock.monotonic() + self.timeout
+            local missing
+            while not self.stopped do
+                missing = M.missing_privileges(self.user, self.wanted)
+                if #missing == 0 then
+                    self.state = 'ok'
+                    self.error = nil
+                    M.alert_clear(self.role, self.key)
+                    return
+                end
+                if clock.monotonic() >= deadline then
+                    break
+                end
+                fiber.sleep(0.05)
+            end
+            if self.stopped then
+                return
+            end
+            local named = {}
+            for i, want in ipairs(missing) do
+                if i > 4 then
+                    table.insert(named, string.format('and %d more',
+                                                      #missing - 4))
+                    break
+                end
+                table.insert(named, privilege_text(want))
+            end
+            self.state = 'failed'
+            self.error = string.format(
+                "%s: the user '%s' is missing %s, which pregel needs to run " ..
+                "job '%s' here; grant it under credentials.%s in the cluster " ..
+                'config', self.role, self.user, table.concat(named, ', '),
+                self.job, 'roles.' .. M.CREDENTIALS_ROLE)
+            log.error('%s', self.error)
+            M.alert(self.role, self.key, self.error)
+        end,
+        --- Start the fiber. Returns at once.
+        -- @function start
+        start = function(self)
+            self.fiber = fiber.create(function()
+                fiber.self():name('pregel_grants', {truncate = true})
+                local ok, err = pcall(self.run, self)
+                if not ok and not self.stopped then
+                    self.state = 'failed'
+                    self.error = tostring(err)
+                    log.error("%s: the privilege check of job '%s' failed: %s",
+                              self.role, self.job, self.error)
+                end
+            end)
+            return self
+        end,
+        --- Stop checking and withdraw the alert.
+        -- @function stop
+        stop = function(self)
+            local f = self.fiber
+            self.stopped = true
+            self.fiber = nil
+            if f ~= nil and f:status() ~= 'dead' then
+                f:cancel()
+            end
+            M.alert_clear(self.role, self.key)
+        end,
+    },
+}
+
+--- Check, in a fiber, that the pregel user may do what the job needs here.
+--
+-- The roles used to hand these privileges out themselves, to the login
+-- roles_cfg named, right after creating the spaces. They do not any more: the
+-- credentials applier grants what `credentials.roles.pregel` lists, including
+-- for objects that appear later (measured: 8.9 ms after the space is created
+-- on CE 3.9, 9.1 ms on EE 3.7, and again after a config:reload and after the
+-- job's spaces are dropped and re-created). What a role granted was invisible
+-- in the config and survived being taken out of it, which is the opposite of
+-- what a credentials section is for.
+--
+-- What is left is telling an operator when the config does not grant enough --
+-- otherwise a job that is missing one privilege connects, starts, and fails
+-- somewhere inside a superstep with an access error from a remote call.
+--
+-- opts.user    -- the login to check
+-- opts.job     -- the job name, for the message
+-- opts.wanted  -- as returned by M.required_privileges
+-- opts.timeout -- roles_cfg.connect_timeout, when the config sets one: a
+--                 deployment that says how long it is willing to wait for the
+--                 rest of the world is saying it about this too. Never longer
+--                 than M.GRANT_TIMEOUT, which is already generous for a grant
+--                 that arrives in milliseconds.
+--
+-- Built but not started: call start() on the result.
+--
+-- @param role the role name, for the messages and the alerts namespace
+-- @param opts table as above
+-- @return the checker
+-- @function grant_check
+function M.grant_check(role, opts)
+    return setmetatable({
+        role    = role,
+        user    = opts.user,
+        job     = opts.job,
+        wanted  = opts.wanted,
+        timeout = math.min(opts.timeout or M.GRANT_TIMEOUT, M.GRANT_TIMEOUT),
+        key     = 'privileges',
+        state   = 'checking',
+        error   = nil,
+        fiber   = nil,
+        stopped = false,
+    }, grants_mt)
 end
 
 -------------------------------------------------------------------------------
