@@ -30,6 +30,15 @@ Tarantool's own default path.
     echo "require('pregel.roles.master').status()" | tt connect <name>:master -f -
     tt stop -y
 
+Each directory carries a `tt.yaml` of its own with `instances_enabled: .`, so
+it is a `tt` environment and a `tt` application at once and needs no `tt init`
+— unlike the configuration in the top-level README, which has to be dropped
+into one.
+
+`tt start` returns before the pid files are written, so a `tt status` run in
+the same breath as it prints `NOT RUNNING` for all four instances. Give it a
+second; nothing is wrong.
+
 Every example's master has `autostart: true`, so it waits for its three
 workers, loads the graph and runs the supersteps by itself; `status()` reports
 `idle` → `loading` → `running` → `done`, or `failed` with the error. Without
@@ -39,6 +48,13 @@ autostart nothing happens until an operator drives it:
     m:wait_up():preload():start()
 
 All five listen on `127.0.0.1:3301`…`3304`, so run one at a time.
+
+Every per-worker transcript in these READMEs is reproducible, not a snapshot:
+a vertex name is hashed onto one of the `workers` entries, and every instance
+sorts that list by the URI string before hashing, so bucket 1 is always
+`worker1` (`127.0.0.1:3302`), bucket 2 `worker2` (`:3303`) and bucket 3
+`worker3` (`:3304`). The same vertex lands on the same worker on every machine
+and after every restart.
 
 ## Configuring an app module
 

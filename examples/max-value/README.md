@@ -56,10 +56,13 @@ trailing `;;` keeps Tarantool's own default path.
     cd examples/max-value
     LUA_PATH="$(cd ../.. && pwd)/?.lua;$(cd ../.. && pwd)/?/init.lua;$PWD/?.lua;;" tt start
 
-    • Starting an instance [max-value:worker2]...
-    • Starting an instance [max-value:worker3]...
     • Starting an instance [max-value:master]...
     • Starting an instance [max-value:worker1]...
+    • Starting an instance [max-value:worker2]...
+    • Starting an instance [max-value:worker3]...
+
+`tt` forks the four in whatever order it likes and that line order varies run
+to run; nothing downstream depends on it.
 
 The master role has `autostart: true`, so it waits for the three workers, loads
 the graph and runs the supersteps by itself. Watch it:
@@ -67,10 +70,13 @@ the graph and runs the supersteps by itself. Watch it:
     tt status
 
      INSTANCE           STATUS   PID    MODE  CONFIG  BOX      UPSTREAM
-     max-value:master   RUNNING  26141  RW    ready   running  --
-     max-value:worker1  RUNNING  26138  RW    ready   running  --
-     max-value:worker2  RUNNING  26139  RW    ready   running  --
-     max-value:worker3  RUNNING  26140  RW    ready   running  --
+     max-value:master   RUNNING  81099  RW    ready   running  --
+     max-value:worker1  RUNNING  81101  RW    ready   running  --
+     max-value:worker2  RUNNING  81102  RW    ready   running  --
+     max-value:worker3  RUNNING  81104  RW    ready   running  --
+
+`tt start` returns before the pid files are written, so a `tt status` run in
+the same breath as it prints `NOT RUNNING` for all four. Give it a second.
 
 `tt connect max-value:master` opens a console on the master. Every console
 line below is written as a pipe instead, so it can be pasted as it stands:
@@ -96,27 +102,59 @@ The answer, from the master's copy of the aggregator:
     ...
 
 Each worker keeps its own shard in the space `data_<job name>` — here
-`data_maxvalue` — as `{name, halted, value, edges}`:
+`data_maxvalue` — as `{name, halted, value, edges}`.
+
+Which worker holds what is decided without anyone being told: a vertex name is
+hashed onto one of the `workers` entries, and every instance orders that list
+the same way — by the URI string, sorted — so bucket N means the same worker
+everywhere. For the ports in this `config.yaml` that makes bucket 1 `worker1`
+(`127.0.0.1:3302`), bucket 2 `worker2` (`:3303`) and bucket 3 `worker3`
+(`:3304`), and the split below is the same on every machine and after every
+restart. `require('pregel.mpool').guava_name('2', 3)` answers `1` anywhere,
+which is how to work out where a named vertex went without looking for it.
 
     echo "box.space.data_maxvalue:len()" | tt connect max-value:worker1 -f -
+    ---
+    - 25459
+    ...
+
+    echo "box.space.data_maxvalue:len()" | tt connect max-value:worker2 -f -
     ---
     - 25564
     ...
 
-    echo "box.space.data_maxvalue:pairs():take(3):map(function(t) return t.value end):totable()" | tt connect max-value:worker1 -f -
+    echo "box.space.data_maxvalue:len()" | tt connect max-value:worker3 -f -
     ---
-    - - {'id': 0, 'name': 'James Moore', 'value': 999987}
-      - {'value': 999987, 'name': 'Duane Olson', 'id': 10}
-      - {'id': 1000, 'name': 'Laura Debar', 'value': 999987}
+    - 24856
     ...
 
+    echo "box.space.data_maxvalue:pairs():take(3):map(function(t) return t.value end):totable()" | tt connect max-value:worker1 -f -
+    ---
+    - - {'value': 999987, 'name': 'Rita Swafford', 'id': 100}
+      - {'id': 10008, 'name': 'Ricky Mayhew', 'value': 136854}
+      - {'id': 10015, 'name': 'Shirley Flowers', 'value': 636429}
+    ...
+
+Two of those three are below the global maximum, which is the point of the
+first section: a vertex holds the largest value that reaches it, and only 47676
+of the 75879 are reachable from the vertex holding 999987.
+
 A named vertex lives on exactly one worker, so `:get()` for it answers on one
-instance and nil on the other two:
+instance and nil on the other two. Vertex `2` hashes to bucket 1:
+
+    echo "box.space.data_maxvalue:get('2')" | tt connect max-value:worker1 -f -
+    ---
+    - ['2', true, {'value': 999987, 'name': 'Harriette Campbell', 'id': 2}, [['5', 1],
+        ['12', 1], ['18', 1], ['26', 1], ['30', 1], ['31', 1], ['33', 1], ['35', 1], [
+    ...
 
     echo "box.space.data_maxvalue:get('2')" | tt connect max-value:worker3 -f -
+    ---
+    ...
 
 Selecting a whole tuple prints the vertex's entire edge list, which for this
-graph is long; the `:pairs():map(...)` above is the readable way round it.
+graph is long — the output above is cut after two lines of it; the
+`:pairs():map(...)` above is the readable way round it.
 
 Each worker also reports for itself:
 
@@ -132,10 +170,10 @@ Each worker also reports for itself:
 
     tt stop -y
 
-    • The Instance max-value:worker2 (PID = 26139) has been terminated.
-    • The Instance max-value:worker3 (PID = 26140) has been terminated.
-    • The Instance max-value:master (PID = 26141) has been terminated.
-    • The Instance max-value:worker1 (PID = 26138) has been terminated.
+    • The Instance max-value:worker1 (PID = 81101) has been terminated.
+    • The Instance max-value:worker2 (PID = 81102) has been terminated.
+    • The Instance max-value:worker3 (PID = 81104) has been terminated.
+    • The Instance max-value:master (PID = 81099) has been terminated.
 
 `wal.mode` is `none`, so nothing survives; `rm -rf var` clears the working
 directories as well.

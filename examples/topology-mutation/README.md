@@ -68,13 +68,16 @@ threshold and therefore kept (`d -5-> e`), three vertices that lose everything
     • Starting an instance [topology-mutation:worker2]...
     • Starting an instance [topology-mutation:worker3]...
 
+`tt start` returns before the pid files are written, so a `tt status` run in the
+same breath as it prints `NOT RUNNING` for all four. Give it a second.
+
     tt status
 
      INSTANCE                   STATUS   PID    MODE  CONFIG  BOX      UPSTREAM
-     topology-mutation:master   RUNNING  81635  RW    ready   running  --
-     topology-mutation:worker1  RUNNING  81636  RW    ready   running  --
-     topology-mutation:worker2  RUNNING  81637  RW    ready   running  --
-     topology-mutation:worker3  RUNNING  81638  RW    ready   running  --
+     topology-mutation:master   RUNNING  20379  RW    ready   running  --
+     topology-mutation:worker1  RUNNING  20380  RW    ready   running  --
+     topology-mutation:worker2  RUNNING  20382  RW    ready   running  --
+     topology-mutation:worker3  RUNNING  20383  RW    ready   running  --
 
 `tt connect topology-mutation:master` opens a console; every console line below
 is written as a pipe instead, so it can be pasted as it stands.
@@ -89,15 +92,13 @@ is written as a pipe instead, so it can be pasted as it stands.
 ## Read the results
 
 The graph is small enough to print whole. Each tuple is
-`{name, halted, value, edges}`:
+`{name, halted, value, edges}`. Which worker a vertex lands on is fixed: the
+name is hashed onto one of the `workers` entries, and every instance sorts that
+list by the URI string first, so bucket 1 is `worker1` (`127.0.0.1:3302`),
+bucket 2 is `worker2` (`:3303`) and bucket 3 is `worker3` (`:3304`) — the
+placement below is the same on every machine and after every restart.
 
     echo "box.space.data_topology:select()" | tt connect topology-mutation:worker1 -f -
-    ---
-    - - ['b', true, {'id': 2, 'name': 'b', 'value': 0}, []]
-      - ['h', true, {'value': 0, 'name': 'h', 'id': 8}, []]
-    ...
-
-    echo "box.space.data_topology:select()" | tt connect topology-mutation:worker2 -f -
     ---
     - - ['a', true, {'id': 1, 'name': 'a', 'value': 0}, [['b', 9]]]
       - ['b:orphan', true, {'name': 'b:orphan', 'orphan_of': 'b'}, []]
@@ -106,6 +107,12 @@ The graph is small enough to print whole. Each tuple is
       - ['e', true, {'id': 5, 'name': 'e', 'value': 0}, []]
       - ['f', true, {'id': 6, 'name': 'f', 'value': 0}, [['g', 8], ['h', 6]]]
       - ['g', true, {'id': 7, 'name': 'g', 'value': 0}, []]
+    ...
+
+    echo "box.space.data_topology:select()" | tt connect topology-mutation:worker2 -f -
+    ---
+    - - ['b', true, {'id': 2, 'name': 'b', 'value': 0}, []]
+      - ['h', true, {'value': 0, 'name': 'h', 'id': 8}, []]
     ...
 
     echo "box.space.data_topology:select()" | tt connect topology-mutation:worker3 -f -
@@ -119,7 +126,7 @@ The graph is small enough to print whole. Each tuple is
 threshold; `b`, `e`, `g` and `h` came away with nothing and each has a marker.
 
 And the markers are not where the vertices that asked for them are: `b` is on
-`worker1` while `b:orphan` is on `worker2`, and `e`, `g`, `h` are spread over
+`worker2` while `b:orphan` is on `worker1`, and `e`, `g`, `h` are spread over
 `worker1` and `worker2` while all three of their markers are on `worker3`. A
 vertex is placed by the hash of its name and `<name>:orphan` is a different
 name — which is exactly what the delayed mutation queue is for. The request

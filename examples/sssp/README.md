@@ -64,18 +64,21 @@ Tarantool's own default path.
     cd examples/sssp
     LUA_PATH="$(cd ../.. && pwd)/?.lua;$(cd ../.. && pwd)/?/init.lua;$PWD/?.lua;;" tt start
 
+    • Starting an instance [sssp:master]...
     • Starting an instance [sssp:worker1]...
     • Starting an instance [sssp:worker2]...
     • Starting an instance [sssp:worker3]...
-    • Starting an instance [sssp:master]...
+
+`tt start` returns before the pid files are written, so a `tt status` run in the
+same breath as it prints `NOT RUNNING` for all four. Give it a second.
 
     tt status
 
      INSTANCE      STATUS   PID    MODE  CONFIG  BOX      UPSTREAM
-     sssp:master   RUNNING  89082  RW    ready   running  --
-     sssp:worker1  RUNNING  89079  RW    ready   running  --
-     sssp:worker2  RUNNING  89080  RW    ready   running  --
-     sssp:worker3  RUNNING  89081  RW    ready   running  --
+     sssp:master   RUNNING  96784  RW    ready   running  --
+     sssp:worker1  RUNNING  96785  RW    ready   running  --
+     sssp:worker2  RUNNING  96787  RW    ready   running  --
+     sssp:worker3  RUNNING  96788  RW    ready   running  --
 
 `tt connect sssp:master` opens a console; every console line below is written
 as a pipe instead, so it can be pasted as it stands.
@@ -91,7 +94,15 @@ as a pipe instead, so it can be pasted as it stands.
 
 Each worker holds its own shard in `data_sssp`, and between them they hold the
 graph exactly once — which is also the proof that the three parallel loads
-partitioned it rather than each loading everything:
+partitioned it rather than each loading everything.
+
+The split is not luck of the draw: a vertex name is hashed onto one of the
+`workers` entries, and every instance sorts that list by the URI string before
+hashing, so bucket N is the same worker on every instance and after every
+restart. For the ports in this `config.yaml`, bucket 1 is `worker1`
+(`127.0.0.1:3302`), bucket 2 is `worker2` (`:3303`) and bucket 3 is `worker3`
+(`:3304`) — which puts six of the nine vertices on `worker1` and makes the
+placement below reproducible rather than a snapshot of one run.
 
     echo "box.space.data_sssp:pairs():map(function(t) return t.value end):totable()" | tt connect sssp:worker1 -f -
     ---
@@ -105,13 +116,13 @@ partitioned it rather than each loading everything:
 
     echo "box.space.data_sssp:pairs():map(function(t) return t.value end):totable()" | tt connect sssp:worker2 -f -
     ---
-    - - {'name': 'i', 'dist': inf}
+    - - {'name': 'b', 'dist': 1}
+      - {'name': 'h', 'dist': 9}
     ...
 
     echo "box.space.data_sssp:pairs():map(function(t) return t.value end):totable()" | tt connect sssp:worker3 -f -
     ---
-    - - {'name': 'b', 'dist': 1}
-      - {'name': 'h', 'dist': 9}
+    - - {'name': 'i', 'dist': inf}
     ...
 
 `i` is `inf` because nothing points at it. That is a real `math.huge` in the

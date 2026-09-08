@@ -75,18 +75,21 @@ everything rather than its own share when it is called without a worker index.
     cd examples/pagerank
     LUA_PATH="$(cd ../.. && pwd)/?.lua;$(cd ../.. && pwd)/?/init.lua;$PWD/?.lua;;" tt start
 
-    • Starting an instance [pagerank:worker3]...
     • Starting an instance [pagerank:master]...
     • Starting an instance [pagerank:worker1]...
     • Starting an instance [pagerank:worker2]...
+    • Starting an instance [pagerank:worker3]...
+
+`tt start` returns before the pid files are written, so a `tt status` run in the
+same breath as it prints `NOT RUNNING` for all four. Give it a second.
 
     tt status
 
-     INSTANCE          STATUS   PID    MODE  CONFIG  BOX      UPSTREAM
-     pagerank:master   RUNNING  20593  RW    ready   running  --
-     pagerank:worker1  RUNNING  20594  RW    ready   running  --
-     pagerank:worker2  RUNNING  20595  RW    ready   running  --
-     pagerank:worker3  RUNNING  20592  RW    ready   running  --
+     INSTANCE          STATUS   PID   MODE  CONFIG  BOX      UPSTREAM
+     pagerank:master   RUNNING  4981  RW    ready   running  --
+     pagerank:worker1  RUNNING  4982  RW    ready   running  --
+     pagerank:worker2  RUNNING  4983  RW    ready   running  --
+     pagerank:worker3  RUNNING  4986  RW    ready   running  --
 
 `tt connect pagerank:master` opens a console; every console line below is
 written as a pipe instead, so it can be pasted as it stands.
@@ -118,10 +121,16 @@ The two aggregators, from the master's merged copies:
 The dangling value is `F`'s rank, which is what it should be: `F` is the only
 vertex with no out-edges.
 
+Which worker holds what is fixed rather than incidental: a vertex name is
+hashed onto one of the `workers` entries, and every instance sorts that list by
+the URI string first, so bucket N means the same worker everywhere. For the
+ports in this `config.yaml` that is bucket 1 = `worker1` (`127.0.0.1:3302`),
+bucket 2 = `worker2` (`:3303`), bucket 3 = `worker3` (`:3304`), and the split
+below comes out the same on every machine and after every restart.
+
     echo "box.space.data_pagerank:pairs():map(function(t) return t.value end):totable()" | tt connect pagerank:worker1 -f -
     ---
-    - - {'name': 'A', 'rank': 0.34102414309093}
-      - {'name': 'F', 'rank': 0.044635865309319}
+    - []
     ...
 
     echo "box.space.data_pagerank:pairs():map(function(t) return t.value end):totable()" | tt connect pagerank:worker2 -f -
@@ -134,11 +143,12 @@ vertex with no out-edges.
 
     echo "box.space.data_pagerank:pairs():map(function(t) return t.value end):totable()" | tt connect pagerank:worker3 -f -
     ---
-    - []
+    - - {'name': 'A', 'rank': 0.34102414309093}
+      - {'name': 'F', 'rank': 0.044635865309319}
     ...
 
 Six vertices over three shards is few enough that a worker can come away with
-none, as `worker3` did here; the sharding is by hash of the vertex name and
+none, as `worker1` does here; the sharding is by hash of the vertex name and
 makes no attempt to balance.
 
 `C` ranks highest, `A` a close second (both are pointed at by three of the six

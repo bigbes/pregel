@@ -52,18 +52,21 @@ answer.
     cd examples/wcc
     LUA_PATH="$(cd ../.. && pwd)/?.lua;$(cd ../.. && pwd)/?/init.lua;$PWD/?.lua;;" tt start
 
-    • Starting an instance [wcc:master]...
     • Starting an instance [wcc:worker1]...
     • Starting an instance [wcc:worker2]...
     • Starting an instance [wcc:worker3]...
+    • Starting an instance [wcc:master]...
+
+`tt start` returns before the pid files are written, so a `tt status` run in the
+same breath as it prints `NOT RUNNING` for all four. Give it a second.
 
     tt status
 
      INSTANCE     STATUS   PID    MODE  CONFIG  BOX      UPSTREAM
-     wcc:master   RUNNING  45606  RW    ready   running  --
-     wcc:worker1  RUNNING  45608  RW    ready   running  --
-     wcc:worker2  RUNNING  45609  RW    ready   running  --
-     wcc:worker3  RUNNING  45611  RW    ready   running  --
+     wcc:master   RUNNING  11766  RW    ready   running  --
+     wcc:worker1  RUNNING  11763  RW    ready   running  --
+     wcc:worker2  RUNNING  11764  RW    ready   running  --
+     wcc:worker3  RUNNING  11765  RW    ready   running  --
 
 `tt connect wcc:master` opens a console; every console line below is written as
 a pipe instead, so it can be pasted as it stands.
@@ -82,38 +85,44 @@ supersteps about eight and a half.
 
     echo "box.space.data_wcc:pairs():take(3):map(function(t) return t.value end):totable()" | tt connect wcc:worker1 -f -
     ---
-    - - {'name': 'James Moore', 'label': '0', 'id': 0}
-      - {'name': 'Duane Olson', 'label': '0', 'id': 10}
-      - {'name': 'Laura Debar', 'label': '0', 'id': 1000}
+    - - {'name': 'Rita Swafford', 'label': '0', 'id': 100}
+      - {'name': 'Ricky Mayhew', 'label': '0', 'id': 10008}
+      - {'name': 'Shirley Flowers', 'label': '0', 'id': 10015}
     ...
 
 Counting the components means counting distinct labels, which each worker can
-do over its own shard:
+do over its own shard. Which shard is which is settled before anything runs: a
+vertex name is hashed onto one of the `workers` entries, and every instance
+sorts that list by the URI string first, so bucket 1 is `worker1`
+(`127.0.0.1:3302`), bucket 2 is `worker2` (`:3303`) and bucket 3 is `worker3`
+(`:3304`) — the same three numbers below on every machine and after every
+restart. This is the same graph `examples/max-value` runs on, and the shard
+sizes match its transcript for exactly that reason.
 
     echo "local n, c = {}, 0 for _, t in box.space.data_wcc:pairs() do if n[t.value.label] == nil then c = c + 1 end n[t.value.label] = (n[t.value.label] or 0) + 1 end return {distinct_labels = c, in_component_0 = n['0'], vertices = box.space.data_wcc:len()}" | tt connect wcc:worker1 -f -
-    ---
-    - vertices: 24856
-      distinct_labels: 2
-      in_component_0: 24855
-    ...
-
-    ... | tt connect wcc:worker2 -f -
     ---
     - vertices: 25459
       distinct_labels: 2
       in_component_0: 25458
     ...
 
-    ... | tt connect wcc:worker3 -f -
+    ... | tt connect wcc:worker2 -f -
     ---
     - vertices: 25564
       distinct_labels: 1
       in_component_0: 25564
     ...
 
+    ... | tt connect wcc:worker3 -f -
+    ---
+    - vertices: 24856
+      distinct_labels: 2
+      in_component_0: 24855
+    ...
+
 One component of 75877 vertices — labelled `0`, so vertex 0 is the
 lexicographically smallest name in it — plus two isolated vertices, one on
-`worker1` and one on `worker2`. The three shards agree on the label without
+`worker1` and one on `worker3`. The three shards agree on the label without
 ever comparing notes, which is the property worth noticing: a vertex only knows
 what its neighbours told it.
 
