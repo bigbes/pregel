@@ -266,6 +266,106 @@ g.test_read_fastavro_object_container_files = function()
     end
 end
 
+g.test_fastavro_deflate_files_read_the_same_through_both_paths = function()
+    -- The deflate codec has two readers: zlib through pregel.compress, and the
+    -- pure-Lua inflater that is the guarantee on a host with no library. Both
+    -- have to produce the same records from bytes fastavro wrote, and on this
+    -- machine only the first would ever run -- so the second is forced here
+    -- rather than left to a build that happens not to have zlib.
+    local saved = deflate.force_pure
+    local ok, err = pcall(function()
+        for _, name in ipairs(CASES) do
+            local file = fio.pathjoin(FIXTURES, name .. '.deflate.avro')
+            local want = load_expectations(name)
+
+            deflate.force_pure = false
+            local _, fast_reader = deflate.backend()
+            local fast = ocf.read_all(file)
+
+            deflate.force_pure = true
+            t.assert_equals(select(2, deflate.backend()), 'pure-lua')
+            local pure = ocf.read_all(file)
+
+            t.assert_equals(#fast, #want, name .. ': record count, zlib path')
+            t.assert_equals(#pure, #want, name .. ': record count, pure path')
+            for i = 1, #want do
+                assert_same(fast[i], want[i],
+                            string.format('%s via %s, record %d', name,
+                                          fast_reader, i))
+                assert_same(pure[i], want[i],
+                            string.format('%s via pure-lua, record %d', name, i))
+            end
+        end
+    end)
+    deflate.force_pure = saved
+    if not ok then
+        error(err, 0)
+    end
+end
+
+g.test_our_deflate_files_read_the_same_through_both_paths = function()
+    -- The other direction: bytes this repository compressed, read back by the
+    -- inflater that did not write them. A deflate stream zlib emits uses
+    -- dynamic Huffman blocks, which the stored-block fallback never produces,
+    -- so without a zlib on the machine this pairing does not happen at all.
+    t.skip_if(not deflate.has_zlib, 'no libz can be loaded in this build')
+    local dir = fio.tempdir()
+    local saved = deflate.force_pure
+    local ok, err = pcall(function()
+        for _, name in ipairs(CASES) do
+            local sc = schema.parse(slurp(name .. '.avsc'))
+            local want = load_expectations(name)
+            local file = fio.pathjoin(dir, name .. '.deflate.avro')
+            ocf.write_all(file, sc, want, {codec = 'deflate', block_size = 128})
+            for _, pure in ipairs({false, true}) do
+                deflate.force_pure = pure
+                local got = ocf.read_all(file)
+                t.assert_equals(#got, #want)
+                for i = 1, #want do
+                    assert_same(got[i], want[i],
+                                string.format('%s force_pure=%s record %d',
+                                              name, tostring(pure), i))
+                end
+            end
+        end
+    end)
+    deflate.force_pure = saved
+    fio.rmtree(dir)
+    if not ok then
+        error(err, 0)
+    end
+end
+
+g.test_zstandard_container_files_round_trip = function()
+    -- zstandard used to be Enterprise-only here. It is not any more, so the
+    -- codec gets the same treatment as the other two: written and read back
+    -- against the expectations fastavro produced.
+    t.skip_if(not ocf.codec_available('zstandard'),
+              'no libzstd can be loaded in this build')
+    local dir = fio.tempdir()
+    local ok, err = pcall(function()
+        for _, name in ipairs(CASES) do
+            local sc = schema.parse(slurp(name .. '.avsc'))
+            local want = load_expectations(name)
+            local file = fio.pathjoin(dir, name .. '.zstandard.avro')
+            ocf.write_all(file, sc, want, {codec = 'zstandard', block_size = 128})
+            local r = ocf.open(file, {mode = 'r'})
+            t.assert_equals(r.codec, 'zstandard')
+            r:close()
+            local got = ocf.read_all(file)
+            t.assert_equals(#got, #want, name .. ': record count')
+            for i = 1, #want do
+                assert_same(got[i], want[i],
+                            string.format('%s zstandard record %d', name, i))
+            end
+        end
+    end)
+    fio.rmtree(dir)
+    if not ok then
+        error(err, 0)
+    end
+end
+
 g.test_fastavro_file_schema_matches_the_avsc = function()
     for _, name in ipairs(CASES) do
         local sc = schema.parse(slurp(name .. '.avsc'))
@@ -317,6 +417,20 @@ g.test_inflate_matches_zlib_over_a_corpus_using_every_length_code = function()
         -- copies the right number of bytes from the wrong place as often as not.
         t.assert_equals(#got, #plain, 'inflated length at level ' .. level)
         t.assert_equals(got, plain, 'inflated bytes at level ' .. level)
+    end
+end
+
+g.test_the_zlib_reader_matches_the_lua_one_over_the_same_corpus = function()
+    -- Same corpus, the other reader. It is the one that actually runs on this
+    -- machine, so leaving it out would mean the fast path was checked only
+    -- against streams this repository wrote itself.
+    t.skip_if(not deflate.has_raw_inflate, 'no libz can be loaded in this build')
+    local meta  = json.decode(slurp('deflate_corpus.meta.json'))
+    local plain = slurp('deflate_corpus.raw')
+    for _, level in ipairs({'1', '6', '9'}) do
+        local packed = slurp(meta.levels[level].file)
+        t.assert_equals(deflate.decompress(packed), plain,
+                        'zlib inflated bytes at level ' .. level)
     end
 end
 

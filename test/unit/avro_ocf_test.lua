@@ -88,23 +88,145 @@ g.test_round_trip_deflate_codec = function()
 end
 
 g.test_round_trip_zstandard_codec = function()
-    t.skip_if(not has_zstd(), 'compress.zstd is not available in this build')
+    -- Used to skip on Community Edition, where there was no compress.zstd. It
+    -- runs there now: pregel.compress binds the system libzstd through the
+    -- FFI, so the codec is available on any host that has the library.
+    t.skip_if(not has_zstd(), 'no libzstd can be loaded in this build')
     round_trip('zstandard', 20)
 end
 
-g.test_deflate_actually_compresses_under_enterprise = function()
-    t.skip_if(not deflate.has_zlib, 'compress.zlib is not available in this build')
+g.test_deflate_actually_compresses = function()
+    -- Used to skip on Community Edition too, for the same reason and with the
+    -- same fix. Where no libz can be loaded at all the writer still falls back
+    -- to stored blocks, which is the branch below.
+    t.skip_if(not deflate.has_zlib, 'no libz can be loaded in this build')
     -- Highly repetitive input, so real compression is unmistakable.
     local body = string.rep('the same line over and over ', 500)
     local compressed = deflate.deflate(body)
     t.assert_lt(#compressed, #body / 10)
     t.assert_equals(deflate.inflate(compressed), body)
+    t.assert_equals(deflate.decompress(compressed), body)
 end
 
 g.test_deflate_falls_back_to_stored_blocks_without_zlib = function()
-    -- Stored blocks are valid RFC 1951 and the inflater reads them either way.
+    -- Stored blocks are valid RFC 1951 and both readers take them either way.
     local body = string.rep('xyz', 1000)
     t.assert_equals(deflate.inflate(deflate.store(body)), body)
+    t.assert_equals(deflate.decompress(deflate.store(body)), body)
+end
+
+g.test_deflate_both_readers_agree = function()
+    -- The pure-Lua inflater is the guarantee that a deflate file is readable
+    -- anywhere, so it has to keep working on the same bytes the fast path
+    -- reads -- on a machine where zlib loads, nothing would otherwise run it.
+    t.skip_if(not deflate.has_raw_inflate, 'no libz can be loaded in this build')
+    local bodies = {
+        '',
+        'x',
+        string.rep('the same line over and over ', 500),
+        require('digest').urandom(100000),
+    }
+    for i, body in ipairs(bodies) do
+        local packed = deflate.deflate(body)
+        t.assert_equals(deflate.inflate(packed), body, 'pure inflater, body ' .. i)
+        t.assert_equals(deflate.decompress(packed), body, 'zlib, body ' .. i)
+    end
+end
+
+g.test_deflate_force_pure_selects_the_lua_inflater = function()
+    -- PREGEL_AVRO_PURE_LUA sets this at load; the flag is writable so that one
+    -- process can drive both paths over the same file, which is what the
+    -- container-file test below does.
+    local saved = deflate.force_pure
+    local ok, err = pcall(function()
+        local _, reader = deflate.backend()
+        t.assert_equals(reader, deflate.has_raw_inflate and 'ffi' or 'pure-lua')
+        deflate.force_pure = true
+        local _, forced = deflate.backend()
+        t.assert_equals(forced, 'pure-lua')
+        local body = string.rep('forced through Lua ', 500)
+        t.assert_equals(deflate.decompress(deflate.deflate(body)), body)
+    end)
+    deflate.force_pure = saved
+    if not ok then
+        error(err, 0)
+    end
+end
+
+g.test_the_ffi_and_enterprise_writers_produce_the_same_file = function()
+    -- Under Enterprise the deflate and zstandard codecs compress through the
+    -- Enterprise module while everywhere else they go through the FFI
+    -- bindings. A file has to be the same either way, or a cluster with one
+    -- binary of each would be writing two dialects of the same format.
+    --
+    -- The sync marker is fixed, so the only thing that could differ is the
+    -- compressed payload.
+    local compress = require('pregel.compress')
+    t.skip_if(compress.implementation ~= 'enterprise',
+              'the two implementations are the same object in this build')
+
+    local sc = schema.parse(RECORD_JSON)
+    local records = sample(400)
+    local sync = 'pregel-avro-fixt'
+
+    local function write_with(zlib_mod, zstd_mod, suffix)
+        local saved_zlib, saved_zstd = compress.zlib, compress.zstd
+        compress.zlib, compress.zstd = zlib_mod, zstd_mod
+        local out = {}
+        local ok, err = pcall(function()
+            for _, codec_name in ipairs({'deflate', 'zstandard'}) do
+                local file = path(codec_name .. '-' .. suffix .. '.avro')
+                ocf.write_all(file, sc, records,
+                              {codec = codec_name, sync = sync, block_size = 2048})
+                local fh = fio.open(file, {'O_RDONLY'})
+                out[codec_name] = fh:read()
+                fh:close()
+            end
+        end)
+        compress.zlib, compress.zstd = saved_zlib, saved_zstd
+        if not ok then
+            error(err, 0)
+        end
+        return out
+    end
+
+    local ee = write_with(compress.enterprise.zlib, compress.enterprise.zstd, 'ee')
+    local our = write_with(compress.ffi.zlib, compress.ffi.zstd, 'ffi')
+
+    for _, codec_name in ipairs({'deflate', 'zstandard'}) do
+        t.assert_gt(#ee[codec_name], 0)
+        t.assert_equals(#our[codec_name], #ee[codec_name],
+                        codec_name .. ': file size')
+        t.assert_equals(our[codec_name], ee[codec_name],
+                        codec_name .. ': the two writers produce the same bytes')
+        -- And whichever wrote it, the reader gets the records back.
+        t.assert_equals(#ocf.read_all(path(codec_name .. '-ffi.avro')), #records)
+        t.assert_equals(#ocf.read_all(path(codec_name .. '-ee.avro')), #records)
+    end
+end
+
+g.test_codec_available_names_the_implementation = function()
+    local ok, impl = ocf.codec_available('null')
+    t.assert_equals(ok, true)
+    t.assert_equals(impl, 'none')
+
+    ok, impl = ocf.codec_available('deflate')
+    t.assert_equals(ok, true)
+    -- '<writer>/<reader>', e.g. 'ffi/ffi' on Community Edition with a system
+    -- libz, 'enterprise/ffi' under Enterprise, 'stored/pure-lua' with neither.
+    t.assert_str_contains(impl, '/')
+    local writer, reader = impl:match('^(.-)/(.+)$')
+    t.assert_items_include({'enterprise', 'ffi', 'stored'}, {writer})
+    t.assert_items_include({'ffi', 'pure-lua'}, {reader})
+
+    ok, impl = ocf.codec_available('zstandard')
+    if ok then
+        t.assert_items_include({'enterprise', 'ffi'}, {impl})
+    else
+        t.assert_equals(impl, nil)
+    end
+
+    t.assert_equals(ocf.codec_available('snappy'), false)
 end
 
 g.test_multi_block_file = function()
@@ -282,12 +404,28 @@ g.test_unknown_codec_is_rejected = function()
                                  codec = 'snappy'})
 end
 
-g.test_missing_zstd_module_names_it = function()
-    t.skip_if(has_zstd(), 'compress.zstd is available, so it cannot be missing')
-    t.assert_error_msg_contains('compress.zstd', function()
-        ocf.write_all(path('zstd.avro'), schema.parse('"long"'), {1},
+g.test_missing_zstd_library_names_it = function()
+    -- This used to skip itself wherever zstd worked, which is now everywhere,
+    -- so the message it checks would have gone untested on every machine that
+    -- runs the suite. Take the library away instead: `new` is what fails when
+    -- none can be loaded, and it is the only thing the codec calls.
+    local compress = require('pregel.compress')
+    local saved = compress.zstd.new
+    compress.zstd.new = function()
+        error('pregel.compress: cannot load libzstd (tried: nothing)', 0)
+    end
+    local ok, err = pcall(function()
+        ocf.write_all(path('zstd-missing.avro'), schema.parse('"long"'), {1},
                       {codec = 'zstandard'})
     end)
+    compress.zstd.new = saved
+    t.assert_equals(ok, false)
+    t.assert_str_contains(err, 'codec "zstandard" needs a libzstd')
+    t.assert_str_contains(err, 'cannot load libzstd')
+    -- And the codec works again once the library is back, so the stub above
+    -- did not leave the module broken for whatever runs next.
+    t.skip_if(not has_zstd(), 'no libzstd can be loaded in this build')
+    round_trip('zstandard', 3)
 end
 
 g.test_writer_needs_a_schema = function()

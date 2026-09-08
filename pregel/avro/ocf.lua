@@ -17,8 +17,9 @@
 --
 -- Codecs: `null` always; `deflate` always, since the inflater is pure Lua and
 -- the deflater falls back to stored blocks (see pregel.avro.deflate);
--- `zstandard` only where `compress.zstd` exists, which today means Tarantool
--- Enterprise.
+-- `zstandard` wherever `pregel.compress` can reach a libzstd, which is
+-- Tarantool Enterprise and any host with the library installed.
+-- `codec_available` answers for the running build and names the implementation.
 --
 -- Reading and writing both stream, so a file larger than memory costs one
 -- block. Everything here does blocking file I/O through fio and so must run in
@@ -31,6 +32,7 @@ local fio    = require('fio')
 
 local avro_schema = require('pregel.avro.schema')
 local codec       = require('pregel.avro.codec')
+local compress    = require('pregel.compress')
 local deflate     = require('pregel.avro.deflate')
 
 local M = {}
@@ -53,15 +55,19 @@ end
 -- Codecs
 --------------------------------------------------------------------------------
 
---- Load a compression module on demand, naming it when it is missing so that
---  the message says what to install rather than just "codec unsupported".
-local function require_module(name, codec_name)
-    local ok, mod = pcall(require, name)
+--- A zstd object, made per block.
+--
+-- Made rather than kept so that a build with no libzstd can still read and
+-- write every other codec, and so that a test can take the library away and
+-- see this message. The cost is a table and a cached library lookup against a
+-- block of tens of kilobytes, which does not show.
+local function zstd_object()
+    local ok, res = pcall(function() return compress.zstd.new() end)
     if not ok then
-        fail('codec %q needs the %q module, which is not available in this ' ..
-             'Tarantool build', codec_name, name)
+        fail('codec "zstandard" needs a libzstd, which this build cannot ' ..
+             'load: %s', tostring(res))
     end
-    return mod
+    return res
 end
 
 local CODECS = {
@@ -71,33 +77,45 @@ local CODECS = {
     },
     ['deflate'] = {
         compress   = function(s) return deflate.deflate(s) end,
-        decompress = function(s) return deflate.inflate(s) end,
+        decompress = function(s) return deflate.decompress(s) end,
     },
     ['zstandard'] = {
-        compress = function(s)
-            return require_module('compress.zstd', 'zstandard').new():compress(s)
-        end,
-        decompress = function(s)
-            return require_module('compress.zstd', 'zstandard').new():decompress(s)
-        end,
+        compress   = function(s) return zstd_object():compress(s) end,
+        decompress = function(s) return zstd_object():decompress(s) end,
     },
 }
 
 M.codecs = CODECS
 
---- True when the codec can be used in this build without raising.
+--- Whether the codec can be used in this build, and by what.
 --
--- 'deflate' is always available: the inflater is pure Lua and the deflater
--- falls back to stored blocks. Only 'zstandard' depends on the build.
+-- 'deflate' is always usable: the inflater is pure Lua and the deflater falls
+-- back to stored blocks, so the answer is true even where no library loads --
+-- what changes is the second return value. Only 'zstandard' can be
+-- unavailable outright.
 --
 -- @param name codec name
 -- @return boolean; false for a codec this package does not know at all
+-- @return the implementation, as a string: 'none' for the null codec;
+--         '<writer>/<reader>' for deflate, e.g. 'ffi/ffi', 'enterprise/ffi' or
+--         'stored/pure-lua'; 'enterprise' or 'ffi' for zstandard, and nil when
+--         it is unavailable
 -- @function codec_available
 function M.codec_available(name)
     if name == 'zstandard' then
-        return (pcall(require, 'compress.zstd'))
+        if not compress.available('zstd') then
+            return false
+        end
+        return true, compress.implementation
     end
-    return CODECS[name] ~= nil
+    if name == 'deflate' then
+        local writer, reader = deflate.backend()
+        return true, writer .. '/' .. reader
+    end
+    if CODECS[name] == nil then
+        return false
+    end
+    return true, 'none'
 end
 
 local function get_codec(name)
