@@ -1,0 +1,118 @@
+# One master and three workers, each the read-write leader of a replicaset of
+# its own. Unlike the graph examples, both Avro files are read by *every*
+# worker (worker_preload), each keeping the vertices whose names hash to it --
+# so app_cfg has to reach the workers as well as the master, and the anchor
+# below is what keeps the two copies from drifting.
+
+credentials:
+  users:
+    pregel:
+      password: 'secret'
+      # Everything pregel sends to pregel is a conn:call() on one of these four
+      # entry points. The other half of the privileges -- read/write on the
+      # job's own spaces -- cannot be spelled here (the spaces are named after
+      # the job and do not exist yet) and is granted by the worker role itself.
+      privileges:
+        - permissions: [execute]
+          lua_call:
+            - pregel.worker.deliver
+            - pregel.worker.deliver_batch
+            - pregel.worker.wait
+            - pregel.master.deliver
+
+# Nothing in an example outlives the cluster. The per-task training spaces are
+# `temporary` in their own right, so they would stay out of the WAL even here.
+wal:
+  mode: none
+
+groups:
+  pregel:
+    replicasets:
+      master:
+        instances:
+          master:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3301'
+            roles: [pregel.roles.master]
+            roles_cfg:
+              pregel.roles.master:
+                name: lookalike
+                app: app
+                # Run the job as soon as every worker has reported in. Without
+                # this the cluster comes up idle and waits for an operator --
+                # see the README.
+                autostart: true
+                user: pregel
+                password: 'secret'
+                workers:
+                  - '127.0.0.1:3302'
+                  - '127.0.0.1:3303'
+                  - '127.0.0.1:3304'
+                app_cfg: &app_cfg
+                  # Relative to examples/lookalike/, resolved by the app
+                  # module: an instance's own working directory is under
+                  # var/lib and is no use as a base.
+                  #
+                  # The committed fixture: 200 users, 8 features, 2 tasks with
+                  # 60 labels each. `tools/gen-lookalike.lua` writes a bigger
+                  # one -- the README runs 2000 users, 16 features, 3 tasks.
+                  users:  '../../test/fixtures/lookalike/users.avro'
+                  labels: '../../test/fixtures/lookalike/labels.avro'
+                  # Held out of training, per class, to measure AUC on.
+                  test_fraction: 0.25
+                  # A task with fewer labels than this reports `failed` with a
+                  # reason instead of training on nothing.
+                  min_labels: 20
+                  # Minibatch SGD on the hinge loss with an L2 penalty, and an
+                  # inverse-decay rate of 0.1 / (1 + 0.01 * iteration).
+                  learning_rate: 0.1
+                  learning_decay: 0.01
+                  lambda: 0.001
+                  batch_size: 16
+                  max_iter: 300
+                  alpha: 0.2
+                  epsilon: 0.0001
+                  # Users asked for a raw score, and the width of one bucket of
+                  # the percentile scale built out of their answers.
+                  calibration_sample: 100
+                  calibration_bucket: 5
+      worker1:
+        instances:
+          worker1:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3302'
+            roles: [pregel.roles.worker]
+            roles_cfg: &worker_cfg
+              pregel.roles.worker:
+                name: lookalike
+                app: app
+                master: '127.0.0.1:3301'
+                workers:
+                  - '127.0.0.1:3302'
+                  - '127.0.0.1:3303'
+                  - '127.0.0.1:3304'
+                user: pregel
+                password: 'secret'
+                # The same table as the master's, and here it is load-bearing
+                # on both sides: the workers read the Avro files (the master
+                # has no loader at all) and every hyperparameter is read by a
+                # compute function through the worker context.
+                app_cfg: *app_cfg
+      worker2:
+        instances:
+          worker2:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3303'
+            roles: [pregel.roles.worker]
+            roles_cfg: *worker_cfg
+      worker3:
+        instances:
+          worker3:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3304'
+            roles: [pregel.roles.worker]
+            roles_cfg: *worker_cfg
