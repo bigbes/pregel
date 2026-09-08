@@ -247,6 +247,34 @@ g.test_sync_mismatch_is_reported = function()
     end)
 end
 
+--- next_block() checked the block's declared byte size for a negative value but
+--  not its record count. A negative count made _remaining negative, so the
+--  records() loop never reached zero and kept decoding past the block's data
+--  until the codec ran out of bytes -- naming an offset deep inside the file
+--  rather than the header field that is actually wrong.
+g.test_a_negative_block_record_count_is_rejected = function()
+    local sc = schema.parse('"long"')
+    local file = path('negcount.avro')
+    ocf.write_all(file, sc, {1, 2, 3})
+    local raw = slurp(file)
+
+    -- The header ends with the sync marker; the block's record count is the
+    -- varint right after it. Three records zigzag to 0x06, one byte, so -1
+    -- (0x01) replaces it without moving anything.
+    local r = ocf.open({mode = 'r', data = raw})
+    local sync = r.sync
+    r:close()
+    local at = raw:find(sync, 1, true)
+    t.assert_not_equals(at, nil, 'the header sync marker must be findable')
+    local count_at = at + #sync
+    t.assert_equals(raw:byte(count_at), 6, 'three records zigzag to 0x06')
+    local broken = raw:sub(1, count_at - 1) .. '\1' .. raw:sub(count_at + 1)
+
+    t.assert_error_msg_contains('negative record count', function()
+        for _ in ocf.open({mode = 'r', data = broken}):records() do end
+    end)
+end
+
 g.test_unknown_codec_is_rejected = function()
     t.assert_error_msg_contains('unsupported codec "snappy"', ocf.open,
                                 path('never.avro'),

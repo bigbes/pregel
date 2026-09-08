@@ -214,6 +214,13 @@ local function next_block(self)
     end
     local count = read_long(self)
     local size  = read_long(self)
+    -- Both are checked here rather than left to the codec: a negative count
+    -- made _remaining negative, so the records() loop never reached zero and
+    -- decoded past the block's data until the codec ran out of bytes, blaming
+    -- an offset deep in the file instead of this header field.
+    if count < 0 then
+        fail('block at record %d declares a negative record count', self._read)
+    end
     if size < 0 then
         fail('block at record %d declares a negative size', self._read)
     end
