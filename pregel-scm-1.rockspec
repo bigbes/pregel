@@ -35,5 +35,6 @@ build = {
         ['pregel.avro.deflate']      = 'pregel/avro/deflate.lua',
         ['pregel.avro.ocf']          = 'pregel/avro/ocf.lua',
         ['pregel.avro.resolve']      = 'pregel/avro/resolve.lua',
+        ['pregel.math.vector']       = 'pregel/math/vector.lua',
     },
 }
