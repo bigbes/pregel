@@ -1,6 +1,6 @@
 # Examples
 
-Five runnable pregel jobs. Each directory is a `tt` application — a Tarantool 3
+Six runnable pregel jobs. Each directory is a `tt` application — a Tarantool 3
 cluster config, four instance names, an app module and a README whose every
 command was run against it — and each one is picked to show something the
 others do not.
@@ -12,6 +12,7 @@ others do not.
 | [pagerank](pagerank/) | PageRank, damping 0.85 | aggregators as the way a vertex learns something about the whole graph, and a job that runs a fixed number of supersteps |
 | [wcc](wcc/) | weakly connected components | why the graph, not the algorithm, has to be symmetric |
 | [topology-mutation](topology-mutation/) | prune weak edges | changing the graph from inside compute, and when each kind of change takes effect |
+| [mf](mf/) | matrix factorisation, SGD | fitting a model rather than measuring the graph: a bipartite graph loaded by a hand-written loader, aggregators carrying an answer *out*, and a result read back off the workers |
 
 Read them in that order if you are reading them all: each one assumes the one
 above it.
@@ -47,7 +48,7 @@ autostart nothing happens until an operator drives it:
     local m = require('pregel.roles.master').get()
     m:wait_up():preload():start()
 
-All five listen on `127.0.0.1:3301`…`3304`, so run one at a time.
+All six listen on `127.0.0.1:3301`…`3304`, so run one at a time.
 
 Every per-worker transcript in these READMEs is reproducible, not a snapshot:
 a vertex name is hashed onto one of the `workers` entries, and every instance

@@ -45,14 +45,18 @@ local ITEMS         = 30
 local TRAIN = '../../test/fixtures/ratings/train.avro'
 local TEST  = '../../test/fixtures/ratings/test.avro'
 
---- What the same hyperparameters produce, measured on this fixture.
+--- What these hyperparameters produce on this fixture, measured.
 --
--- The run is deterministic -- the starting vectors are drawn from the vertex
--- names -- so this is a number and not a range; the threshold is loose enough
--- to survive a change in the order a worker happens to hand a vertex its
--- messages, which is the one thing about the schedule that is not pinned.
--- Shuffling that order over six trials moved the score between 0.4762 and
--- 0.4810, so 0.50 is roughly four times the spread away.
+-- Not a fixed number, and this is the one place worth saying why. The starting
+-- vectors are drawn from the vertex names, so *they* are the same on every run
+-- and on every shard count -- but the order a vertex reads its messages in is
+-- the order they arrived, and a vertex chains its own updates as it walks
+-- them, so a different interleaving is a slightly different model. Three runs
+-- of this cluster gave 0.4773, 0.4777 and 0.4781; shuffling the order
+-- deliberately, over six trials outside the cluster, spanned 0.4762 to 0.4810.
+--
+-- 0.50 is about four times that spread above the top of it, and well below the
+-- 0.5606 a model that learnt nothing scores -- see baseline_rmse.
 local TEST_RMSE_MAX = 0.50
 
 local function app_cfg(overrides)
