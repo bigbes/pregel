@@ -14,6 +14,8 @@
 -- either on every put (the default) or once per superstep from squash(), when
 -- `squash_only` is set -- combining on put costs a read of the receiver's
 -- messages per put, which is the wrong trade when a receiver gets many.
+--
+-- @module pregel.queue
 
 local log = require('log')
 
@@ -45,6 +47,16 @@ end
 -------------------------------------------------------------------------------
 
 local tube_space_methods = {
+    --- Iterate the messages addressed to one receiver.
+    --
+    -- Yields (key, message). The key is whatever the engine iterates by -- the
+    -- index state here, an array position in the table engine -- so a caller
+    -- may only use the second value; `for _, msg in q:pairs(id)`.
+    --
+    -- @param receiver vertex name
+    -- @return iterator function
+    -- @raise when `receiver` is nil
+    -- @function pairs
     pairs = function(self, receiver)
         assert(receiver ~= nil, 'receiver is nil')
         local gen, param, state = self.space.index.receiver:pairs({receiver})
@@ -57,6 +69,10 @@ local tube_space_methods = {
             return state, tuple[3]
         end
     end,
+    --- Iterate the distinct receivers that currently hold a message.
+    --
+    -- @return iterator yielding one receiver name at a time, nil when done
+    -- @function receiver_closure
     receiver_closure = function(self)
         -- GT on the partial key {receiver} skips every message of that
         -- receiver at once, so this walks distinct receivers, not messages.
@@ -73,6 +89,18 @@ local tube_space_methods = {
             return tuple[2]
         end
     end,
+    --- Add one message for `receiver`.
+    --
+    -- With a combiner in the default (non-squash_only) mode the receiver's
+    -- existing messages are folded into this one and replaced by it, so the
+    -- queue holds a single message per receiver at all times.
+    --
+    -- @param receiver vertex name
+    -- @param message any value a tuple field can hold
+    -- @return the message actually stored, which is the combined one when a
+    --         combiner ran, not the argument
+    -- @raise when `receiver` or `message` is nil
+    -- @function put
     put = function(self, receiver, message)
         assert(receiver ~= nil, 'receiver is nil')
         assert(message ~= nil, 'message is nil')
@@ -88,12 +116,24 @@ local tube_space_methods = {
         self.space:insert{box.NULL, receiver, message}
         return message
     end,
+    --- How many messages the queue holds, in total or for one receiver.
+    --
+    -- Counted from the space itself rather than from `stats`, which is what
+    -- makes queue.verify() a real cross-check rather than a tautology.
+    --
+    -- @param receiver vertex name, or nil for the whole queue
+    -- @return number
+    -- @function len
     len = function(self, receiver)
         if receiver == nil then
             return self.space:len()
         end
         return self.space.index.receiver:count({receiver})
     end,
+    --- Drop one receiver's messages, or every message when `receiver` is nil.
+    --
+    -- @param receiver vertex name, or nil for the whole queue
+    -- @function delete
     delete = function(self, receiver)
         if receiver == nil then
             self.space:truncate()
@@ -106,6 +146,9 @@ local tube_space_methods = {
         end
         self.stats[receiver] = nil
     end,
+    --- Engine half of drop(): methods_of() renames this to __drop and puts
+    --  tube_drop() in its place, so the messages outlive nothing.
+    -- @function drop
     drop = function(self)
         self.space:drop()
     end,
@@ -116,6 +159,13 @@ local tube_space_methods = {
 -------------------------------------------------------------------------------
 
 local tube_table_methods = {
+    --- Iterate the messages addressed to one receiver; see the space engine's
+    --  pairs() for the shape of what it yields.
+    --
+    -- @param receiver vertex name
+    -- @return iterator function
+    -- @raise when `receiver` is nil
+    -- @function pairs
     pairs = function(self, receiver)
         assert(receiver ~= nil, 'receiver is nil')
         -- rawget, not container[receiver]: reading must not create a bucket,
@@ -126,6 +176,13 @@ local tube_table_methods = {
         end
         return pairs(messages)
     end,
+    --- Iterate the distinct receivers that currently hold a message.
+    --
+    -- Walks a live Lua table, so squash() collects the names before it starts
+    -- deleting and re-putting them.
+    --
+    -- @return iterator yielding one receiver name at a time, nil when done
+    -- @function receiver_closure
     receiver_closure = function(self)
         local gen, param, state = pairs(self.container)
         return function()
@@ -137,6 +194,13 @@ local tube_table_methods = {
             return state
         end
     end,
+    --- Add one message for `receiver`; see the space engine's put().
+    --
+    -- @param receiver vertex name
+    -- @param message any Lua value
+    -- @return the message actually stored, combined where a combiner ran
+    -- @raise when `receiver` or `message` is nil
+    -- @function put
     put = function(self, receiver, message)
         assert(receiver ~= nil, 'receiver is nil')
         assert(message ~= nil, 'message is nil')
@@ -157,6 +221,14 @@ local tube_table_methods = {
         table.insert(messages, message)
         return message
     end,
+    --- How many messages the queue holds, in total or for one receiver.
+    --
+    -- The total is recounted by walking every receiver, so it is O(receivers)
+    -- rather than the space engine's O(1).
+    --
+    -- @param receiver vertex name, or nil for the whole queue
+    -- @return number
+    -- @function len
     len = function(self, receiver)
         if receiver ~= nil then
             local messages = rawget(self.container, receiver)
@@ -168,6 +240,10 @@ local tube_table_methods = {
         end
         return len
     end,
+    --- Drop one receiver's messages, or every message when `receiver` is nil.
+    --
+    -- @param receiver vertex name, or nil for the whole queue
+    -- @function delete
     delete = function(self, receiver)
         if receiver == nil then
             self.container = {}
@@ -177,6 +253,8 @@ local tube_table_methods = {
         self.container[receiver] = nil
         self.stats[receiver] = nil
     end,
+    --- Engine half of drop(); see the space engine's.
+    -- @function drop
     drop = function(self)
         self.container = nil
     end,
@@ -187,13 +265,18 @@ local tube_table_methods = {
 -------------------------------------------------------------------------------
 
 local tube_common_methods = {
+    --- Drop every message, keeping the queue usable. Alias of delete().
+    -- @function truncate
     truncate = function(self)
         return self:delete()
     end,
     --- Fold every receiver's messages down to one with the combiner.
     --
     -- Only does anything in squash_only mode; otherwise put() has already
-    -- combined and there is nothing left to fold.
+    -- combined and there is nothing left to fold. A receiver whose messages
+    -- fold to nil is left empty rather than re-put.
+    --
+    -- @function squash
     squash = function(self)
         if self.combiner == nil or self.squash_only == false then
             return
@@ -224,6 +307,12 @@ local tube_common_methods = {
 
 --- Detach the queue: it can no longer be used, and queue.new() will build a
 -- fresh one under the same name.
+--
+-- Discards the messages with it -- the space engine drops its space. The
+-- object is left without a metatable, so any later method call on it fails
+-- rather than reading a half-dismantled queue.
+--
+-- @function drop
 local function tube_drop(self)
     tube_list[self.name] = nil
     self:__drop()
@@ -247,8 +336,16 @@ local tube_table_mt = { __index = methods_of(tube_table_methods) }
 
 --- Cross-check the per-receiver counters against what the queue actually holds.
 --
--- Returns `true, {}` when they agree and `false, {problem, ...}` when they do
--- not; every problem is also logged.
+-- `stats` is maintained by put() and delete() and read by nothing else, so
+-- this is a self-check: it catches a message that reached the space or the
+-- container without going through those, and a counter left behind by one that
+-- did not. Each divergent receiver is reported once, whichever side knows it.
+--
+-- @param queue queue object
+-- @return true and an empty table when they agree, false and a list of
+--         human-readable problems when they do not; every problem is also
+--         logged at error level
+-- @function verify
 local function verify_queue(queue)
     local problems = {}
     local seen = {}
@@ -290,6 +387,16 @@ end
 -- asks for the same options. Asking for different ones used to be a cache hit
 -- too, silently: a worker restarted in place with another combiner went on
 -- computing with the old one.
+--
+-- The 'space' engine needs box to be configured, and adopts a space of the
+-- same name that survived a restart, rebuilding the counters from its tuples.
+--
+-- @param name string, unique per instance; the space is `pregel_tube_<name>`
+-- @param options optional table as above
+-- @return the queue object
+-- @raise on a malformed option, and when `name` is already open with options
+--        that differ from the ones asked for
+-- @function new
 local function tube_new(name, options)
     assert(type(name) == 'string', 'queue name must be a string')
     assert(type(options) == 'nil' or type(options) == 'table',
@@ -379,7 +486,13 @@ local function tube_new(name, options)
     return self
 end
 
--- Reading a name whose space already exists adopts it, with default options.
+--- Every queue open in this instance, keyed by name.
+--
+-- Reading a name whose space already exists adopts it, with default options --
+-- so a queue created before a restart is reachable without knowing that it is
+-- there, but only ever with no combiner. Use new() when the options matter.
+--
+-- @table list
 tube_list = setmetatable({}, {
     __index = function(_, name)
         if type(name) == 'string' and box.space[space_name_of(name)] ~= nil then

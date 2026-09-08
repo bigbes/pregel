@@ -7,6 +7,8 @@
 -- Which instance runs the loader is up to the caller: master:preload() runs one
 -- on the master, worker:preload() runs one on each worker (and is handed its
 -- own index and the worker count, so a loader can split the input).
+--
+-- @module pregel.loader
 
 local fio  = require('fio')
 local log  = require('log')
@@ -28,25 +30,54 @@ local READ_SIZE = 65536
 local SECTION_VERTICES = 1
 local SECTION_EDGES    = 2
 
+--- The methods a loader function calls on itself (`self:store_vertex(...)`).
+--
+-- Every one of them only queues: nothing reaches a worker until flush(), or
+-- until an mpool bucket fills on its own.
 local function loader_methods(instance)
     return {
+        --- Queue one vertex for the worker that owns it.
+        --
         -- no conflict resolving, resets the vertex to this state
+        --
+        -- @param vertex the vertex value; the instance's obtain_name names it
+        -- @return the name it was stored under
+        -- @function store_vertex
         store_vertex = function(_, vertex)
             local id = instance.obtain_name(vertex)
             instance.mpool:by_id(id):put('vertex.store', vertex)
             return id
         end,
+        --- Queue one edge, on the worker that owns its *source*.
+        --
         -- no conflict resolving, may produce duplicates
+        --
+        -- @param src source vertex name (a name, not a vertex value)
+        -- @param dest destination vertex name
+        -- @param value edge value
+        -- @function store_edge
         store_edge = function(_, src, dest, value)
             -- '{src {dest, value}}' parsed as a call of the string src, so
             -- store_edge raised "attempt to call a string value" every time.
             -- edge.store takes (source, list-of-edges).
             instance.mpool:by_id(src):put('edge.store', {src, {{dest, value}}})
         end,
+        --- Queue several edges of one source in a single message.
+        --
         -- no conflict resolving, may produce duplicates
+        --
+        -- @param src source vertex name
+        -- @param list array of {destination_name, edge_value}
+        -- @function store_edges_batch
         store_edges_batch = function(_, src, list)
             instance.mpool:by_id(src):put('edge.store', {src, list})
         end,
+        --- Queue a vertex together with all of its outbound edges.
+        --
+        -- @param vertex the vertex value
+        -- @param list array of {destination_name, edge_value}
+        -- @return the name the vertex was stored under
+        -- @function store_vertex_edges
         store_vertex_edges = function(self, vertex, list)
             local id = self:store_vertex(vertex)
             -- store_edges_batch wants the source *name*; this used to hand it
@@ -55,12 +86,28 @@ local function loader_methods(instance)
             self:store_edges_batch(id, list)
             return id
         end,
+        --- Send everything still queued and wait for the workers to take it.
+        --
+        -- Yields, so a loader must run in a fiber that may.
+        --
+        -- @function flush
         flush = function()
             instance.mpool:flush()
         end,
     }
 end
 
+--- Wrap a plain function as a loader object.
+--
+-- The result is callable -- calling it runs `loader` with the object itself as
+-- `self`, so the function reaches store_vertex() and friends -- which is what
+-- lets master:preload() and worker:preload() take either.
+--
+-- @param instance the master or worker the graph is pushed through
+-- @param loader callable(self [, worker_idx, workers_count])
+-- @return the loader object
+-- @raise when `loader` is not callable
+-- @function new
 local function loader_new(instance, loader)
     assert(is_callable(loader), 'options.loader must be callable')
     return setmetatable({}, {
@@ -80,6 +127,18 @@ end
 -- instance's obtain_name, and the edge section is translated through that.
 -- Edges are batched per source, which is why the file wants them grouped by
 -- source -- correctness does not depend on it, only the batch sizes do.
+--
+-- Reads the whole file on whichever instance runs it and ignores the
+-- worker_idx/workers_count arguments, so running it on every worker loads the
+-- graph once per worker. Use it from master:preload(); the Avro loader below is
+-- the one that can split.
+--
+-- @param instance the master or worker the graph is pushed through
+-- @param file path to the text file
+-- @return the loader object; calling it returns the number of lines parsed
+-- @raise on an unreadable file, an unparsable line, a line outside any
+--        section, or an edge naming a vertex the vertex section never declared
+-- @function graph_edges_f
 local function loader_graph_edges_file(instance, file)
     local function loader(self)
         log.info('loading graph from file "%s"', file)
@@ -205,6 +264,13 @@ end
 -- and it is checked against that schema here rather than coming back as a nil
 -- value halfway through a load -- a misspelled field would otherwise store a
 -- whole graph of nameless vertices before anything complained.
+--
+-- @param spec a field name or a function(record)
+-- @param sc the schema the records have
+-- @param what option name, for the error message
+-- @return function(record) -> value
+-- @raise when `spec` is neither, or names a field `sc` does not have
+-- @function record_getter
 local function record_getter(spec, sc, what)
     if is_callable(spec) then
         return spec
@@ -231,6 +297,12 @@ local function record_getter(spec, sc, what)
 end
 
 --- The schema of an OCF file, with a readable error when the file is not there.
+--
+-- @param path filesystem path
+-- @param what option name, for the error message
+-- @return the schema object
+-- @raise when `path` is not a string, does not exist, or is not a readable OCF
+-- @function schema_of_file
 local function schema_of_file(path, what)
     if type(path) ~= 'string' then
         error('options.%s must be a path, got %s', what, type(path))
@@ -279,6 +351,19 @@ end
 -- An edge lands on the worker owning its source, which is the worker that
 -- stored that source's vertex, so a partitioned load never sends an edge to an
 -- instance that has not seen the vertex it belongs to.
+--
+-- Every option is checked against the files' own schemas here, when the loader
+-- is built, rather than per record: a misspelled field name is a startup error
+-- and not half a graph of nameless vertices.
+--
+-- @param instance the master or worker the graph is pushed through
+-- @param options table as above
+-- @return the loader object; calling it flushes and returns the number of
+--         vertices plus edges it stored
+-- @raise on a missing or unreadable file, a required option left out, a field
+--        name the file's schema does not have, or a record whose name, source
+--        or destination is null
+-- @function avro_files
 local function loader_avro_files(instance, options)
     if type(options) ~= 'table' then
         error('loader.avro_files: options must be a table, got %s',

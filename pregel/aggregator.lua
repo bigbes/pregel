@@ -21,6 +21,8 @@
 -- superstep starts contributing to it, so every worker reports the global
 -- again and the master adds it once per worker: four workers turned a count of
 -- 2000 into 10000 and then 42000. See receive_global below.
+--
+-- @module pregel.aggregator
 
 local log = require('log')
 
@@ -32,12 +34,23 @@ local MASTER_DELIVER = 'pregel.master.deliver'
 local aggregator_mt = {
     __index = {
         --- Queue this value on every worker, to go out with the next flush.
+        --
+        -- Called on the master's copy after it has merged every worker's, so
+        -- what is queued is the merged value each worker will read back as its
+        -- `global`.
+        --
+        -- @function inform_workers
         inform_workers = function(self)
             for _, bucket in ipairs(self.pregel.mpool.buckets) do
                 bucket:put('aggregator.inform', {self.name, self.value})
             end
         end,
         --- Report this worker's copy to the master.
+        --
+        -- Blocks on the master's reply, so it must run in a fiber that may
+        -- yield.
+        --
+        -- @function inform_master
         inform_master = function(self)
             -- conn:call against the master's registry, not conn:eval: eval
             -- needs a universe execute grant, a call needs only lua_call on
@@ -46,6 +59,11 @@ local aggregator_mt = {
                 'aggregator.inform', {self.name, self.value}
             })
         end,
+        --- Reset the accumulator to the configured default.
+        --
+        -- A function default is called afresh; anything else is deep-copied.
+        --
+        -- @function make_default
         make_default = function(self)
             if type(self.default) == 'function' then
                 self.value = self.default()
@@ -55,6 +73,13 @@ local aggregator_mt = {
                 self.value = deepcopy(self.default)
             end
         end,
+        --- Fold one worker's reported copy into the master's accumulator.
+        --
+        -- Runs on the master, once per worker per superstep, through `merge`
+        -- rather than `reduce`.
+        --
+        -- @param value the worker's copy
+        -- @function merge_master
         merge_master = function(self, value)
             self.value = self.merge(self.value, value)
         end,
@@ -64,6 +89,8 @@ local aggregator_mt = {
         -- it is the moment to clear the accumulator: from here until the end
         -- of the next superstep, `value` holds nothing but what that
         -- superstep's own vertices contribute.
+        -- @param value the master's merged value
+        -- @function receive_global
         receive_global = function(self, value)
             self.global = value
             self:make_default()
@@ -72,12 +99,26 @@ local aggregator_mt = {
         -- the previous superstep, not this worker's running total for the
         -- current one -- which would make what a vertex reads depend on how
         -- many vertices of its own shard happened to be computed before it.
+        --
+        -- In superstep 1 nothing has been merged yet, so this is the default.
+        --
+        -- @return the merged value
+        -- @function get_global
         get_global = function(self)
             return self.global
         end,
     },
     --- aggregator()        -> current value
     --  aggregator(value)   -> contribute value
+    --
+    -- The read is of the local accumulator, not the merged global -- a vertex
+    -- wants get_global() and reaches it through vertex:get_aggregation().
+    -- Contributing nil is indistinguishable from a read, so an aggregator
+    -- cannot be given one.
+    --
+    -- @param value the contribution, or nil to read
+    -- @return the accumulator when called with no argument, nothing otherwise
+    -- @function __call
     __call = function(self, value)
         if value == nil then
             return self.value
@@ -86,11 +127,21 @@ local aggregator_mt = {
     end
 }
 
---- opts.default  -- starting value, or a function returning one
---  opts.reduce   -- callable(accumulator, contribution) -> accumulator
---  opts.merge    -- callable(accumulator, worker_value) -> accumulator
---                   (defaults to reduce)
---  opts.internal -- true for the aggregators pregel keeps for itself
+--- Create an aggregator for one instance, master or worker.
+--
+-- opts.default  -- starting value, or a function returning one
+-- opts.reduce   -- callable(accumulator, contribution) -> accumulator
+--                  (defaults to last-write-wins)
+-- opts.merge    -- callable(accumulator, worker_value) -> accumulator
+--                  (defaults to reduce)
+-- opts.internal -- true for the aggregators pregel keeps for itself
+--
+-- @param name string the instance registers it under
+-- @param pregel the owning master or worker instance
+-- @param opts optional table as above
+-- @return the aggregator object
+-- @raise when reduce or merge is given and is not callable
+-- @function new
 local function aggregator_new(name, pregel, opts)
     opts = opts or {}
     local internal = opts.internal or false
