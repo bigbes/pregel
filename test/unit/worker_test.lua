@@ -109,6 +109,46 @@ g.test_grant_is_per_function = function()
     t.assert_equals(granted['pregel.master.deliver'], 'execute')
 end
 
+-- The same, for the spaces delayed_push adds. They are created by mpool.new()
+-- inside worker.new(), before the grant loop runs, so grant() can find them --
+-- it just did not look.
+g.test_grant_covers_the_delayed_push_bucket_spaces = function()
+    local w, name = make_worker({delayed_push = true, grant_to = 'guest'})
+
+    local space_names = {}
+    for _, bucket in ipairs(w.mpool.buckets) do
+        t.assert_not_equals(bucket.space_name, nil,
+                            'the buckets are not space-backed')
+        table.insert(space_names, bucket.space_name)
+    end
+    t.assert_gt(#space_names, 0)
+
+    local privs = {space = {}, sequence = {}}
+    for _, priv in ipairs(box.schema.user.info('guest')) do
+        local kind, object = priv[2], tostring(priv[3])
+        if privs[kind] ~= nil then
+            privs[kind][object] = priv[1]
+        end
+    end
+    for _, space_name in ipairs(space_names) do
+        t.assert_str_contains(space_name, 'pregel_mpool_' .. name .. '_')
+        t.assert_str_contains(privs.space[space_name] or '', 'write',
+                              'guest cannot write ' .. space_name)
+        -- The primary key is sequence-backed, and drawing from a sequence is a
+        -- privileged operation of its own.
+        t.assert_str_contains(privs.sequence[space_name .. '_seq'] or '',
+                              'write',
+                              'guest cannot use ' .. space_name .. '_seq')
+    end
+
+    drop_worker(w)
+    for _, space_name in ipairs(space_names) do
+        if box.space[space_name] ~= nil then
+            box.space[space_name]:drop()
+        end
+    end
+end
+
 g.test_grant_is_idempotent = function()
     worker.grant('guest')
     master.grant('guest')

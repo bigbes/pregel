@@ -143,6 +143,45 @@ g.test_max_value_with_a_combiner = function()
     t.assert_equals(c:pending_messages('combined'), 0)
 end
 
+-- delayed_push backs the message buckets with spaces instead of memory, which
+-- is what makes a preload larger than RAM possible. Defect: those spaces were
+-- not in the list worker.grant() hands out, and compute runs inside the
+-- pregel.worker.deliver RPC -- with the *caller's* privileges -- so every
+-- send_message under delayed_push wrote to a space the caller had never been
+-- granted: "Write access to space 'pregel_mpool_...' is denied for user
+-- 'guest'". The option was unusable under the module's own grants.
+g.test_max_value_with_delayed_push = function()
+    c = cluster.new(WORKER_COUNT)
+    c:create_workers('delayed', MAX_VALUE_COMPUTE, {delayed_push = true})
+    c:create_master('delayed', GRAPH_PATH)
+
+    c:run()
+
+    local vertices = c:collect_vertices('delayed')
+    local best = expected_max()
+    for _, v in ipairs(VERTICES) do
+        t.assert_not_equals(vertices[v.name], nil,
+                            'vertex ' .. v.name .. ' is missing')
+        t.assert_equals(vertices[v.name].value.value, best, 'vertex ' .. v.name)
+    end
+    t.assert_equals(c:pending_messages('delayed'), 0)
+
+    -- The buckets really were the space-backed ones, not instant ones under
+    -- another name -- otherwise this test proves nothing about the grants.
+    for _, names in ipairs(c:each_worker(function()
+        local rv = {}
+        for _, bucket in ipairs(_G.worker_instance.mpool.buckets) do
+            table.insert(rv, bucket.space_name)
+        end
+        return rv
+    end)) do
+        t.assert_equals(#names, WORKER_COUNT)
+        for _, name in ipairs(names) do
+            t.assert_str_contains(name, 'pregel_mpool_delayed_')
+        end
+    end
+end
+
 -------------------------------------------------------------------------------
 -- Topology mutation
 -------------------------------------------------------------------------------

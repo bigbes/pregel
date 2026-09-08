@@ -480,13 +480,35 @@ local function create_spaces(name)
 end
 
 --- The spaces one worker instance owns.
+--
+-- The fixed four, plus the delayed_push message buckets -- one space per peer,
+-- named 'pregel_mpool_<instance>_<bucket>' by mpool.lua. Those are discovered
+-- rather than listed because their number is the size of the cluster, and they
+-- have to be here: compute runs inside the pregel.worker.deliver RPC, with the
+-- caller's privileges, so a send_message under delayed_push writes to one of
+-- them on the caller's behalf. mpool.new() has already created them by the
+-- time worker_new() grants.
 local function space_names(name)
-    return {
+    local names = {
         'data_' .. name,
         'topology_mutation_' .. name,
         'pregel_tube_mqueue_first_' .. name,
         'pregel_tube_mqueue_second_' .. name,
     }
+    local prefix = 'pregel_mpool_' .. name .. '_'
+    for _, tuple in box.space._space.index.name:pairs({prefix},
+                                                      {iterator = 'GE'}) do
+        local space = tuple.name
+        if space:sub(1, #prefix) ~= prefix then
+            break
+        end
+        -- Only the bucket index may follow, so an instance whose name is a
+        -- prefix of another one's does not collect its neighbour's spaces.
+        if space:sub(#prefix + 1):match('^%d+$') ~= nil then
+            table.insert(names, space)
+        end
+    end
+    return names
 end
 
 --- Let `user` call this module's RPC entry points, and -- given an instance
