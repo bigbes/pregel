@@ -16,22 +16,15 @@ LUATEST_LUA     := $(ROCKS)/share/tarantool/rocks/luatest/scm-1/bin/luatest
 ROCKS_LUA_PATH  := $(ROCKS)/share/tarantool/?.lua;$(ROCKS)/share/tarantool/?/init.lua;;
 ROCKS_LUA_CPATH := $(ROCKS)/lib/tarantool/?.so;;
 
-# Directories that are already luacheck-clean. The 2016 core in pregel/ is
-# exempt until the Tarantool 3 port lands -- see lint-all.
-LINT_DIRS := $(wildcard test examples)
-
 .PHONY: deps lint lint-all test test-under test-ee
 
 deps:
 	tt rocks install luatest
 	tt rocks install luacheck
 
-lint:
-	$(LUACHECK) $(LINT_DIRS)
-
-# Lints the whole tree, core included. Expected to report warnings until the
-# port of pregel/ to Tarantool 3 is finished; kept out of `lint` for that reason.
-lint-all:
+# The whole tree, core included: pregel/ carried an exemption while it was
+# still 2016 code, and the Tarantool 3 port removed the need for it.
+lint lint-all:
 	$(LUACHECK) .
 
 test:

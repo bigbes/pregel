@@ -475,15 +475,52 @@ local function create_spaces(name)
     return data, tm
 end
 
---- Let `user` call this module's RPC entry points.
+--- The spaces one worker instance owns.
+local function space_names(name)
+    return {
+        'data_' .. name,
+        'topology_mutation_' .. name,
+        'pregel_tube_mqueue_first_' .. name,
+        'pregel_tube_mqueue_second_' .. name,
+    }
+end
+
+--- Let `user` call this module's RPC entry points, and -- given an instance
+-- name -- touch that instance's spaces.
 --
--- Per-function lua_call grants, so a worker exposes exactly three names and
--- nothing else -- the 1.6 version handed 'execute' on 'universe' to guest,
--- which is every function in the process.
-local function grant(user)
+-- Two halves, because they are needed at different times. The entry-point
+-- names do not depend on any instance, so a bootstrap script can grant them
+-- before it knows what it will run; the space privileges cannot be granted
+-- before the spaces exist, so worker.new() applies them for every user in
+-- options.grant_to.
+--
+-- Both halves are per-object grants. The 1.6 version handed 'execute' on
+-- 'universe' to guest instead, which is every function in the process, and
+-- needed it because the RPC was conn:eval.
+--
+-- A lua_call grant alone is not enough to run a worker: the call executes with
+-- the caller's privileges, and the entry points write to the instance's
+-- spaces.
+local function grant(user, instance_name)
     for _, name in ipairs({RPC_DELIVER, RPC_DELIVER_BATCH, RPC_WAIT}) do
         box.schema.user.grant(user, 'execute', 'lua_call', name,
                               {if_not_exists = true})
+    end
+    if instance_name == nil then
+        return
+    end
+    for _, space in ipairs(space_names(instance_name)) do
+        if box.space[space] ~= nil then
+            box.schema.user.grant(user, 'read,write', 'space', space,
+                                  {if_not_exists = true})
+        end
+        -- The primary keys are sequence-backed, and drawing from a sequence
+        -- is a privileged operation of its own.
+        local sequence = space .. '_seq'
+        if box.sequence[sequence] ~= nil then
+            box.schema.user.grant(user, 'read,write', 'sequence', sequence,
+                                  {if_not_exists = true})
+        end
     end
 end
 
@@ -507,6 +544,9 @@ end
 -- options.preload_args   -- passed to worker_preload
 -- options.user           -- net.box user for the outgoing connections
 -- options.password       -- net.box password for the outgoing connections
+-- options.grant_to       -- user, or array of users, allowed to reach this
+--                           instance: they get the RPC grants and read/write
+--                           on this instance's spaces
 local function worker_new(name, options)
     assert(type(name) == 'string', 'name must be a string')
     assert(type(options) == 'table', 'options must be a table')
@@ -599,6 +639,15 @@ local function worker_new(name, options)
         default  = 0,
         merge    = function(old, new) return old + new end,
     })
+
+    -- Now that every space exists, hand out the privileges that name them.
+    local grant_to = options.grant_to
+    if type(grant_to) == 'string' then
+        grant_to = {grant_to}
+    end
+    for _, user in ipairs(grant_to or {}) do
+        grant(user, name)
+    end
 
     workers[name] = self
     return self
