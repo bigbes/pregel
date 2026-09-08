@@ -1,12 +1,4 @@
 *.snap
 *.xlog
 .*.swp
-CMakeCache.txt
-CMakeFiles/
-CTestTestfile.cmake
-Makefile
-cmake_install.cmake
-*.so
 var
-var.bkp
-worker-*.lua
