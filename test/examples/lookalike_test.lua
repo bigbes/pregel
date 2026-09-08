@@ -38,8 +38,8 @@ local TASKS = {'task1', 'task2'}
 local USERS = 200
 
 -- The fixture's own Bayes error is 2 flipped labels of 60 for task1 and 7 of
--- 60 for task2, so a perfect model does not reach AUC 1 on task2. Measured on
--- this fixture: task1 1.000, task2 0.927.
+-- 60 for task2, so a perfect model does not reach AUC 1 on either. Measured on
+-- this fixture: task1 0.955, task2 0.945.
 local MIN_AUC = 0.9
 -- Nine weights (a bias and eight features), so 0.8 is "at least eight of the
 -- nine". Measured: 9 of 9 for both tasks.

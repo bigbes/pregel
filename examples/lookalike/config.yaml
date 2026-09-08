@@ -80,7 +80,7 @@ groups:
                   batch_size: 16
                   max_iter: 300
                   alpha: 0.2
-                  epsilon: 0.0001
+                  epsilon: 0.00001
                   # Users asked for a raw score, and the width of one bucket of
                   # the percentile scale built out of their answers.
                   calibration_sample: 100

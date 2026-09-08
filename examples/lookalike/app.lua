@@ -48,7 +48,12 @@
 --   batch_size          samples per gradient step                (16)
 --   max_iter            gradient steps at most                   (300)
 --   alpha               loss averaging factor                    (0.2)
---   epsilon             convergence threshold on the averaged loss (1e-4)
+--   epsilon             convergence threshold on the averaged loss (1e-5).
+--                       Below gd's own 1e-4 default on purpose: at batch_size
+--                       16 the batch loss is noisy enough that two iterations
+--                       land within 1e-4 of each other by luck, which stopped
+--                       one task of the README's run after 11 iterations at
+--                       AUC 0.920 against 0.978 trained out.
 --   calibration_sample  users asked for a score during calibration (100)
 --   calibration_bucket  percent per calibration bucket           (5)
 
@@ -97,7 +102,7 @@ local DEFAULTS = {
     batch_size         = 16,
     max_iter           = 300,
     alpha              = 0.2,
-    epsilon            = 1e-4,
+    epsilon            = 1e-5,
     calibration_sample = 100,
     calibration_bucket = 5,
 }

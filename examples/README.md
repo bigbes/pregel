@@ -13,6 +13,7 @@ others do not.
 | [wcc](wcc/) | weakly connected components | why the graph, not the algorithm, has to be symmetric |
 | [topology-mutation](topology-mutation/) | prune weak edges | changing the graph from inside compute, and when each kind of change takes effect |
 | [mf](mf/) | matrix factorisation, SGD | fitting a model rather than measuring the graph: a bipartite graph loaded by a hand-written loader, aggregators carrying an answer *out*, and a result read back off the workers |
+| [lookalike](lookalike/) | distributed SGD look-alike models | a job with no edges at all: heterogeneous vertices, spaces an app module owns, and an aggregator used to publish a model to a whole population instead of broadcasting it |
 
 Read them in that order if you are reading them all: each one assumes the one
 above it.
