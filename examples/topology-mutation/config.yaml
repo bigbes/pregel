@@ -38,10 +38,6 @@ groups:
                 name: topology
                 app: app
                 autostart: true
-                workers:
-                  - '127.0.0.1:3302'
-                  - '127.0.0.1:3303'
-                  - '127.0.0.1:3304'
                 app_cfg: &app_cfg
                   # Relative to examples/topology-mutation/, resolved by the
                   # app module: an instance's own working directory is under
@@ -64,11 +60,6 @@ groups:
               pregel.roles.worker:
                 name: topology
                 app: app
-                master: '127.0.0.1:3301'
-                workers:
-                  - '127.0.0.1:3302'
-                  - '127.0.0.1:3303'
-                  - '127.0.0.1:3304'
                 app_cfg: *app_cfg
       worker2:
         instances:

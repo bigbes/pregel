@@ -71,36 +71,6 @@ local function check_nonempty(value)
     return true
 end
 
---- An array of non-empty strings, e.g. a list of net.box URIs.
---
--- The map test is what catches a YAML mapping written where a sequence was
--- meant: `#value` is 0 for one, which would otherwise read as "empty".
---
--- Only the roles_cfg spelling is checked here. A discovered URI never passes
--- through this and may be a {uri = ..., params = ...} table, which this would
--- refuse -- see peer_uri.
---
--- @param value the option's value, already known to be a table
--- @return false and the expected shape when it is not one, true otherwise
-local function check_uri_array(value)
-    if #value == 0 then
-        return false, 'a non-empty array of URIs'
-    end
-    local count = 0
-    for _ in pairs(value) do
-        count = count + 1
-    end
-    if count ~= #value then
-        return false, 'an array of URIs, not a map'
-    end
-    for _, uri in ipairs(value) do
-        if type(uri) ~= 'string' or uri == '' then
-            return false, 'an array of non-empty strings'
-        end
-    end
-    return true
-end
-
 --- The options both roles accept, and how they are checked.
 --
 -- `types` is the set of Lua types the value may have; `check` refines that.
@@ -117,7 +87,6 @@ M.common_spec = {
     -- source vertex -- and a role that knew what belonged in it would have to
     -- be changed for every app.
     app_cfg      = {types = {table = true}},
-    workers      = {types = {table = true}, check = check_uri_array},
     pool_size    = {
         types = {number = true},
         check = function(v)
@@ -845,7 +814,9 @@ end
 -- 'off' reads database.mode and wants exactly one 'rw'; 'manual' reads the
 -- replicaset's configured leader. Under 'election' and 'supervised' the config
 -- names nobody, so this raises rather than picking one -- guessing would put a
--- worker's whole shard on an instance that cannot serve it.
+-- worker's whole shard on an instance that cannot serve it. A replicated
+-- pregel deployment therefore has to name its leaders in the config; a
+-- replicaset of one instance is unaffected and is what the examples use.
 --
 -- A single-member replicaset short-circuits all of that, which is why a
 -- non-replicated cluster never meets any of these messages.
@@ -883,9 +854,9 @@ local function rw_member(role, role_name, job, replicaset, members, config,
         end
         error("%s: replicaset '%s' runs %s for job '%s' on %d instances and " ..
               "%d of them are 'database.mode: rw'; a job takes one worker " ..
-              'per replicaset, so name exactly one or list the URIs in ' ..
-              'roles_cfg instead', role, replicaset, role_name, job, #members,
-              #rw)
+              'per replicaset, so give exactly one instance of that ' ..
+              "replicaset 'database.mode: rw'", role, replicaset, role_name,
+              job, #members, #rw)
     end
 
     if failover == 'manual' then
@@ -896,15 +867,19 @@ local function rw_member(role, role_name, job, replicaset, members, config,
             end
         end
         error("%s: replicaset '%s' runs %s for job '%s' on %d instances and " ..
-              "its leader (%s) is not one of them; list the URIs in " ..
-              'roles_cfg instead', role, replicaset, role_name, job, #members,
-              leader == nil and 'unset' or "'" .. tostring(leader) .. "'")
+              "its leader (%s) is not one of them; set the replicaset's " ..
+              "'leader' to an instance that runs %s", role, replicaset,
+              role_name, job, #members,
+              leader == nil and 'unset' or "'" .. tostring(leader) .. "'",
+              role_name)
     end
 
     error("%s: replicaset '%s' runs %s for job '%s' on %d instances under " ..
-          "'%s' failover, which names no leader in the config; list the URIs " ..
-          'in roles_cfg instead', role, replicaset, role_name, job, #members,
-          tostring(failover))
+          "'%s' failover, which names no leader in the config, and pregel " ..
+          'resolves its participants from the config alone; run that role on ' ..
+          "a replicaset of one instance, or use 'replication.failover: " ..
+          "manual' with a 'leader'", role, replicaset, role_name, job,
+          #members, tostring(failover))
 end
 
 --- Every participant of `job` running `role_name`: one per replicaset.
@@ -980,8 +955,9 @@ local function uris_of(role, role_name, job)
     local rv = {}
     for _, found in ipairs(M.instances_of(role, role_name, job)) do
         if found.uri == nil then
-            error("%s: cannot discover the URI of instance '%s', which runs " ..
-                  "%s for job '%s'; set the URIs in roles_cfg instead",
+            error("%s: instance '%s' runs %s for job '%s' and the cluster " ..
+                  'config gives it no address to reach it at; give it an ' ..
+                  "'iproto.listen' entry, or an 'iproto.advertise.peer' one",
                   role, found.instance, role_name, job)
         end
         table.insert(rv, found.uri)
@@ -991,9 +967,12 @@ end
 
 --- Every worker of `job`, from the cluster config.
 --
--- What roles_cfg.workers stands in for. Both roles call it, and both get the
--- same answer from the same document, which is what lets them agree on the
--- sharding without being told it.
+-- The only source of the worker list, and the reason there is no roles_cfg
+-- option for it: both roles call this, and both get the same answer out of the
+-- same document, which is what lets them agree on the sharding without being
+-- told it. A list written per instance was one more thing to keep in step with
+-- `roles`, and a job whose master and workers disagreed about who the workers
+-- are is a job that shards the graph two ways.
 --
 -- @param role the role name of the caller
 -- @param job the job name
@@ -1004,7 +983,9 @@ function M.discover_workers(role, job)
     local uris = uris_of(role, M.WORKER_ROLE, job)
     if #uris == 0 then
         error("%s: no instance in the cluster config runs %s for job '%s'; " ..
-              "set roles_cfg.workers instead", role, M.WORKER_ROLE, job)
+              "a worker is an instance whose 'roles' names %s and whose " ..
+              "roles_cfg for it says \"name: %s\"", role, M.WORKER_ROLE, job,
+              M.WORKER_ROLE, job)
     end
     return uris
 end
@@ -1025,7 +1006,9 @@ function M.discover_master(role, job)
     local uris = uris_of(role, M.MASTER_ROLE, job)
     if #uris == 0 then
         error("%s: no instance in the cluster config runs %s for job '%s'; " ..
-              "set roles_cfg.master instead", role, M.MASTER_ROLE, job)
+              "the master is an instance whose 'roles' names %s and whose " ..
+              "roles_cfg for it says \"name: %s\"", role, M.MASTER_ROLE, job,
+              M.MASTER_ROLE, job)
     end
     if #uris > 1 then
         error("%s: %d instances in the cluster config run %s for job '%s'; " ..

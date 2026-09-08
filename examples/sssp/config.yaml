@@ -38,10 +38,6 @@ groups:
                 name: sssp
                 app: app
                 autostart: true
-                workers:
-                  - '127.0.0.1:3302'
-                  - '127.0.0.1:3303'
-                  - '127.0.0.1:3304'
                 # No app_cfg here on purpose: the app module has no
                 # master_preload, so the master has nothing to configure. Its
                 # autostart sees a worker_preload instead and asks every worker
@@ -57,11 +53,6 @@ groups:
               pregel.roles.worker:
                 name: sssp
                 app: app
-                master: '127.0.0.1:3301'
-                workers:
-                  - '127.0.0.1:3302'
-                  - '127.0.0.1:3303'
-                  - '127.0.0.1:3304'
                 app_cfg:
                   # Paths are relative to examples/sssp/ and resolved by the
                   # app module: an instance's own working directory is under

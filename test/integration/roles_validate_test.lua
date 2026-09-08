@@ -20,10 +20,8 @@ local REMOVE = setmetatable({}, {__tostring = function() return '<remove>' end})
 
 local function worker_cfg(extra)
     local cfg = {
-        name    = 'job',
-        app     = APP,
-        master  = 'unix/:./master.iproto',
-        workers = {'unix/:./worker1.iproto'},
+        name = 'job',
+        app  = APP,
     }
     for key, value in pairs(extra or {}) do
         if value == REMOVE then
@@ -50,22 +48,33 @@ g.test_a_full_worker_config_is_accepted = function()
     }))
 end
 
--- The credentials moved to the `credentials` section of the cluster config, so
--- a roles_cfg that still spells them is a config written for the old shape and
--- must say so rather than be ignored.
-g.test_the_credentials_are_not_roles_cfg_options = function()
+-- The credentials moved to the `credentials` section of the cluster config and
+-- the topology to `roles`, so a roles_cfg that still spells either is a config
+-- written for the old shape and must say so rather than be ignored. An
+-- operator upgrading meets this message, so it is worth a test of its own.
+g.test_the_options_that_moved_to_the_cluster_config_are_refused = function()
     assert_refused(worker_role, worker_cfg({user = 'pregel'}),
                    "pregel.roles.worker: unknown option 'user'")
     assert_refused(worker_role, worker_cfg({password = 'secret'}),
                    "pregel.roles.worker: unknown option 'password'")
     assert_refused(master_role, {name = 'job', app = APP, user = 'pregel'},
                    "pregel.roles.master: unknown option 'user'")
+    assert_refused(worker_role,
+                   worker_cfg({workers = {'unix/:./worker1.iproto'}}),
+                   "pregel.roles.worker: unknown option 'workers'")
+    assert_refused(worker_role,
+                   worker_cfg({master = 'unix/:./master.iproto'}),
+                   "pregel.roles.worker: unknown option 'master'")
+    assert_refused(master_role,
+                   {name = 'job', app = APP, workers = {'x:1'}},
+                   "pregel.roles.master: unknown option 'workers'")
 end
 
-g.test_the_uri_options_are_optional = function()
-    -- Left out, they come from the cluster config instead; validate() cannot
-    -- resolve them (there is no cluster here) and must not pretend otherwise.
-    worker_role.validate(worker_cfg({master = REMOVE, workers = REMOVE}))
+g.test_a_bare_name_and_app_are_a_whole_config = function()
+    -- Everything else has a default or comes from the cluster config, and
+    -- validate() must not reach for the cluster: it runs before anything is
+    -- built, and the tests here have no cluster at all.
+    worker_role.validate({name = 'job', app = APP})
     master_role.validate({name = 'job', app = APP})
 end
 
@@ -85,8 +94,9 @@ g.test_an_unknown_option_is_refused = function()
     assert_refused(worker_role, worker_cfg({poolsize = 10}),
                    "pregel.roles.worker: unknown option 'poolsize'")
     -- ... including one that belongs to the other role.
-    assert_refused(master_role, {name = 'job', app = APP, master = 'x:1'},
-                   "pregel.roles.master: unknown option 'master'")
+    assert_refused(master_role,
+                   {name = 'job', app = APP, queue_engine = 'space'},
+                   "pregel.roles.master: unknown option 'queue_engine'")
     assert_refused(worker_role, worker_cfg({autostart = true}),
                    "pregel.roles.worker: unknown option 'autostart'")
 end
@@ -108,15 +118,6 @@ g.test_option_types_are_checked = function()
                    'boolean')
     assert_refused(master_role, {name = 'job', app = APP, autostart = 'yes'},
                    "pregel.roles.master: option 'autostart' must be boolean")
-end
-
-g.test_the_worker_list_must_be_an_array_of_uris = function()
-    assert_refused(worker_role, worker_cfg({workers = {}}),
-                   "option 'workers' must be a non-empty array of URIs")
-    assert_refused(worker_role, worker_cfg({workers = {a = 'x:1'}}),
-                   "option 'workers' must be a non-empty array of URIs")
-    assert_refused(worker_role, worker_cfg({workers = {'x:1', 42}}),
-                   "option 'workers' must be an array of non-empty strings")
 end
 
 g.test_a_missing_app_module_is_reported_at_validation = function()
@@ -143,11 +144,10 @@ g.test_the_app_module_must_export_what_the_role_needs = function()
     package.loaded['test.roles_fake_app'] = nil
 end
 
--- Every one of these was accepted. An empty name produced spaces called
--- 'data_' and a job logged as ''; an empty master got as far as a net.box URI
--- error inside apply; an empty app reached package.searchpath and came back
--- with 'bad argument #1 to searchpath (string expected, got nil)', which names
--- neither the role nor the option.
+-- Both of these were accepted. An empty name produced spaces called 'data_'
+-- and a job logged as ''; an empty app reached package.searchpath and came
+-- back with 'bad argument #1 to searchpath (string expected, got nil)', which
+-- names neither the role nor the option.
 g.test_the_identifier_options_must_not_be_empty = function()
     assert_refused(worker_role, worker_cfg({name = ''}),
                    "pregel.roles.worker: option 'name' must be a non-empty " ..
@@ -155,9 +155,6 @@ g.test_the_identifier_options_must_not_be_empty = function()
     assert_refused(worker_role, worker_cfg({app = ''}),
                    "pregel.roles.worker: option 'app' must be a non-empty " ..
                    'string')
-    assert_refused(worker_role, worker_cfg({master = ''}),
-                   "pregel.roles.worker: option 'master' must be a " ..
-                   'non-empty string')
     assert_refused(master_role, {name = '', app = APP},
                    "pregel.roles.master: option 'name' must be a non-empty " ..
                    'string')

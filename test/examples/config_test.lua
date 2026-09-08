@@ -177,14 +177,16 @@ g.test_the_credentials_grant_what_pregel_calls = function()
     end
 end
 
--- The options the roles used to take and no longer do. An example still
--- spelling one of them does not start at all: an unknown key in roles_cfg is
--- refused by name, which is the whole point of refusing it.
-g.test_no_roles_cfg_spells_a_login = function()
+-- The options the roles used to take and no longer do: the credentials come
+-- from the `credentials` section and the participants from `roles`. An example
+-- still spelling one of them does not start at all -- an unknown key in
+-- roles_cfg is refused by name, which is the whole point of refusing it.
+g.test_no_roles_cfg_spells_a_login_or_a_topology = function()
     for _, example in ipairs(examples()) do
         for _, instance in ipairs(instances_of(config_of(example))) do
             for role, cfg in pairs(instance.roles_cfg) do
-                for _, key in ipairs({'user', 'password'}) do
+                for _, key in ipairs({'user', 'password', 'workers',
+                                      'master'}) do
                     t.assert_equals(cfg[key], nil,
                                     example .. ': ' .. instance.name .. ' ' ..
                                     'still spells ' .. key .. ' in the ' ..

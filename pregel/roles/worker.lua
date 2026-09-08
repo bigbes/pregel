@@ -5,10 +5,6 @@
 --     pregel.roles.worker:
 --       name: maxvalue                 # job name, required
 --       app: myapp.pregel              # Lua module name, required
---       master: '127.0.0.1:3301'       # the master's net.box URI
---       workers:                       # every worker's net.box URI,
---         - '127.0.0.1:3302'           # this instance included
---         - '127.0.0.1:3303'
 --       pool_size: 1000
 --       delayed_push: false
 --       squash_only: false
@@ -17,14 +13,19 @@
 --         graph: '../../data/graph.txt'
 --         threshold: 5
 --
--- `master` and `workers` may both be left out: the role then reads the cluster
--- config and looks for instances that run pregel.roles.worker (or
--- pregel.roles.master) for a job of this `name`. A *replicaset* is one
--- participant, not each of its instances -- `roles:` is written at replicaset
--- scope, so every replica carries the role and none of them can run it -- so
--- discovery takes the one instance per replicaset that the config says will be
--- read-write. Under election or supervised failover the config names nobody,
--- and the role asks for an explicit list instead of guessing.
+-- Who the other participants are is not configured here at all: the role reads
+-- the cluster config and takes every instance that runs pregel.roles.worker
+-- (or pregel.roles.master) for a job of this `name`. The config says who is in
+-- the job exactly once -- in `roles` -- and every participant computes the same
+-- list from it, which is what makes them agree on the sharding.
+--
+-- A *replicaset* is one participant, not each of its instances: `roles:` is
+-- written at replicaset scope, so every replica carries the role and none of
+-- them can run it. Discovery takes the one instance per replicaset that the
+-- config says will be read-write -- the only one carrying the role, the `rw`
+-- one under `replication.failover: off`, or the replicaset's `leader` under
+-- `manual`. Under election or supervised failover the config names nobody and
+-- the role says so rather than guessing.
 --
 -- That is resolved once, by the apply that creates the job: adding a worker to
 -- the cluster does not move a running one, and cannot: see the note on
@@ -98,15 +99,6 @@ end
 local ROLE = 'pregel.roles.worker'
 
 local SPEC = common.spec({
-    master       = {
-        types = {string = true},
-        check = function(v)
-            if v == '' then
-                return false, 'a non-empty string'
-            end
-            return true
-        end,
-    },
     delayed_push = {types = {boolean = true}},
     squash_only  = {types = {boolean = true}},
     queue_engine = {
@@ -186,8 +178,8 @@ local function apply(cfg)
 
     -- Resolved once, here, and not re-read on a later apply: a running job
     -- cannot change its worker list, which is what the check above says.
-    local workers = cfg.workers or common.discover_workers(ROLE, cfg.name)
-    local master_uri = cfg.master or common.discover_master(ROLE, cfg.name)
+    local workers = common.discover_workers(ROLE, cfg.name)
+    local master_uri = common.discover_master(ROLE, cfg.name)
     -- Who this instance connects to its peers as: the cluster config's own
     -- credentials, not a login repeated in every instance's roles_cfg.
     local user, password = common.pregel_user(ROLE)

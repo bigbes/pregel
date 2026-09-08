@@ -5,16 +5,13 @@
 --     pregel.roles.master:
 --       name: maxvalue                 # job name, required
 --       app: myapp.pregel              # Lua module name, required
---       workers:                       # every worker's net.box URI
---         - '127.0.0.1:3302'
---         - '127.0.0.1:3303'
 --       pool_size: 1000
 --       autostart: false               # run the job as soon as it can
 --       app_cfg:                       # opaque, handed to the app module
 --         graph: '../../data/graph.txt'
 --
--- `workers` may be left out: the role then reads the cluster config and looks
--- for instances running pregel.roles.worker for a job of this `name`. A
+-- The workers are not configured here: the role reads the cluster config and
+-- takes every instance running pregel.roles.worker for a job of this `name`. A
 -- replicaset is one worker, not each of its instances, and which instance that
 -- is comes from the config -- see pregel/roles/worker.lua, which resolves the
 -- same list the same way, which is what makes the two agree on the sharding.
@@ -237,7 +234,7 @@ local function apply(cfg)
     local app = common.load_app(ROLE, cfg.app, {'obtain_name'})
 
     -- Resolved once, here: a running job cannot change its worker list.
-    local workers = cfg.workers or common.discover_workers(ROLE, cfg.name)
+    local workers = common.discover_workers(ROLE, cfg.name)
     -- Who this instance connects to its workers as: the cluster config's own
     -- credentials, not a login repeated in every instance's roles_cfg.
     local user, password = common.pregel_user(ROLE)

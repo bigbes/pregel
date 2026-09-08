@@ -16,6 +16,25 @@ local g = t.group('integration.roles')
 
 local MAX_VALUE = helper.VERTEX_COUNT
 
+--- Reload `instance`, expecting it to fail, and return the message.
+--
+-- luatest wraps what the reload raised in a {class = 'LuatestErrorWrapper'}
+-- table, and unwraps it in its own assertions but not for a plain pcall --
+-- where tostring() then answers 'table: 0x...', a string that contains no
+-- substring anybody meant to assert and fails every check silently for the
+-- wrong reason.
+local function reload_error(cluster, instance)
+    local ok, err = pcall(helper.reload, cluster, instance)
+    t.assert_equals(ok, false, 'the reload was expected to fail')
+    if type(err) == 'table' and err.class == 'LuatestErrorWrapper' then
+        err = err.error
+    end
+    if type(err) == 'table' and err.message ~= nil then
+        return tostring(err.message)
+    end
+    return tostring(err)
+end
+
 --- Assert that every vertex of the graph ended up holding the largest value.
 local function assert_max_value_everywhere(cluster, opts)
     local vertices = helper.collect_vertices(cluster, opts)
@@ -162,14 +181,25 @@ end
 -- 'pregel.worker.deliver' is not defined", and the master went to 'failed'
 -- 0 ms after reporting every peer reached, with no alert and nothing retrying.
 --
--- The window is raced for in real life; here it is held open by starting with
--- the role off worker1 and adding it back by config:reload() afterwards.
+-- The window is raced for in real life; here it is held open by starting the
+-- rest of the cluster from a config that gives worker1 the role -- so the
+-- master discovers it as a participant -- and then bringing worker1 itself up
+-- from a config that does not, so it listens without ever becoming a worker.
+-- Dropping the role from the config the whole cluster starts with would not do
+-- it any more: an instance with no role is not a participant of the job at
+-- all, and the master would simply run over the other two.
 g.test_a_worker_whose_role_applies_late_still_runs_the_job = function()
-    local c = Cluster:new(helper.config({autostart = true, drop_worker = 1}),
+    local c = Cluster:new(helper.config({autostart = true}),
                           helper.server_opts)
-    c:start()
 
     local worker1 = helper.worker_name(1)
+    helper.start_without(c, worker1)
+
+    -- worker1 comes up with the credentials and without the role: the config
+    -- on disk no longer gives it one, and the master has already resolved its
+    -- participants from the config that did.
+    c:sync(helper.config({autostart = true, drop_worker = 1}))
+    c:start_instance(worker1)
 
     -- Waiting, visibly, and saying which peer and why -- the same contract as
     -- a peer that is simply down.
@@ -238,9 +268,13 @@ end
 -- there meant one instance that was down killed every other one in the cluster
 -- 30 s later, and nothing retried afterwards.
 g.test_a_peer_that_is_down_does_not_stop_the_cluster = function()
-    local c = Cluster:new(helper.config({ghost_worker = true}),
+    -- A fourth worker the config gives the role to and nothing starts. The
+    -- participants come from the config now, so this is the only way a job can
+    -- have one that is not there -- and it is the ordinary case during a
+    -- cluster start rather than an exotic one.
+    local c = Cluster:new(helper.config({worker_count = 4}),
                           helper.server_opts)
-    c:start()
+    helper.start_without(c, helper.worker_name(4))
 
     local worker1 = helper.worker_name(1)
     t.assert_equals(helper.worker_status(c, worker1).state, 'connecting',
@@ -250,7 +284,8 @@ g.test_a_peer_that_is_down_does_not_stop_the_cluster = function()
     t.helpers.retrying({timeout = 30, delay = 0.5}, function()
         local status = helper.worker_status(c, worker1)
         t.assert_equals(status.state, 'connecting')
-        t.assert_str_contains(tostring(status.error), 'ghost.iproto')
+        t.assert_str_contains(tostring(status.error),
+                              helper.worker_name(4) .. '.iproto')
         t.assert_str_contains(tostring(status.error), 'No such file')
     end)
 
@@ -270,22 +305,24 @@ end
 -- raising: measured on 3.9 and on EE 3.7, a role's namespace accepts
 -- type='warn' only, and raising from apply() at startup exits the process.
 g.test_giving_up_on_a_peer_is_an_alert_and_not_a_dead_instance = function()
-    local c = Cluster:new(helper.config({ghost_worker = true,
+    local c = Cluster:new(helper.config({worker_count = 4,
                                          connect_timeout = 1}),
                           helper.server_opts)
-    c:start()
+    helper.start_without(c, helper.worker_name(4))
 
     local worker1 = helper.worker_name(1)
     local status = helper.wait_role_state(c, function(cluster)
         return helper.worker_status(cluster, worker1)
     end, 'failed', 30)
-    t.assert_str_contains(tostring(status.error), 'ghost.iproto')
+    t.assert_str_contains(tostring(status.error),
+                          helper.worker_name(4) .. '.iproto')
 
     local info = helper.config_info(c, worker1)
     t.assert_equals(info.status, 'ready')
     local said = false
     for _, alert in ipairs(info.alerts) do
-        if alert.message:find('ghost.iproto', 1, true) ~= nil then
+        if alert.message:find(helper.worker_name(4) .. '.iproto', 1, true)
+           ~= nil then
             said = true
             t.assert_equals(alert.type, 'warn')
         end
@@ -376,10 +413,11 @@ end
 -------------------------------------------------------------------------------
 
 g.test_the_roles_find_each_other_in_the_cluster_config = function()
-    local config = helper.config({autostart = true, discovery = true})
+    local config = helper.config({autostart = true})
 
-    -- Guard against the test passing for the wrong reason: with the URIs
-    -- written out this would prove nothing about discovery.
+    -- Guard against the test passing for the wrong reason: a roles_cfg with
+    -- the URIs written out would prove nothing about discovery, and the whole
+    -- suite runs against this one helper.
     local instances = config.groups.pregel.replicasets
     for _, replicaset in pairs(instances) do
         for name, instance in pairs(replicaset.instances) do
@@ -417,7 +455,7 @@ end
 -- the job would finish either way (pregel-9vt, M6). What is under test is what
 -- peer_uri returns, so that is what is read.
 g.test_discovery_does_not_borrow_the_replication_login = function()
-    local c = Cluster:new(helper.config({autostart = true, discovery = true}),
+    local c = Cluster:new(helper.config({autostart = true}),
                           helper.server_opts)
     c:start()
 
@@ -436,14 +474,56 @@ g.test_discovery_does_not_borrow_the_replication_login = function()
     assert_max_value_everywhere(c)
 end
 
+-- Discovery is the only source of the participants now, so "found nobody" is a
+-- configuration error rather than a reason to fall back to a list -- and the
+-- message is all the operator gets. The usual cause is a typo in one
+-- instance's `name`, which is what this builds: the master runs a job of a
+-- different name, so from the worker's side no instance runs the master role
+-- for its own job.
+--
+-- Driven through a reload of an instance whose role is not running, because
+-- apply() raises and an error raised at startup exits the process.
+g.test_no_master_for_the_job_says_what_to_write = function()
+    local c = Cluster:new(helper.config({}), helper.server_opts)
+    c:start()
+
+    local worker1 = helper.worker_name(1)
+    c:sync(helper.config({drop_worker = 1}))
+    helper.reload(c, worker1)
+
+    c:sync(helper.config({master_job = 'other'}))
+    local err = reload_error(c, worker1)
+    t.assert_str_contains(err,
+                          "pregel.roles.worker: no instance in the cluster " ..
+                          "config runs pregel.roles.master for job 'maxvalue'")
+    -- What to fix, not just what is wrong.
+    t.assert_str_contains(err, "whose 'roles' names pregel.roles.master")
+    t.assert_str_contains(err, 'name: maxvalue')
+end
+
+-- The same from the master's side, where the whole worker list is missing.
+g.test_no_worker_for_the_job_says_what_to_write = function()
+    local c = Cluster:new(helper.config({}), helper.server_opts)
+    c:start()
+
+    c:sync(helper.config({drop_master = true}))
+    helper.reload(c, helper.MASTER_NAME)
+
+    c:sync(helper.config({worker_job = 'other'}))
+    local err = reload_error(c, helper.MASTER_NAME)
+    t.assert_str_contains(err,
+                          "pregel.roles.master: no instance in the cluster " ..
+                          "config runs pregel.roles.worker for job 'maxvalue'")
+    t.assert_str_contains(err, "whose 'roles' names pregel.roles.worker")
+end
+
 -- A replicaset written as `roles: [pregel.roles.worker]` puts the role on the
 -- replica too, and discovery used to count the replica as a second worker of
 -- the job -- so every instance tried to connect to an address that would never
 -- serve pregel, and the whole cluster died 30 s later. One worker per
 -- replicaset, addressed through the leader.
 g.test_discovery_takes_one_worker_per_replicaset = function()
-    local config = helper.config({autostart = true, discovery = true,
-                                  replica_worker = 1})
+    local config = helper.config({autostart = true, replica_worker = 1})
     local c = Cluster:new(config, helper.server_opts)
     c:start()
 
@@ -468,7 +548,7 @@ end
 -- so. Nothing covered this at all: check_writable could be deleted from both
 -- roles and the suite stayed green.
 g.test_the_role_is_inert_on_a_read_only_instance = function()
-    local c = Cluster:new(helper.config({autostart = true, discovery = true,
+    local c = Cluster:new(helper.config({autostart = true,
                                          replica_worker = 1}),
                           helper.server_opts)
     c:start()

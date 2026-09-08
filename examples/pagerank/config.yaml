@@ -39,10 +39,6 @@ groups:
                 name: pagerank
                 app: app
                 autostart: true
-                workers:
-                  - '127.0.0.1:3302'
-                  - '127.0.0.1:3303'
-                  - '127.0.0.1:3304'
                 app_cfg: &app_cfg
                   # Paths are relative to examples/pagerank/ and resolved by
                   # the app module: an instance's own working directory is
@@ -62,11 +58,6 @@ groups:
               pregel.roles.worker:
                 name: pagerank
                 app: app
-                master: '127.0.0.1:3301'
-                workers:
-                  - '127.0.0.1:3302'
-                  - '127.0.0.1:3303'
-                  - '127.0.0.1:3304'
                 # The same table as the master's: the paths are ignored here
                 # (this app has no worker_preload) and damping/iterations are
                 # ignored there. One anchor beats two lists that can drift.

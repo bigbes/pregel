@@ -136,12 +136,6 @@ end
 
 helper.MASTER_NAME = 'master'
 
---- A worker URI nothing ever listens on.
---
--- Adding it to roles_cfg.workers is how a test says "one participant of this
--- job is down", which is the case that used to kill every other instance.
-helper.GHOST_URI = 'unix/:./ghost.iproto'
-
 -------------------------------------------------------------------------------
 -- The config
 -------------------------------------------------------------------------------
@@ -150,15 +144,16 @@ helper.GHOST_URI = 'unix/:./ghost.iproto'
 --
 -- opts.worker_count -- default helper.WORKER_COUNT
 -- opts.job          -- job name, default helper.JOB
+-- opts.master_job   -- the master's job name, when it is to differ from the
+--                      workers': a job's participants are the instances that
+--                      name it, so this is how a test says "nobody runs the
+--                      other half of this job"
+-- opts.worker_job   -- the same for the workers
 -- opts.autostart    -- the master role runs the job by itself (default false)
--- opts.discovery    -- leave `workers`/`master` out of roles_cfg, so the roles
---                      have to find each other in the cluster config
 -- opts.pool_size    -- roles_cfg.pool_size for the workers
 -- opts.drop_worker  -- index of a worker whose roles list is left empty, as if
 --                      the role had been taken off that instance
 -- opts.drop_master  -- the same for the master instance
--- opts.ghost_worker -- add helper.GHOST_URI to every worker list, so the job
---                      has one participant that is not there
 -- opts.connect_timeout -- roles_cfg.connect_timeout for both roles
 -- opts.replica_worker -- index of a worker whose replicaset gets a second
 --                        instance ('<name>r') carrying the same role with the
@@ -203,14 +198,6 @@ function helper.config(opts)
         }})
     end
 
-    local worker_uris = {}
-    for i = 1, count do
-        worker_uris[i] = helper.uri(helper.worker_name(i))
-    end
-    if opts.ghost_worker then
-        table.insert(worker_uris, helper.GHOST_URI)
-    end
-
     local function base_cfg()
         return {
             name            = job,
@@ -221,9 +208,7 @@ function helper.config(opts)
 
     local master_cfg = base_cfg()
     master_cfg.autostart = opts.autostart or false
-    if not opts.discovery then
-        master_cfg.workers = worker_uris
-    end
+    master_cfg.name      = opts.master_job or job
 
     builder:use_group('pregel')
     builder:use_replicaset('r_master')
@@ -239,10 +224,7 @@ function helper.config(opts)
     for i = 1, count do
         local worker_cfg = base_cfg()
         worker_cfg.pool_size = opts.pool_size
-        if not opts.discovery then
-            worker_cfg.workers = worker_uris
-            worker_cfg.master  = helper.uri(helper.MASTER_NAME)
-        end
+        worker_cfg.name      = opts.worker_job or job
         local roles     = {helper.WORKER_ROLE}
         local roles_cfg = {[helper.WORKER_ROLE] = worker_cfg}
         if opts.drop_worker == i then
@@ -277,6 +259,34 @@ end
 -------------------------------------------------------------------------------
 -- Driving and inspecting a running cluster
 -------------------------------------------------------------------------------
+
+--- Start every instance of the cluster except `missing`.
+--
+-- How a test says "one participant of this job is down". There is no URI to
+-- invent for it any more: the participants are exactly the instances the
+-- cluster config gives the role to, so a peer that is not there is an instance
+-- that was never started -- which is also closer to the case this is about,
+-- since tt forks the instances of a cluster in whatever order it likes and one
+-- of them may be minutes behind the rest.
+--
+-- Cluster:start() would wait for every instance including that one, so the
+-- servers are started one by one. `each` walks the cluster's own list, so an
+-- instance added to the config is started without this having to know about it.
+--
+-- @param cluster the luatest cluster
+-- @param missing the instance name not to start
+function helper.start_without(cluster, missing)
+    local started = {}
+    cluster:each(function(server)
+        if server.alias ~= missing then
+            server:start({wait_until_ready = false})
+            table.insert(started, server)
+        end
+    end)
+    for _, server in ipairs(started) do
+        server:wait_until_ready()
+    end
+end
 
 --- Reload the config on one instance, letting the error through.
 function helper.reload(cluster, instance_name)

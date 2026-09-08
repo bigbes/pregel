@@ -107,11 +107,6 @@ function helper.config(opts)
     })
     builder:set_global_option('wal.mode', 'none')
 
-    local worker_uris = {}
-    for i = 1, count do
-        worker_uris[i] = helper.uri(helper.worker_name(i))
-    end
-
     local function base_cfg()
         return {
             name    = job,
@@ -122,7 +117,6 @@ function helper.config(opts)
 
     local master_cfg = base_cfg()
     master_cfg.autostart = opts.autostart ~= false
-    master_cfg.workers   = worker_uris
 
     builder:use_group('pregel')
     builder:use_replicaset('r_master')
@@ -133,8 +127,6 @@ function helper.config(opts)
 
     for i = 1, count do
         local worker_cfg = base_cfg()
-        worker_cfg.workers     = worker_uris
-        worker_cfg.master      = helper.uri(helper.MASTER_NAME)
         worker_cfg.squash_only = opts.squash_only
         builder:use_replicaset('r_worker' .. i)
         builder:add_instance(helper.worker_name(i), {

@@ -77,7 +77,6 @@ end)
 g.test_discovered_peers_keep_the_listener_transport = function()
     local c = Cluster:new(helper.config({
         autostart = true,
-        discovery = true,
         ssl       = {cert = ssl.cert, key = ssl.key},
     }), helper.server_opts)
     c:start()
