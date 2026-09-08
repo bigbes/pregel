@@ -1,15 +1,13 @@
-<a href="http://tarantool.org">
-	<img src="https://avatars2.githubusercontent.com/u/2344919?v=2&s=250" align="right">
-</a>
-<a href="https://travis-ci.org/tarantool/pregel">
-	<img src="https://travis-ci.org/tarantool/pregel.png?branch=master" align="right">
-</a>
+# Pregel on Tarantool
 
-# Large scale graph processing based on Tarantool
-
-Based on [Pregel whitepaper](http://kowshik.github.io/JPregel/pregel_paper.pdf).
-
-As 'abstract' says:
+Large-scale graph processing on Tarantool 3, in pure Lua. A graph is sharded
+across a set of worker instances by vertex name; a master instance drives a
+loop of supersteps, in each of which every active vertex runs a compute
+function, reads the messages sent to it in the previous superstep and sends
+messages of its own. The run ends when no vertex is active and no message is in
+flight. The model is the one described in the
+[Pregel paper](http://kowshik.github.io/JPregel/pregel_paper.pdf); the API it
+grew from is Apache Giraph's.
 
 > Many practical computing problems concern large graphs. Standard examples
 > include the Web graph and various social networks. The scale of these
@@ -27,272 +25,744 @@ As 'abstract' says:
 > The result is a framework for processing large graphs that is expressive
 > and easy to program.
 
-It's API was inspired by Apache Giraph.
+## Requirements and installation
 
-## Configuration options
+Tarantool 3.x, Community Edition. There is no C code and no external Lua
+dependency; luatest and luacheck are needed only to run the test suite, and
+`make deps` installs them.
 
-### Common configuration options (for master and worker)
+Tarantool Enterprise adds two things, both of them in the Avro module and
+neither of them required: `compress.zlib` turns the `deflate` container-file
+codec from valid-but-uncompressed stored blocks into real compression, and
+`compress.zstd` is what makes the `zstandard` codec available at all. Reading a
+`deflate` file never needs either — the inflater is pure Lua.
 
-* `workers` - list of all [URIs](https://tarantool.org/doc/book/configuration/index.html#uri)
-	with worker (`table` of `string`s). Neccesary to define
-
-	Example:
-
-	``` lua
-	local workers = {
-		'myhost1:myport1',
-		'myhost1:myport2',
-		'myhost2:myport3',
-	}
-	-- or, for simple generation:
-	local fun = require('fun')
-	local function generate_worker_uris(cnt)
-		cnt = cnt or 8
-		return fun.range(cnt):map(function(k)
-			return 'myhost1:' .. tostring(3301 + k)
-		end):chain(fun.range(cnt):map(function(k)
-			return 'myhost2:' .. tostring(3301 + k)
-		end)):chain(fun.range(cnt):map(function(k)
-			return 'myhost3:' .. tostring(3301 + k)
-		end)):totable()
-	end
-	local workers = generate_worker_uris(cnt)
-	```
-
-* `pool_size` - Size of outgoing pool messages (`number`).
-* `obtain_name` - Callback for obtaining name of vertex from data.
-	(`function (value) -> string`). Necessary to define
-
-	Example:
-	``` lua
-	local function obtain_name(value)
-		return value.name
-	end
-	-- or
-	local function obtain_name(value)
-		return ('%s:%s'):format(value.part1, value.part2)
-	end
-	```
-
-### Preloading configuration options
-
-* `worker_preload` - function to preload data to nodes from all workers.
-	excludes `master_preload`
-
-	(`function (worker, opts) -> (function(self, idx, cnt) -> nil)`)
-
-* `master_preload` - function to preload data to nodes from master only
-	excludes `worker_preload`
-
-	(`function (master, opts) -> (function(self) -> nil)`)
-
-* `preload_args` - arguments, that must be passed to loader
-
-Let's start with examples of worker/master loader creation:
-
-``` lua
-local ploader = require('pregel.loader')
-
-local function worker_loader(worker, opts)
-	local function loader(self, worker_idx, workers_count)
-	-- loading process
-	end
-	return ploader.new(worker, loader)
-end
-
-local function master_loader(master, opts)
-	local function loader(self)
-	-- loading process
-	end
-	return ploader.new(master, loader)
-end
-```
-
-And then you'll provide `worker_loader`/`master_loader` as parameters in the
-options table.
-
-#### API for loader
-
-* `loader:store_vertex(vertex)` - arbitrary vertex object
-* `loader:store_edge(src, dest, value)` - store direct edge, that connects
-	vertices wtih names `dest` and `value`
-* `loader:store_edges_batch(edge_list)` - store a number of edges
-* `loader:store_vertex_edges(vertex, edge_list)` - combination of `store_vertex`
-	and `store_edges_batch`
-* `loader:flush()` - send all cached vertex
-
-### Worker configuration options
-
-* `worker_context` - set worker context (common object for all vertices, that
-	located on current instance of worker and can be accessed/modified by vertex).
-* `master` - [URI](https://tarantool.org/doc/book/configuration/index.html#uri)
-	of master node
-* `combiner` - combine messages, that needed to be sent to vertex
-* `compute` - compute function
-
-## Developing
-
-Simple example is located in `example` folder. It finds maximum value of
-vertices by communication:
-* first step, everyone sends message with their values to their neighbor
-* if value, that vertice receive, then it, again, informs all neighbours that
-	it got value greater, than it've got before.
-* everything ends, when no message sent and every vertice is halted (everyone
-	got max before)
-
-For more usages of Pregel data model you can read [paper](http://kowshik.github.io/JPregel/pregel_paper.pdf)
-or read on it's [site](http://kowshik.github.io/JPregel/).
-
-For example:
-* Shortest Path:
-	- http://kowshik.github.io/JPregel/developers.html#shortestpaths
-	- https://cwiki.apache.org/confluence/display/GIRAPH/Shortest+Paths+Example
-* PageRank Algorithm
-	- http://kowshik.github.io/JPregel/developers.html#pagerank
-	- http://giraph.apache.org/pagerank.html
-* e.t.c.
-
-In future it's planned to write down more examples/algorithms.
-
-Also, it's preferably to use tarantool-pregel in conjuction with [Torch](http://torch.ch/).
-
-> Torch is a scientific computing framework with wide support for machine
-> learning algorithms that puts GPUs first. It is easy to use and efficient,
-> thanks to an easy and fast scripting language, LuaJIT.
-
-But you shouldn't use parallelization (as it'll break Tarantool evloop) or GPU
-(since it doesn't integrated with our Fibers and it'll stop Tarantool)
-
-### Master node
-
-Master node is something that orchestrate everything. It told workers to do
-something, it will have access to all results in the end, that workers will
-decide to give it.
-
-* `master:wait_up()` - wait while all workers are up and running.
-* `master:start()` - start task (compute everything)
-* `master:preload()` - preload all data from master
-* `master:preload_on_workers()` - preload all data from workers
-* `master:add_aggregator(name, options)` - add agreggator.
-
-	Possible options are:
-	* `default` - default value for aggregator. Can be anything.
-	* `merge` - Add new value to aggregator. Must be commutative and associative.
-
-	  Example:
-		```
-		local function merge(old, new)
-			return old + new
-		end
-		```
-
-* `master:save_snapshot()` - tell workers to save snapshot.
-
-Typical master initialization is like that:
+Install the rock into a `tt` environment's rocks tree:
 
 ```
+tt rocks make --tree /path/to/env/.rocks pregel-scm-1.rockspec
+```
+
+`tt rocks make pregel-scm-1.rockspec` does the same into the current
+directory's `.rocks`. Alternatively point `LUA_PATH` at a checkout, which is
+what the tests do:
+
+```
+LUA_PATH="$PWD/?.lua;$PWD/?/init.lua;;" tarantool your-script.lua
+```
+
+## Quick start: the cluster roles
+
+`pregel.roles.master` and `pregel.roles.worker` are Tarantool 3 roles, so a
+whole job is a cluster config plus one Lua module. Nothing is created by hand:
+the roles applier builds the master and the workers from `roles_cfg`.
+
+The app module is what makes the job this job rather than another one. Both
+roles `require()` it by the name in `roles_cfg.app` and read the same fields
+out of it — the worker needs `compute`, the master does not; both need
+`obtain_name`.
+
+```lua
+-- maxvalue.lua: every vertex ends up holding the largest value in the graph.
+local loader = require('pregel.loader')
+
+local VERTEX_COUNT = 12
+local app = {}
+
+local function vertex(i)
+    return {
+        name  = string.format('v%03d', i),
+        value = ((i * 7 - 1) % VERTEX_COUNT) + 1,
+    }
+end
+
+--- The name pregel knows a vertex value by. Required by both roles.
+function app.obtain_name(value)
+    return value.name
+end
+
+--- Run once per vertex per superstep. Required by the worker role.
+function app.compute(self)
+    local value = self:get_value().value
+    local best = value
+    for _, msg in self:pairs_messages() do
+        if msg > best then best = msg end
+    end
+    if self:get_superstep() == 1 or best > value then
+        self:set_value({name = self:get_name(), value = best})
+        for _, dest in self:pairs_edges() do
+            self:send_message(dest, best)
+        end
+    end
+    self:set_aggregation('max_seen', best)
+    self:vote_halt(true)
+end
+
+--- Optional: fold several messages for one receiver into one.
+function app.combiner(a, b)
+    return a > b and a or b
+end
+
+--- Optional, and declared on both sides: a worker reports its copy of an
+--- aggregator to the master by name, so the master must know the same name.
+app.aggregators = {
+    max_seen = {
+        default = 0,
+        reduce  = function(old, new) return new > old and new or old end,
+    },
+}
+
+--- Optional: push the graph out from the master.
+function app.master_preload(instance)
+    return loader.new(instance, function(self)
+        for i = 1, VERTEX_COUNT do
+            self:store_vertex(vertex(i))
+        end
+        for i = 1, VERTEX_COUNT do
+            self:store_edge(vertex(i).name,
+                            vertex((i % VERTEX_COUNT) + 1).name, 1)
+        end
+        self:flush()
+    end)
+end
+
+return app
+```
+
+The cluster config below runs that module over one master and three workers:
+
+```yaml
+credentials:
+  users:
+    replicator:
+      password: 'replicator-secret'
+      roles: [replication]
+    # The user pregel connects to its own peers as. Every message between a
+    # master and a worker is a conn:call() on one of these four names, so this
+    # grant is the whole privilege story -- the library asks for no universe
+    # grant and uses no conn:eval().
+    pregel:
+      password: 'pregel-secret'
+      privileges:
+        - permissions: [execute]
+          lua_call:
+            - pregel.worker.deliver
+            - pregel.worker.deliver_batch
+            - pregel.worker.wait
+            - pregel.master.deliver
+
+iproto:
+  advertise:
+    peer:
+      login: replicator
+
+# One instance per replicaset: every instance is the read-write leader of its
+# own, so the workers are shards rather than copies of each other. Both roles
+# refuse to apply on a read-only instance.
+replication:
+  failover: off
+
+groups:
+  pregel:
+    replicasets:
+      r-master:
+        instances:
+          master:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3301'
+            roles: [pregel.roles.master]
+            roles_cfg:
+              pregel.roles.master:
+                name: maxvalue          # job name
+                app: maxvalue           # the Lua module above
+                autostart: true         # run the job as soon as it can
+                user: pregel
+                password: pregel-secret
+      r-worker1:
+        instances:
+          worker1:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3302'
+            roles: [pregel.roles.worker]
+            roles_cfg: &worker_cfg
+              pregel.roles.worker:
+                name: maxvalue
+                app: maxvalue
+                user: pregel
+                password: pregel-secret
+      r-worker2:
+        instances:
+          worker2:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3303'
+            roles: [pregel.roles.worker]
+            roles_cfg: *worker_cfg
+      r-worker3:
+        instances:
+          worker3:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3304'
+            roles: [pregel.roles.worker]
+            roles_cfg: *worker_cfg
+```
+
+Neither `workers` nor `master` appears in any `roles_cfg` here. Both roles fall
+back to reading the cluster config and taking every instance that runs the
+other role for a job of this `name`, so the config says who the participants
+are exactly once. Spell the URIs out instead when the participants are not all
+in one cluster config.
+
+Start it, watch it, read the answer, stop it:
+
+```
+tt start pregel
+tt status pregel
+```
+
+```
+ INSTANCE        STATUS   PID    MODE  CONFIG  BOX      UPSTREAM
+ pregel:master   RUNNING  77303  RW    ready   running  --
+ pregel:worker1  RUNNING  77304  RW    ready   running  --
+ pregel:worker2  RUNNING  77305  RW    ready   running  --
+ pregel:worker3  RUNNING  77302  RW    ready   running  --
+```
+
+The master role's `status()` follows the autostart fiber through `idle`,
+`loading`, `running` and then `done` (or `failed`, with the error):
+
+```
+$ tt connect pregel:master -f - <<< "return require('pregel.roles.master').status()"
+---
+- state: done
+  name: maxvalue
+  superstep: 13
+...
+```
+
+The result is the workers' own spaces. A job called `maxvalue` stores its shard
+of the graph in `data_maxvalue`, one tuple per vertex: name, halted flag, the
+user value, and the outgoing edges as `{destination, value}` pairs.
+
+```
+$ tt connect pregel:worker1 -f - <<< "return box.space.data_maxvalue:select({}, {limit = 3})"
+---
+- - ['v002', true, {'name': 'v002', 'value': 12}, [['v003', 1]]]
+  - ['v003', true, {'name': 'v003', 'value': 12}, [['v004', 1]]]
+  - ['v007', true, {'name': 'v007', 'value': 12}, [['v008', 1]]]
+...
+```
+
+```
+tt stop -y pregel
+```
+
+Runnable versions of this configuration live in `examples/`.
+
+### roles_cfg reference
+
+Both roles take:
+
+* `name` — the job name (required). It names the spaces, and it is what the
+  discovery above matches on, so one cluster can run several jobs.
+* `app` — the Lua module name both roles `require()` (required).
+* `workers` — array of every worker's net.box URI. Left out, it is discovered
+  from the cluster config.
+* `pool_size` — messages per outgoing batch (default 1000).
+* `user`, `password` — the net.box credentials for outgoing calls.
+
+`pregel.roles.worker` also takes:
+
+* `master` — the master's net.box URI; discovered when left out.
+* `squash_only` (default `false`) — run the app's combiner once per superstep
+  instead of on every message put.
+* `queue_engine` — `space` (default, so the message queue survives a restart)
+  or `table`.
+* `delayed_push` (default `false`) — back the outgoing batches with spaces
+  rather than memory, for a preload that produces more messages than fit in
+  memory.
+
+`pregel.roles.master` also takes `autostart` (default `false`), which starts a
+background fiber that waits for every worker, preloads the graph and runs the
+supersteps.
+
+Two limits are deliberate. A running job cannot be reconfigured: an apply that
+changes `roles_cfg` while the job exists fails with a message saying to stop
+the role first, because the worker list is resolved once and moving it under a
+running job cannot be done consistently. And both roles refuse to apply on a
+read-only instance, since both write — a worker creates the job's spaces, and
+both hand out the privileges their peers need.
+
+An unknown key in `roles_cfg` is refused by name rather than ignored, so a
+typo stops the config from applying.
+
+Neither the `lua_call` grant nor the `credentials` section can name the job's
+spaces, because they do not exist when the credentials applier first runs. The
+worker role grants read/write on them itself, to the `user` from `roles_cfg`,
+right after creating them. A config that sets no `user` gets no such grant:
+the peers then connect as `guest`, and giving `guest` write access to the graph
+is a decision for the operator.
+
+Without `autostart`, nothing happens until someone drives the job. Both roles
+expose `get()` for that, returning the live object:
+
+```lua
+local m = require('pregel.roles.master').get()
+m:wait_up():preload():start()
+```
+
+## Programmatic API
+
+Underneath the roles are `pregel.master` and `pregel.worker`, which can be used
+directly — this is what the integration tests do.
+
+```lua
+local pworker = require('pregel.worker')
 local pmaster = require('pregel.master')
-local master = pmaster.new('test', config)
-master:add_aggregator('custom', <options>)
-master:wait_up()
-master:preload_on_workers()
-<...> -- for example, you can add vertices by hand, if you need it to.
-master:save_snapshot()
+
+-- Requiring the modules publishes the RPC entry points; these two let the user
+-- the peers connect as call them.
+pworker.grant('guest')
+pmaster.grant('guest')
+
+local worker = pworker.new('demo', {
+    workers     = {'127.0.0.1:3302', '127.0.0.1:3303'},
+    master      = '127.0.0.1:3301',
+    obtain_name = function(value) return value.name end,
+    compute     = function(self) --[[ ... ]] end,
+    grant_to    = 'guest',
+})
+
+local master = pmaster.new('demo', {
+    workers     = {'127.0.0.1:3302', '127.0.0.1:3303'},
+    obtain_name = function(value) return value.name end,
+})
+
+local supersteps = master:wait_up():preload():start()
 ```
 
-### Worker node
+`master.new(name, options)`:
 
-* `master:add_aggregator(name, options)` - add agreggator.
+* `workers` — array of every worker's net.box URI. Each may carry its own
+  `user:password@host:port`.
+* `obtain_name` — `callable(value) -> string`, the name pregel routes and
+  stores a vertex value by (required).
+* `pool_size` — messages per batch (default 1000).
+* `master_preload` — a loader object, or `callable(self, preload_args)`
+  returning one, or `nil` for a master that only coordinates.
+* `preload_args` — passed to `master_preload`.
+* `user`, `password` — net.box credentials for the outgoing connections.
 
-	Possible options are:
-	* `default` - default value for aggregator. Can be anything.
-	* `merge` - Add new value to aggregator. Must be commutative and associative.
+`worker.new(name, options)` takes `workers`, `obtain_name`, `pool_size`,
+`preload_args`, `user` and `password` with the same meaning, plus:
 
-	  Example:
-		```
-		local function merge(old, new)
-			return old + new
-		end
-		```
+* `master` — the master's net.box URI (required).
+* `compute` — `callable(vertex)`, run once per active vertex per superstep
+  (required).
+* `combiner` — `callable(a, b) -> c`, folds two messages for one receiver into
+  one.
+* `squash_only` — run the combiner once per superstep from the queue's
+  `squash()` rather than on every put (default `false`). Combining on put costs
+  a read of the receiver's messages per put, which is the wrong trade when one
+  receiver gets many.
+* `queue_engine` — `'space'` (default) or `'table'`.
+* `delayed_push` — back the outgoing batches with spaces instead of memory
+  (default `false`).
+* `worker_context` — any value, handed to every vertex on this instance through
+  `vertex:get_worker_context()`.
+* `worker_preload` — a loader object, or `callable(self, preload_args)`
+  returning one.
+* `grant_to` — a user, or an array of users, allowed to reach this instance.
+  They get the RPC grants and read/write on this instance's spaces.
 
-### Vertex
+Lifecycle, on the master:
 
-Vertex is the least and main part of this process. Compute function is applied
-to each vertex on each worker node.
+* `master:wait_up()` — block until every worker exists and has reached this
+  master.
+* `master:preload()` — run the master-side loader and push what it produced.
+* `master:preload_on_workers()` — ask every worker to run its own loader
+  instead. A worker's loader is handed its own bucket index and the bucket
+  count, so it can load only its share.
+* `master:start()` — run supersteps until no message is in flight and no vertex
+  is active. Returns the number of supersteps.
+* `master:add_aggregator(name, options)` — see below.
+* `master:save_snapshot()` — tell every worker to `box.snapshot()`.
+* `master:stop()` — stop the message pool and drop this master.
 
-#### API
+Each of `wait_up`, `preload`, `preload_on_workers` and `add_aggregator` returns
+the master, so they chain. `worker:stop()` is the worker's half: it stops the
+pool, closes the connection to the master and unregisters the instance. Neither
+`stop` drops any space — the shard is meant to survive a restart.
 
-**Base API**:
+Sharding is a pure function of the vertex name: jump consistent hashing over a
+CRC-32 of the name (`pregel.mpool.guava_name`), so every instance computes the
+same owner without talking to anything, and adding a worker moves only the
+names it must.
 
-* `vertex:vote_halt([is_halted = true])` - set vertex status to be halted
-* `vertex:pairs_edges()` - iterate through all edges.
+`worker.grant(user[, instance_name])` and `master.grant(user)` hand out
+`execute` on `lua_call` for the entry points those modules publish —
+`pregel.worker.deliver`, `pregel.worker.deliver_batch`, `pregel.worker.wait`
+and `pregel.master.deliver`. Given an instance name as well, `worker.grant`
+also grants read/write on that instance's spaces and their sequences, which a
+`lua_call` grant alone does not cover: the call runs with the caller's
+privileges and the entry points write. The two halves are separate because the
+entry-point names are known before any instance exists and the space names are
+not.
 
-	Example:
-	```
-	for _, neighbour, value in vertex:pairs_edges() do
-		-- process vertex
-	end
-	```
+## Loaders
 
-* `vertex:get_value()` - get value of vertex
-* `vertex:set_value(value)` - set value of vertex
-* `vertex:get_name()` - get name of vertex
-* `vertex:get_superstep()` - get superstep number (1 to ...)
+A loader is a callable object that walks a source and pushes the graph out
+through the instance's message pool, addressing every vertex and edge to the
+worker that owns it. `pregel.loader` has three entry points.
 
-**Messaging API**
+`loader.new(instance, fn)` wraps an arbitrary function, which is called with
+the loader itself and may use:
 
-> Vertices communicate directly with one another by sending messages, each of
-> which consists of a message value and the name of the destination vertex.
-> A vertex can send any number of messages in a superstep. All messages sent to
-> vertex V in superstep S are available, via an iterator, when V’s `Compute()`
-> method is called in superstep S + 1. There is no guaranteed order of messages
-> in the iterator, but it is guaranteed that messages will be delivered and that
-> they will not be duplicated. A common usage pattern is for a vertex V to
-> iterate over its outgoing edges, sending a message to the destination vertex
-> of each edge.
->
-> However, `dest_vertex` need not be a neighbor of V. A vertex could learn the
-> identifier of a non-neighbor from a message received earlier, or vertex
-> identifiers could be known implicitly. For example, the graph could be a
-> clique, with well-known vertex identifiers V1 through Vn, in which case there
-> may be no need to even keep explicit edges in the graph. When the destination
-> vertex of any message does not exist, we execute user-defined handlers. A
-> handler could, for example, create the missing vertex or remove the dangling
-> edge from its source vertex.
+* `loader:store_vertex(value)` — store one vertex, returning its name.
+* `loader:store_edge(src, dest, value)` — store one edge from the vertex named
+  `src`.
+* `loader:store_edges_batch(src, list)` — store a list of `{dest, value}` pairs
+  from `src` in one message.
+* `loader:store_vertex_edges(value, list)` — both at once, returning the vertex
+  name.
+* `loader:flush()` — send whatever is still batched.
 
-* `vertex:pairs_messages()` - iterate through all incoming messages.
+None of these resolve conflicts: a vertex stored twice is reset to the later
+value, and edges may be duplicated.
 
-	Example:
-	```
-	for _, message in vertex:pairs_messages() do
-		-- process all incoming messages
-	end
-	```
-* `vertex:send_message(receiver_id, msg)` - send message to vertex with ID
-	`receiver_id`
+`loader.graph_edges_f(instance, path)` reads the two-section text format:
 
-**Aggregation API**
+```
+# List of vertices
+<id> '<name>' <value>
+# List of edges
+<source_id> <destination_id> <value>
+```
 
-> Pregel aggregators are a mechanism for global communication, monitoring, and
-> data. Each vertex can provide a value to an aggregator in superstep S, the
-> system combines those values using a reduction operator, and the resulting
-> value is made available to all vertices in superstep S + 1.
+The ids are the file's own numbering. The names pregel uses come from the
+instance's `obtain_name`, and the edge section is translated through the vertex
+section, so the vertex section has to come first.
 
-* `vertex:get_aggregation(name)` - get value from aggregator
-* `vertex:set_aggregation(name, value)` - set aggregator value
+`loader.avro_files(instance, options)` streams a graph from a pair of Avro
+object container files, so a graph larger than memory costs only one edge
+batch here:
 
-**Topology mutation part**
+* `vertices`, `edges` — paths to the two files (required).
+* `vertex_name` — a field name of the vertex file's schema, or
+  `function(record) -> string` (required).
+* `vertex_value` — field name or function; what gets stored as the vertex
+  value. The default is the whole record, because the worker names a stored
+  vertex by calling `obtain_name` on it.
+* `edge_src`, `edge_dst` — field name or function (both required).
+* `edge_value` — field name or function (default `json.NULL`).
+* `batch` — edges of one source per message (default 1000).
 
-> Some graph algorithms need to change the graph’s topology. A clustering
-> algorithm, for example, might replace each cluster with a single vertex,
-> and a minimum spanning tree algorithm might remove all but the tree edges.
-> Just as a user’s Compute() function can send messages, it can also issue
-> requests to add or remove vertices or edges.
+A field name is checked against the file's own schema when the loader is
+built, so a misspelled field fails immediately rather than after storing a
+graph of nameless vertices.
 
-* `vertex:add_vertex(value)` - add vertex
-* `vertex:add_edge([src = vertex:get_name(), ]dest, value)` - add edge
-* `vertex:delete_vertex([src][, vertices = true])` - delete vertex
-* `vertex:delete_edge([src = vertex:get_id(), ]dest)` - delete edge.
+Called as `loader()` the whole graph is loaded. Called as
+`loader(worker_idx, workers_count)` — which is what `worker:preload()` does —
+only the share belonging to that worker is: vertices whose name shards to it,
+and edges whose *source* shards to it. The split uses the same hash that routes
+every message, so N workers reading the same two files cover the graph exactly
+once between them with nothing to coordinate, and an edge always lands on the
+worker that stored its source.
 
-If you'll change properties (add/delete vertex/edge) of currently running vertex,
-then it'll be applied immediatly after compute.
+`tools/text2avro.lua` converts the text format into that pair of files:
+
+```
+$ tarantool tools/text2avro.lua test/fixtures/graphs/small/ring10.txt /tmp/ring10-avro
+test/fixtures/graphs/small/ring10.txt -> /tmp/ring10-avro/vertices.avro: 10 vertices
+test/fixtures/graphs/small/ring10.txt -> /tmp/ring10-avro/edges.avro: 14 edges
+codec: null
+```
+
+It takes `--codec null|deflate|zstandard`, and writes edges naming their
+endpoints by vertex name rather than by the file's numbering — which is what
+lets the Avro loader avoid holding the id-to-name map in memory.
+
+## The vertex API
+
+The compute function is handed a vertex object. Vertex objects are pooled and
+reused across the vertices of a superstep, so nothing may be kept between
+calls.
+
+Base:
+
+* `vertex:get_name()` — the name pregel routes and stores by.
+* `vertex:get_value()` / `vertex:set_value(value)` — the user value.
+* `vertex:get_superstep()` — the superstep number, counting from 1.
+* `vertex:vote_halt([is_halted = true])` — a halted vertex with no messages is
+  skipped in later supersteps. A vertex is automatically un-halted for a
+  superstep in which it has messages waiting.
+* `vertex:get_worker_context()` — the `worker_context` this instance was
+  created with, shared by every vertex on it.
+
+Messaging:
+
+* `vertex:pairs_messages()` — iterate the messages sent to this vertex in the
+  previous superstep. There is no guaranteed order.
+* `vertex:send_message(receiver_name, value)` — send to any vertex by name, not
+  only to a neighbour. It arrives in the next superstep.
+
+```lua
+for _, message in vertex:pairs_messages() do
+    -- ...
+end
+for _, neighbour, edge_value in vertex:pairs_edges() do
+    vertex:send_message(neighbour, edge_value)
+end
+```
+
+Aggregation, described under "Aggregators and combiners" below:
+
+* `vertex:get_aggregation(name)` — the value the whole graph produced in the
+  previous superstep.
+* `vertex:set_aggregation(name, value)` — contribute this vertex's value.
+
+Topology mutation:
+
+* `vertex:add_vertex(value)`
+* `vertex:add_edge([src = vertex:get_name(), ]dest, value)`
+* `vertex:delete_vertex([name = vertex:get_name()][, edges = false])`
+* `vertex:delete_edge([src = vertex:get_name(), ]dest)`
+
+## Aggregators and combiners
+
+An aggregator is a value every vertex can contribute to and read back. Each
+worker keeps its own copy; a superstep ends with every worker reporting its
+copy to the master, the master merging them, and the merged value going back
+out to the workers. So a vertex entering superstep S reads what the whole graph
+produced in S-1.
+
+```lua
+instance:add_aggregator('max_seen', {
+    default = 0,
+    reduce  = function(old, new) return new > old and new or old end,
+})
+```
+
+* `default` — the starting value, or a function returning one. The master takes
+  a fresh copy of it before each superstep's reports arrive, so a table default
+  is not shared with the superstep before it.
+* `reduce` — `callable(accumulator, contribution)`, folds one vertex's
+  contribution into its worker's copy. Defaults to taking the contribution,
+  which makes an aggregator with only a `merge` a per-superstep count.
+* `merge` — `callable(accumulator, worker_value)`, folds one worker's copy into
+  the master's. Defaults to `reduce`, which is what it usually is.
+
+Both should be commutative and associative: nothing fixes the order workers
+report in.
+
+A worker's copy is *not* reset between supersteps — it is overwritten by the
+merged value, and the next superstep's contributions reduce on top of that. So
+`max` behaves as expected while a summing `reduce` accumulates over the whole
+run: four vertices each contributing 1 over three supersteps leave 12, not 4.
+Reset it in the `reduce` itself, or count with `merge` and let `reduce` take
+the last value.
+
+Names beginning with `__` are reserved — pregel counts messages and active
+vertices through `__messages` and `__in_progress`, which is what decides when a
+run is over. Add the same aggregator on the master and on every worker, under
+the same name; the app module's `aggregators` table does this for both sides at
+once.
+
+A combiner is different: it folds two *messages* for one receiver into one, so
+a vertex with many incoming messages sees one. It runs on every put by default,
+or once per superstep with `squash_only`.
+
+## Topology mutation
+
+`add_vertex`, `add_edge`, `delete_vertex` and `delete_edge` do not take effect
+where they are called. Each is queued as a request on the worker that owns the
+vertex it acts on, and the whole batch is applied between supersteps, in a
+fixed order that makes the result independent of the order the requests
+arrived in:
+
+1. edge deletions,
+2. vertex deletions,
+3. vertex additions,
+4. edge additions.
+
+Adding vertices before edges is what lets one superstep add a vertex and an
+edge pointing out of it. The one exception to the delay is a change to the
+*running* vertex's own edges: `add_edge`/`delete_edge` with no explicit source
+are applied to the vertex's own edge list and written back as soon as its
+compute function returns.
+
+Conflicts do not raise; they are logged and the run continues. Deleting an edge
+or a vertex that is not there, adding an edge whose source does not exist, and
+adding a vertex that already exists each produce a log line naming the vertex
+and leave the graph as it was.
+
+`delete_vertex` deletes the vertex and its outgoing edges. Deleting the inbound
+edges as well is not implemented — only a full scan could find them — so the
+`edges` argument must be `false`.
+
+## The Avro module
+
+`pregel.avro` is a self-contained pure-Lua Apache Avro implementation: schema
+parsing with the canonical form and CRC-64-AVRO fingerprints, binary encoding
+and decoding of every type, object container files, and schema resolution. It
+is what `loader.avro_files` and `tools/text2avro.lua` are built on, and it is
+usable on its own.
+
+### Schemas
+
+`avro.schema.parse(spec [, opts])` (also `avro.parse`) takes JSON text, a
+decoded Lua table or an already parsed schema.
+
+```lua
+local avro = require('pregel.avro')
+local sc = avro.schema.parse([[{
+    "type": "record", "name": "Vertex",
+    "fields": [{"name": "name", "type": "string"},
+               {"name": "value", "type": "long"}]
+}]])
+
+sc.kind              --> 'record'
+sc.fullname          --> 'Vertex'
+sc:canonical()       --> {"name":"Vertex","type":"record","fields":[...]}
+sc:tojson()          --> the full schema, with docs, aliases and defaults
+sc:fingerprint()     --> CRC-64-AVRO of the canonical form, as int64 cdata
+sc:fingerprint_hex() --> '547b814b11775a54'
+```
+
+`canonical()` is the Parsing Canonical Form, which strips everything not
+needed to read the data. `tojson()` keeps it all, which is why it — and not the
+canonical form — is what goes into a container file's header: a reader needs
+the defaults.
+
+### Values
+
+```lua
+local bytes = avro.encode(sc, {name = 'v001', value = 7})  --> 6 bytes
+local value = avro.decode(sc, bytes)                       --> {name=, value=}
+avro.validate(sc, {name = 'v001', value = 7})              --> true
+avro.validate(sc, {name = 'v001'})                         --> false
+```
+
+`avro.decode(sc, data [, pos [, reader_schema]])` returns the value and the
+position after it, so a concatenation of records can be walked; `avro.skip`
+walks past one without building it. Lua maps onto Avro the obvious way, with
+one wrinkle: a `null` nested in a record, array or map decodes to `box.NULL`
+(exported as `avro.NULL`), because a Lua `nil` would take the key with it.
+
+### Object container files
+
+```lua
+local w = avro.ocf.open('/tmp/graph.avro', {
+    mode = 'w', schema = sc, codec = 'deflate', block_size = 64 * 1024,
+})
+w:append({name = 'v001', value = 7})
+w:append_all({{name = 'v002', value = 9}})
+w:close()
+
+local r = avro.ocf.open('/tmp/graph.avro')
+for record in r:records() do
+    -- ...
+end
+r:close()
+```
+
+`open` takes `mode = 'r'` (the default) or `'w'`. A reader accepts `data`
+instead of a path, to read a file already in memory, and `schema` — a *reader*
+schema the records are resolved into. A writer takes `schema` (required),
+`codec`, `block_size`, `metadata` and `sync`.
+
+Three shorthands cover the common cases: `avro.ocf.read_all(path)` returns
+every record plus the file's schema, `avro.ocf.write_all(path, sc, records)`
+writes an array in one call, and `avro.ocf.schema_of(path)` returns the schema
+and the metadata map without reading any records.
+
+Codecs, and what each Tarantool build supports:
+
+* `null` — always.
+* `deflate` — always. Reading is a pure-Lua inflater, so a deflate file is
+  readable anywhere. Writing uses `compress.zlib` where it exists and falls
+  back to RFC 1951 stored blocks where it does not: valid, uncompressed
+  deflate that any Avro implementation reads back.
+* `zstandard` — only where `compress.zstd` exists, which today means Tarantool
+  Enterprise.
+
+`avro.ocf.codec_available(name)` answers this for the running build, and
+`avro.deflate.has_zlib` says whether `deflate` will actually compress. Under
+Community Edition the two report `false` for `zstandard` and `false` for
+`has_zlib`; under Enterprise, `true` and `true`.
+
+### Schema resolution
+
+Data written with one schema can be read through another, following the
+specification's Schema Resolution rules: the numeric promotions, string and
+bytes either way, record fields matched by name or by a reader alias, a
+reader field the writer never wrote filled from its default, an unknown enum
+symbol falling back to the reader's `default`.
+
+```lua
+local reader = avro.schema.parse([[{
+    "type": "record", "name": "Vertex",
+    "fields": [{"name": "name", "type": "string"},
+               {"name": "value", "type": "double"},
+               {"name": "colour", "type": "string", "default": "none"}]
+}]])
+
+avro.decode(sc, bytes, 1, reader)  --> {name='v001', value=7, colour='none'}
+```
+
+`avro.resolver(writer, reader)` compiles the pair once and returns a decoder to
+call per record, which is the cheaper form in a loop.
+`avro.resolve.compatible(writer, reader)` is the shallow test the resolver uses
+to pick a branch when only the reader is a union: matching kinds, matching
+names for the named types, and the promotions. It is not a full answer to
+whether the pair resolves — building the resolver is.
+
+## Testing and development
+
+```
+make deps     # tt rocks install luatest; tt rocks install luacheck
+make lint     # luacheck over the whole tree
+make test     # the suite, under the luatest wrapper's own tarantool
+make test-ee  # the suite, under $(TARANTOOL_EE)
+```
+
+The suite covers both binaries because the Avro codecs differ between them.
+Under Community Edition the two Enterprise-only container-file tests are
+skipped; under Enterprise a test asserting that the `zstd` module is absent is
+skipped instead. Both runs are otherwise the same and both are expected to be
+green.
+
+`test-ee` is `test-under` with `TARANTOOL` pointed at `TARANTOOL_EE`, which
+defaults to a path that will not exist on another machine —
+`make test-ee TARANTOOL_EE=/path/to/ee/tarantool`, or set it in the
+environment. `make test-under TARANTOOL=...` runs the suite under any binary.
+
+The Makefile exports a `VARDIR` of its own, keyed by a checksum of the checkout
+path. luatest wipes its `VARDIR` at startup and the default is `/tmp/t`, shared
+by every luatest on the host, so two checkouts running the suite at once would
+delete each other's live servers. The path is a checksum rather than a
+directory inside the checkout because every server puts a unix socket under it
+and macOS caps socket paths at 103 bytes.
+
+The tests are `test/unit` (no servers), `test/integration` (real multi-process
+clusters), `test/helpers` (the two cluster harnesses — one starting bare
+instances and calling `new()` over net.box, one writing a cluster config and
+letting the roles applier do it), `test/apps` (app modules the roles tests
+point at) and `test/fixtures` (graphs, and Avro files generated by fastavro
+1.12.2 for the cross-implementation tests).
+
+## License and credits
+
+BSD, as declared in `pregel-scm-1.rockspec`.
+
+The computational model is Google's Pregel; the shape of the API follows Apache
+Giraph. Both are worth reading for algorithms to port — shortest paths and
+PageRank are the canonical starting points:
+
+* [The Pregel paper](http://kowshik.github.io/JPregel/pregel_paper.pdf), and
+  the [JPregel site](http://kowshik.github.io/JPregel/) it comes from
+* [Shortest paths](https://cwiki.apache.org/confluence/display/GIRAPH/Shortest+Paths+Example)
+  and [PageRank](http://giraph.apache.org/pagerank.html) in Giraph
