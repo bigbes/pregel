@@ -216,19 +216,65 @@ other role for a job of this `name`, so the config says who the participants
 are exactly once. Spell the URIs out instead when the participants are not all
 in one cluster config.
 
+### Putting those two files where `tt` will find them
+
+`tt` runs applications out of an *environment* — a directory with a `tt.yaml`
+in it — and an application is a directory under that environment's
+`instances_enabled` holding a `config.yaml` and an `instances.yml` naming the
+instances the config defines. `tt init` creates the environment; the
+application directory is yours to make. For the two files above, called
+`pregel` because that is the name `tt start pregel` takes:
+
+```
+mkdir quickstart && cd quickstart
+tt init
+mkdir -p instances.enabled/pregel
+```
+
+```
+quickstart/
+├── tt.yaml                              # written by tt init
+└── instances.enabled/
+    └── pregel/
+        ├── config.yaml                  # the cluster config above
+        ├── instances.yml                # master: / worker1: / worker2: / worker3:
+        └── maxvalue.lua                 # the app module above
+```
+
+`instances.yml` is four lines, one per instance name in `config.yaml`, each
+with a trailing colon and nothing after it:
+
+```yaml
+master:
+worker1:
+worker2:
+worker3:
+```
+
+Each instance gets a working directory of its own under `var/lib`, so
+`maxvalue.lua` is not reachable by a relative path once one is running: the
+roles' `require()` finds it through `LUA_PATH`, which has to be set for `tt
+start` and for nothing else. `/path/to/pregel` below is the checkout; with the
+rock installed into the environment's own `.rocks` (see above), only the
+application directory has to be added. The trailing `;;` keeps Tarantool's own
+default path.
+
 Start it, watch it, read the answer, stop it:
 
 ```
-tt start pregel
+LUA_PATH="/path/to/pregel/?.lua;/path/to/pregel/?/init.lua;$PWD/instances.enabled/pregel/?.lua;;" tt start pregel
 tt status pregel
 ```
 
+`tt start` returns before the pid files are written, so a `tt status` run in
+the same breath as it prints `NOT RUNNING` for all four. Give it a second.
+
 ```
  INSTANCE        STATUS   PID    MODE  CONFIG  BOX      UPSTREAM
- pregel:master   RUNNING  77303  RW    ready   running  --
- pregel:worker1  RUNNING  77304  RW    ready   running  --
- pregel:worker2  RUNNING  77305  RW    ready   running  --
- pregel:worker3  RUNNING  77302  RW    ready   running  --
+ pregel:master   RUNNING  33824  RW    ready   running  --
+ pregel:worker1  RUNNING  33826  RW    ready   running  --
+ pregel:worker2  RUNNING  33827  RW    ready   running  --
+ pregel:worker3  RUNNING  33829  RW    ready   running  --
 ```
 
 The master role's `status()` starts at `connecting` — see [Waiting for the
@@ -246,14 +292,17 @@ $ tt connect pregel:master -f - <<< "return require('pregel.roles.master').statu
 
 The result is the workers' own spaces. A job called `maxvalue` stores its shard
 of the graph in `data_maxvalue`, one tuple per vertex: name, halted flag, the
-user value, and the outgoing edges as `{destination, value}` pairs.
+user value, and the outgoing edges as `{destination, value}` pairs. Which
+worker holds which vertices is settled by the vertex name and the sorted list
+of worker URIs, so it is the same on every machine and after every restart —
+`v004`, `v006` and `v008` are the first three on `worker1` wherever this runs.
 
 ```
 $ tt connect pregel:worker1 -f - <<< "return box.space.data_maxvalue:select({}, {limit = 3})"
 ---
-- - ['v002', true, {'name': 'v002', 'value': 12}, [['v003', 1]]]
-  - ['v003', true, {'name': 'v003', 'value': 12}, [['v004', 1]]]
-  - ['v007', true, {'name': 'v007', 'value': 12}, [['v008', 1]]]
+- - ['v004', true, {'name': 'v004', 'value': 12}, [['v005', 1]]]
+  - ['v006', true, {'name': 'v006', 'value': 12}, [['v007', 1]]]
+  - ['v008', true, {'name': 'v008', 'value': 12}, [['v009', 1]]]
 ...
 ```
 
@@ -261,7 +310,11 @@ $ tt connect pregel:worker1 -f - <<< "return box.space.data_maxvalue:select({}, 
 tt stop -y pregel
 ```
 
-Runnable versions of this configuration live in `examples/`.
+Runnable versions of this configuration live in `examples/`. Each of those
+directories carries a `tt.yaml` of its own with `instances_enabled: .`, so it
+is the environment and the application at once and needs no `tt init` — which
+is also why their commands are run from inside the example directory rather
+than from an environment above it.
 
 ### roles_cfg reference
 
