@@ -1,0 +1,90 @@
+# One master and three workers, each the read-write leader of a replicaset of
+# its own. See examples/max-value/config.yaml for the same thing with the
+# graph loaded on the master; here every worker loads its own share.
+
+credentials:
+  users:
+    pregel:
+      password: 'secret'
+      privileges:
+        - permissions: [execute]
+          lua_call:
+            - pregel.worker.deliver
+            - pregel.worker.deliver_batch
+            - pregel.worker.wait
+            - pregel.master.deliver
+
+wal:
+  mode: none
+
+groups:
+  pregel:
+    replicasets:
+      master:
+        instances:
+          master:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3301'
+            roles: [pregel.roles.master]
+            roles_cfg:
+              pregel.roles.master:
+                name: sssp
+                app: app
+                autostart: true
+                user: pregel
+                password: 'secret'
+                workers:
+                  - '127.0.0.1:3302'
+                  - '127.0.0.1:3303'
+                  - '127.0.0.1:3304'
+                # No app_cfg here on purpose: the app module has no
+                # master_preload, so the master has nothing to configure. Its
+                # autostart sees a worker_preload instead and asks every worker
+                # to load its own share.
+      worker1:
+        instances:
+          worker1:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3302'
+            roles: [pregel.roles.worker]
+            roles_cfg: &worker_cfg
+              pregel.roles.worker:
+                name: sssp
+                app: app
+                master: '127.0.0.1:3301'
+                workers:
+                  - '127.0.0.1:3302'
+                  - '127.0.0.1:3303'
+                  - '127.0.0.1:3304'
+                user: pregel
+                password: 'secret'
+                app_cfg:
+                  # Paths are relative to examples/sssp/ and resolved by the
+                  # app module: an instance's own working directory is under
+                  # var/lib and is no use as a base.
+                  #
+                  # These two files are the ../../test/fixtures/graphs/small/
+                  # weighted9.txt graph converted by tools/text2avro.lua. All
+                  # three workers open both of them and each keeps only what
+                  # shards to it.
+                  vertices: '../../test/fixtures/graphs/small/weighted9/vertices.avro'
+                  edges: '../../test/fixtures/graphs/small/weighted9/edges.avro'
+                  source: 'a'
+      worker2:
+        instances:
+          worker2:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3303'
+            roles: [pregel.roles.worker]
+            roles_cfg: *worker_cfg
+      worker3:
+        instances:
+          worker3:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3304'
+            roles: [pregel.roles.worker]
+            roles_cfg: *worker_cfg
