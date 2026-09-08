@@ -18,6 +18,8 @@
 -- Compression prefers `compress.zlib` when it is present. Without it the
 -- encoder falls back to RFC 1951 stored blocks, which are valid, uncompressed
 -- deflate that any Avro implementation reads back.
+--
+-- @module pregel.avro.deflate
 
 local bit = require('bit')
 local ffi = require('ffi')
@@ -115,6 +117,17 @@ local function fixed_tables()
 end
 
 --- Decompress a raw RFC 1951 stream.
+--
+-- Pure Lua, so it works on any Tarantool build, and it is the only read path
+-- -- see the note at the top of the module on why compress.zlib cannot be used
+-- for this. Stops at the block marked final and ignores whatever follows.
+--
+-- @param data raw deflate bytes, without a zlib or gzip wrapper
+-- @return the decompressed string
+-- @raise on a truncated stream and on any malformed block: an over-subscribed
+--        Huffman code, an invalid symbol, a back-reference pointing before the
+--        start of the output, block type 3
+-- @function inflate
 function M.inflate(data)
     if type(data) ~= 'string' then
         fail('inflate expects a string, got %s', type(data))
@@ -311,6 +324,13 @@ end
 
 --- RFC 1951 stored blocks: no compression, but a valid deflate stream. Used
 --  when `compress.zlib` is not available.
+--
+-- Grows the data by five bytes per 65535-byte block. An empty input produces
+-- one (empty, final) block, because a zero-byte deflate stream is not legal.
+--
+-- @param data string to wrap
+-- @return a raw deflate stream that inflates back to `data`
+-- @function store
 local function store(data)
     local out = {}
     local n = #data
@@ -335,6 +355,15 @@ end
 M.store = store
 
 --- Compress to a raw RFC 1951 stream.
+--
+-- Falls back to store() where `compress.zlib` is missing, so the output is
+-- always readable but is not always smaller than the input -- check
+-- M.has_zlib if that matters.
+--
+-- @param data string to compress
+-- @return raw deflate bytes, with no zlib wrapper
+-- @raise when `data` is not a string
+-- @function deflate
 function M.deflate(data)
     if type(data) ~= 'string' then
         fail('deflate expects a string, got %s', type(data))

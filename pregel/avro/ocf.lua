@@ -19,6 +19,12 @@
 -- the deflater falls back to stored blocks (see pregel.avro.deflate);
 -- `zstandard` only where `compress.zstd` exists, which today means Tarantool
 -- Enterprise.
+--
+-- Reading and writing both stream, so a file larger than memory costs one
+-- block. Everything here does blocking file I/O through fio and so must run in
+-- a fiber that may yield.
+--
+-- @module pregel.avro.ocf
 
 local digest = require('digest')
 local fio    = require('fio')
@@ -80,6 +86,13 @@ local CODECS = {
 M.codecs = CODECS
 
 --- True when the codec can be used in this build without raising.
+--
+-- 'deflate' is always available: the inflater is pure Lua and the deflater
+-- falls back to stored blocks. Only 'zstandard' depends on the build.
+--
+-- @param name codec name
+-- @return boolean; false for a codec this package does not know at all
+-- @function codec_available
 function M.codec_available(name)
     if name == 'zstandard' then
         return (pcall(require, 'compress.zstd'))
@@ -236,6 +249,16 @@ local function next_block(self)
 end
 
 --- An iterator over the records in the file.
+--
+-- Reads one block at a time, so the memory cost is a block rather than the
+-- file. A record that decodes to null comes back as box.NULL, which keeps the
+-- loop going where a nil would end it. Calling this twice does not rewind:
+-- both iterators walk on from wherever the reader is.
+--
+-- @return iterator yielding one record at a time, nil at the end of the file
+-- @raise on a truncated file, a sync marker mismatch, or a block header that
+--        declares a negative count or size
+-- @function records
 function reader_mt:records()
     return function()
         while self._remaining == 0 do
@@ -261,8 +284,17 @@ function reader_mt:records()
     end
 end
 
+--- Alias of records(), so a reader can be walked with the same `for x in
+--  r:pairs()` spelling Tarantool's own iterables use.
+-- @function pairs
 reader_mt.pairs = reader_mt.records
 
+--- Release the underlying file. Idempotent.
+--
+-- An iterator already running keeps yielding out of the block held in memory
+-- and stops when that block is exhausted, rather than at the next call.
+--
+-- @function close
 function reader_mt:close()
     if not self._closed then
         self._closed = true
@@ -340,6 +372,14 @@ end
 
 --- Append one record. Blocks are flushed once they hold `block_size` bytes of
 --  uncompressed data.
+--
+-- The record is encoded now, so a value that does not fit the schema is caught
+-- at this call and not at close().
+--
+-- @param record the value to write
+-- @raise when the writer is closed, and when the record does not fit the
+--        schema
+-- @function append
 function writer_mt:append(record)
     if self._closed then
         fail('the writer is closed')
@@ -357,6 +397,12 @@ function writer_mt:append(record)
 end
 
 --- Append every record of a Lua array.
+--
+-- Not atomic: a record that fails to encode leaves the ones before it written.
+--
+-- @param records array of values
+-- @raise as append() does
+-- @function append_all
 function writer_mt:append_all(records)
     for i = 1, #records do
         self:append(records[i])
@@ -364,10 +410,22 @@ function writer_mt:append_all(records)
 end
 
 --- Flush the current block without closing the file.
+--
+-- Ends the block early, so calling it per record produces one block per record
+-- and compresses far worse. Use it to bound how much is lost if the process
+-- dies, not as a matter of course.
+--
+-- @function flush
 function writer_mt:flush()
     flush_block(self)
 end
 
+--- Flush the pending block and close the file. Idempotent.
+--
+-- A file whose writer was never closed is missing its last block, so this is
+-- not optional.
+--
+-- @function close
 function writer_mt:close()
     if self._closed then
         return
@@ -443,6 +501,12 @@ end
 --              for 'w': schema (required), codec, block_size, metadata, sync;
 --              for 'r': data, to read an in-memory file instead of `path`, and
 --              schema, a *reader* schema the records are resolved into.
+-- @return a reader (with `records`, `close`, `schema`, `writer_schema`,
+--         `metadata`, `codec`) or a writer (with `append`, `append_all`,
+--         `flush`, `close`); 'w' truncates an existing file
+-- @raise on an unknown mode, a missing path, a file that is not an OCF, an
+--        unsupported codec, and a writer with no schema
+-- @function open
 function M.open(path, opts)
     if type(path) == 'table' and opts == nil then
         opts, path = path, nil
@@ -472,6 +536,16 @@ end
 
 --- Read every record of a file into an array. Returns the records and the
 --  reader's schema.
+--
+-- Holds the whole file in memory, unlike open():records(). The file is closed
+-- whether or not the read raised.
+--
+-- @param path the file to read
+-- @param opts as for open() in mode 'r'
+-- @return array of records, and the schema they were decoded into -- the
+--         reader schema when opts.schema asked for one, the writer's otherwise
+-- @raise as open() and records() do
+-- @function read_all
 function M.read_all(path, opts)
     local r = M.open(path, opts)
     local out, n = {}, 0
@@ -490,6 +564,17 @@ function M.read_all(path, opts)
 end
 
 --- Write an array of records to a file in one call.
+--
+-- The file is closed whether or not the write raised, so a record that does
+-- not fit the schema leaves a valid file holding the records before it.
+--
+-- @param path the file to create, truncating what is there
+-- @param sc the writer schema
+-- @param records array of values
+-- @param opts as for open() in mode 'w', minus mode and schema
+-- @return the writer, already closed
+-- @raise as open() and append() do
+-- @function write_all
 function M.write_all(path, sc, records, opts)
     opts = opts or {}
     local merged = {}
@@ -509,6 +594,15 @@ function M.write_all(path, sc, records, opts)
 end
 
 --- The schema of a file, without reading any records.
+--
+-- Only the header is read, so this is cheap on a large file -- which is what
+-- lets pregel.loader check its field-name options before a load starts.
+--
+-- @param path the file to inspect
+-- @param opts as for open() in mode 'r'
+-- @return the schema, and the file's metadata map
+-- @raise when the file is missing, is not an OCF, or has no avro.schema entry
+-- @function schema_of
 function M.schema_of(path, opts)
     local r = M.open(path, opts)
     local sc, meta = r.schema, r.metadata

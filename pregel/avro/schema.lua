@@ -8,6 +8,12 @@
 --
 -- Nothing here is Tarantool specific except `json` and `box.NULL`, which stands
 -- in for JSON null wherever a Lua nil would vanish from a table.
+--
+-- Schema objects are immutable once parsed, and the derived forms (canonical,
+-- tojson, fingerprint) are memoised on the object, so passing the same schema
+-- around instead of re-parsing it is what keeps encoding cheap.
+--
+-- @module pregel.avro.schema
 
 local bit  = require('bit')
 local ffi  = require('ffi')
@@ -54,6 +60,16 @@ local FIELD_ORDER = { ascending = true, descending = true, ignore = true }
 M.PRIMITIVE = PRIMITIVE
 M.NAMED     = NAMED
 
+--- Raise a schema error, prefixed and with no position information.
+--
+-- Level 0: the message travels through pcall() in ocf and resolve, where a
+-- 'file.lua:123:' prefix would say where the check lives rather than what is
+-- wrong with the schema.
+--
+-- @param fmt format string
+-- @param ... format arguments
+-- @raise always
+-- @function error
 local function fail(fmt, ...)
     error('avro.schema: ' .. string.format(fmt, ...), 0)
 end
@@ -85,6 +101,11 @@ local function is_namespace(s)
     return true
 end
 
+--- Split a fullname at its last dot.
+--
+-- @param fullname string
+-- @return the namespace, or nil when the name carries none, and the short name
+-- @function split_fullname
 local function split_fullname(fullname)
     local dot = fullname:match('^.*()%.')
     if dot == nil then
@@ -144,6 +165,10 @@ end
 local schema_mt = {}
 schema_mt.__index = schema_mt
 
+--- A short identification of the schema, for error messages and logs -- the
+--  fullname for a named type, the kind otherwise.
+-- @return string
+-- @function __tostring
 function schema_mt:__tostring()
     return 'avro.schema<' .. (self.fullname or self.kind) .. '>'
 end
@@ -152,6 +177,14 @@ local function new_schema(kind)
     return setmetatable({ kind = kind }, schema_mt)
 end
 
+--- True when `v` is a parsed schema object rather than a spec for one.
+--
+-- What makes parse() idempotent, and cheap to call on an argument that may
+-- already be a schema.
+--
+-- @param v any value
+-- @return boolean
+-- @function is_schema
 function M.is_schema(v)
     return getmetatable(v) == schema_mt
 end
@@ -478,11 +511,21 @@ end
 
 --- Parse a schema.
 --
+-- An already parsed schema is returned untouched, so this is safe to call on
+-- any argument that may already be one and is what every entry point in this
+-- package does with its schema argument.
+--
 -- @param spec   JSON text, a decoded Lua table, or an already parsed schema.
 -- @param opts   optional table; `names` seeds the named-type scope, which is
 --               what a reader schema needs when it refers to types the writer
---               schema defined.
--- @return the schema object.
+--               schema defined, and `namespace` is the namespace unqualified
+--               names in `spec` are resolved against.
+-- @return the schema object; its `names` field is the scope every named type
+--         it defined was registered in, ready to be passed back as opts.names.
+-- @raise on invalid JSON and on anything the specification forbids: a
+--        duplicate name, an unknown type reference, a union inside a union, a
+--        malformed name or namespace.
+-- @function parse
 function M.parse(spec, opts)
     if M.is_schema(spec) then
         return spec
@@ -521,6 +564,10 @@ local ESCAPES = {
 
 --- JSON string literal with UTF-8 kept as UTF-8, per the [STRINGS] rule of the
 --  canonical form: escapes are resolved, only what JSON requires is escaped.
+--
+-- @param s string
+-- @return the quoted literal, surrounding double quotes included
+-- @function quote
 local function quote(s)
     return '"' .. s:gsub('[%z\1-\31"\\]', function(c)
         return ESCAPES[c] or string.format('\\u%04x', c:byte())
@@ -587,6 +634,14 @@ canonical_of = function(sc, seen, out)
 end
 
 --- Parsing Canonical Form of the schema, as a compact JSON string.
+--
+-- Strips everything that does not affect how data is read -- docs, aliases,
+-- defaults, logicalType, field order -- which is what makes two schemas with
+-- the same canonical form interchangeable for decoding, and why this must not
+-- be what goes into a container file's header. Memoised.
+--
+-- @return string
+-- @function canonical
 function schema_mt:canonical()
     if self._canonical == nil then
         self._canonical = table.concat(canonical_of(self, {}, {}))
@@ -797,6 +852,12 @@ end
 --  defaults, field order and any extra attributes such as logicalType. This is
 --  what goes into an object container file's `avro.schema` metadata, where the
 --  canonical form would be wrong -- it strips the defaults a reader needs.
+--
+-- Property keys are sorted and names are emitted as fullnames, so the same
+-- schema always renders the same bytes. Memoised.
+--
+-- @return string
+-- @function tojson
 function schema_mt:tojson()
     if self._json == nil then
         self._json = table.concat(tojson_of(self, {}, {}))
@@ -825,6 +886,11 @@ local function build_fp_table()
 end
 
 --- CRC-64-AVRO of an arbitrary byte string, as an int64 cdata.
+--
+-- @param s string
+-- @return int64 cdata; compare with ==, and note that tostring() renders it
+--         with an 'LL' suffix
+-- @function crc64
 function M.crc64(s)
     fp_table = fp_table or build_fp_table()
     local fp = FP_EMPTY
@@ -836,6 +902,12 @@ function M.crc64(s)
 end
 
 --- CRC-64-AVRO fingerprint of the Parsing Canonical Form, as an int64 cdata.
+--
+-- Two schemas with equal fingerprints are the same schema as far as reading
+-- data goes. Memoised.
+--
+-- @return int64 cdata
+-- @function fingerprint
 function schema_mt:fingerprint()
     if self._fingerprint == nil then
         self._fingerprint = M.crc64(self:canonical())
@@ -846,6 +918,9 @@ end
 --- The same fingerprint as 16 hex digits in little-endian byte order, which is
 --  the order the Java and fastavro implementations print and the order the
 --  single-object encoding puts on the wire.
+--
+-- @return 16-character lowercase hex string
+-- @function fingerprint_hex
 function schema_mt:fingerprint_hex()
     local fp = self:fingerprint()
     local out = {}
@@ -861,6 +936,15 @@ end
 
 --- Decode a JSON string in which every character stands for one byte (that is
 --  how the specification spells bytes and fixed defaults).
+--
+-- json.decode has already turned the \uXXXX escapes into UTF-8, so this
+-- reverses that: each code point becomes the single byte it stood for. Pure
+-- ASCII is returned unchanged.
+--
+-- @param s string as json.decode produced it
+-- @return the byte string it denotes
+-- @raise when a code point is above 255, which no byte can stand for
+-- @function json_string_to_bytes
 local function json_string_to_bytes(s)
     if not s:find('[\128-\255]') then
         return s
@@ -910,6 +994,18 @@ local default_to_lua
 
 --- Turn a JSON default (as it appears in the schema) into the Lua value the
 --  codec expects for `sc`.
+--
+-- Checked against the schema rather than passed through, so a default that
+-- cannot be encoded is rejected here and not much later, in the codec,
+-- complaining about the wrong thing.
+--
+-- @param sc the schema the default belongs to
+-- @param value the default in its JSON shape
+-- @return the Lua value; box.NULL for a null, and a fresh table for the
+--         container kinds
+-- @raise when the default does not fit `sc`, and when a record default leaves
+--        a field with no value and no default of its own
+-- @function default_to_lua
 default_to_lua = function(sc, value)
     local kind = sc.kind
     if kind == 'null' then
@@ -995,6 +1091,16 @@ end
 M.default_to_lua = default_to_lua
 
 --- The Lua value of a record field's default, computed once and memoised.
+--
+-- The second return value, not the first, says whether there is a default: a
+-- field whose default is a JSON null answers box.NULL, which compares equal to
+-- nil. The value is cached on the field and shared, so a caller that hands it
+-- on as data must copy it -- resolve.lua's build_record does.
+--
+-- @param field a record field, as parse() built it
+-- @return the default value and true, or nil and false when it declares none
+-- @raise when the field declares a default that does not fit its type
+-- @function field_default
 function M.field_default(field)
     if not field.has_default then
         return nil, false

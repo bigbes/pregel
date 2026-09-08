@@ -12,8 +12,14 @@
 --
 -- The pieces are usable on their own: `pregel.avro.schema` parses and
 -- fingerprints schemas, `pregel.avro.codec` does the binary encoding,
+-- `pregel.avro.resolve` reads data written with one schema through another,
 -- `pregel.avro.ocf` the container format and `pregel.avro.deflate` the raw
 -- DEFLATE its `deflate` codec needs.
+--
+-- This module only re-exports; every function it names is documented where it
+-- is defined.
+--
+-- @module pregel.avro
 
 local schema  = require('pregel.avro.schema')
 local codec   = require('pregel.avro.codec')

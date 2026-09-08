@@ -19,6 +19,8 @@
 --
 -- A resolver is compiled once per (writer, reader) pair and cached, so the
 -- per-record cost is the decode itself.
+--
+-- @module pregel.avro.resolve
 
 local avro_schema = require('pregel.avro.schema')
 local codec       = require('pregel.avro.codec')
@@ -76,6 +78,15 @@ end
 --- A shallow compatibility test, used to choose a branch when only the reader
 --  is a union. It looks at the type and, for named types, the name -- which is
 --  what discriminates the branches of a legal union.
+--
+-- Shallow on purpose: it does not descend into fields or items, so a `true`
+-- here promises a branch worth compiling, not one that will compile. The real
+-- check is build().
+--
+-- @param w the writer schema
+-- @param r a candidate reader schema
+-- @return boolean
+-- @function compatible
 local function compatible(w, r)
     if w.kind == r.kind then
         if NAMED[w.kind] then
@@ -93,6 +104,14 @@ M.compatible = compatible
 -- Defaults
 --------------------------------------------------------------------------------
 
+--- Copy a value recursively, so a schema's default can be handed out as data.
+--
+-- Metatables are not copied and cycles are not detected; the values this sees
+-- are field defaults, which the parser built as plain trees.
+--
+-- @param v any value
+-- @return a copy sharing no table with `v`
+-- @function deep_copy
 local function deep_copy(v)
     if type(v) ~= 'table' then
         return v
@@ -370,6 +389,22 @@ local CACHE = setmetatable({}, {__mode = 'k'})
 
 --- A reusable decoder for one (writer, reader) pair.
 --  Returns function(data, pos) -> value, next_pos.
+--
+-- The returned decoder does *not* narrow a top-level null to nil -- that is
+-- M.decode's job -- so an OCF reader can iterate a file of nulls. `pos`
+-- defaults to 1.
+--
+-- Resolvers are cached, weakly on both schema objects, so calling this per
+-- record is cheap as long as the same schema objects are passed each time; two
+-- separately parsed copies of the same schema text are two cache entries.
+--
+-- @param writer the schema the data was written with, parsed or not
+-- @param reader the schema to read it as
+-- @return function(data, pos) -> value, next_pos
+-- @raise when the two schemas cannot be resolved against each other; a writer
+--        union branch the reader rejects is deferred, and only raises if the
+--        data actually carries it
+-- @function resolver
 function M.resolver(writer, reader)
     local w = avro_schema.parse(writer)
     local r = avro_schema.parse(reader)
@@ -390,6 +425,19 @@ end
 
 --- Decode one value written with `writer` as if it had been written with
 --  `reader`.
+--
+-- A one-shot wrapper over resolver(); when many records share a pair of
+-- schemas, build the resolver once instead.
+--
+-- @param writer the schema the data was written with
+-- @param data the buffer
+-- @param pos 1-based offset, default 1
+-- @param reader the schema to read it as
+-- @return the value, nil for a null at the top level, and the position just
+--         past it
+-- @raise when the schemas do not resolve, or the input is truncated or
+--        malformed
+-- @function decode
 function M.decode(writer, data, pos, reader)
     local value, next_pos = M.resolver(writer, reader)(data, pos)
     if value == NULL then

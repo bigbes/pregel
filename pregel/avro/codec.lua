@@ -19,6 +19,11 @@
 --
 -- Decoding gives box.NULL for a null nested in a record, array or map, so that
 -- the key stays present; a null decoded at the top level comes back as nil.
+--
+-- Positions are 1-based, as everywhere else in Lua: decode(sc, data) starts at
+-- byte 1 and the position it returns is the one to pass to the next call.
+--
+-- @module pregel.avro.codec
 
 local bit = require('bit')
 local ffi = require('ffi')
@@ -62,12 +67,24 @@ end
 -- `box.NULL == nil` is true -- a NULL pointer cdata compares equal to nil in
 -- LuaJIT -- so `v == nil` cannot tell an absent table key from a key holding an
 -- explicit null. Everywhere that difference matters, ask for the type instead.
+--
+-- @param v any value
+-- @return boolean; false for box.NULL
+-- @function is_absent
 local function is_absent(v)
     return type(v) == 'nil'
 end
 
 M.is_absent = is_absent
 
+--- True for 64-bit integer cdata, signed or unsigned.
+--
+-- Not `type(v) == 'cdata'`: box.NULL is cdata too, and so is every other FFI
+-- value a caller might hand in.
+--
+-- @param v any value
+-- @return boolean
+-- @function is_int64
 local function is_int64(v)
     return type(v) == 'cdata' and (ffi.istype(ct_i64, v) or ffi.istype(ct_u64, v))
 end
@@ -104,6 +121,11 @@ local U64_INT_MAX = 9223372036854775807ULL
 -- Without this, put_long() handed an out-of-range double to i64(), which
 -- saturates rather than failing, and a uint64 above INT64_MAX wrapped to a
 -- negative long. Both silently corrupted the value.
+--
+-- @param v a number or int64/uint64 cdata
+-- @return boolean; false for a fractional number and for a uint64 above
+--         INT64_MAX
+-- @function fits_long
 local function fits_long(v)
     if type(v) == 'number' then
         return v % 1 == 0 and v >= LONG_MIN_D and v < LONG_LIMIT
@@ -136,6 +158,14 @@ local function put_int(out, v)
 end
 
 --- Zigzag varint over the full 64-bit range.
+--
+-- Appends to `out` rather than returning, because every encoder builds one
+-- table of fragments that is concatenated once at the end.
+--
+-- @param out array of string fragments to append to
+-- @param v an integer within the int64 range -- callers check that with
+--        fits_long(), this does not
+-- @function put_long
 local function put_long(out, v)
     if type(v) == 'number' and v >= INT_MIN and v <= INT_MAX then
         return put_int(out, v)
@@ -193,6 +223,16 @@ local function get_long_raw(data, pos)
 end
 
 --- A long, narrowed to a Lua number when a double holds it exactly.
+--
+-- So the type of the result depends on the magnitude of the value: a plain
+-- number up to 2^53, int64 cdata beyond. Anything comparing the result against
+-- a literal has to cope with both.
+--
+-- @param data the buffer
+-- @param pos 1-based offset to read from
+-- @return the value and the position just past it
+-- @raise on a truncated or over-long varint
+-- @function get_long
 local function get_long(data, pos)
     local v, next_pos = get_long_raw(data, pos)
     if v <= EXACT and v >= -EXACT then
@@ -371,7 +411,14 @@ end
 -- tuple notation {[branch_name] = value} decides, and failing that the first
 -- accepting branch wins, in schema order.
 --
+-- A nil or box.NULL takes the union's null branch when it has one, before any
+-- of that.
+--
+-- @param sc a union schema
+-- @param value the value to encode
 -- @return branch index, the value to encode against it.
+-- @raise when no branch accepts the value
+-- @function select_branch
 local function select_branch(sc, value)
     local types = sc.types
     if value == nil or value == NULL then
@@ -441,6 +488,17 @@ encoders['record'] = function(sc, value, out)
     end
 end
 
+--- Encode one value, appending its bytes to `out`.
+--
+-- The building block encode() and the OCF writer share: `sc` must already be a
+-- parsed schema, and nothing is concatenated until the caller does it.
+--
+-- @param sc a parsed schema
+-- @param value the value to encode
+-- @param out array of string fragments to append to
+-- @raise when the value does not fit the schema, and when a record field is
+--        missing with no default declared for it
+-- @function encode_value
 encode_value = function(sc, value, out)
     local fn = encoders[sc.kind]
     if fn == nil then
@@ -452,6 +510,12 @@ end
 M.encode_value = encode_value
 
 --- Encode one value. Returns the bytes.
+--
+-- @param sc a schema, parsed or not
+-- @param value the value to encode
+-- @return the encoded bytes as a string
+-- @raise when the schema is invalid or the value does not fit it
+-- @function encode
 function M.encode(sc, value)
     sc = avro_schema.parse(sc)
     local out = {}
@@ -593,6 +657,19 @@ decoders['record'] = function(sc, data, pos)
     return out, pos
 end
 
+--- Decode one value out of `data` at `pos`, without the top-level null
+--  narrowing decode() does.
+--
+-- A null comes back as box.NULL here whether it is nested or not, which is why
+-- the OCF reader uses this rather than decode(): a nil record would end its
+-- iteration.
+--
+-- @param sc a parsed schema
+-- @param data the buffer
+-- @param pos 1-based offset
+-- @return the value and the position just past it
+-- @raise on truncated or malformed input
+-- @function decode_value
 decode_value = function(sc, data, pos)
     local fn = decoders[sc.kind]
     if fn == nil then
@@ -690,6 +767,16 @@ skippers['record'] = function(sc, data, pos)
 end
 
 --- Advance past one value without building it. Returns the next position.
+--
+-- Cheaper than decoding and throwing the result away: an array or map block
+-- written in the negative-count form is jumped over whole.
+--
+-- @param sc a parsed schema
+-- @param data the buffer
+-- @param pos 1-based offset
+-- @return the position just past the value
+-- @raise on truncated or malformed input
+-- @function skip_value
 skip_value = function(sc, data, pos)
     local fn = skippers[sc.kind]
     if fn == nil then
@@ -713,6 +800,15 @@ local function check_pos(pos)
     return pos
 end
 
+--- Advance past one value in `data`, parsing the schema first.
+--
+-- @param sc a schema, parsed or not
+-- @param data the buffer
+-- @param pos 1-based offset, default 1
+-- @return the position just past the value
+-- @raise when `data` is not a string, `pos` is not a positive integer, or the
+--        input is truncated or malformed
+-- @function skip
 function M.skip(sc, data, pos)
     if type(data) ~= 'string' then
         fail('skip expects a string, got %s', type(data))
@@ -730,7 +826,19 @@ local resolve_mod
 -- resolution rules instead: `sc` describes how they were written and
 -- `reader_schema` what the caller wants back.
 --
--- Returns the value and the position just past it.
+-- A null at the top level comes back as nil, unlike one nested in a record,
+-- array or map -- there is no table slot for it to keep alive. So a nil result
+-- does not mean the decode failed: failures raise.
+--
+-- @param sc the schema the data was written with, parsed or not
+-- @param data the buffer
+-- @param pos 1-based offset, default 1
+-- @param reader_schema optional schema to resolve the value into
+-- @return the value and the position just past it
+-- @raise when `data` is not a string, `pos` is not a positive integer, the
+--        input is truncated or malformed, or the two schemas cannot be
+--        resolved against each other
+-- @function decode
 function M.decode(sc, data, pos, reader_schema)
     sc = avro_schema.parse(sc)
     if type(data) ~= 'string' then
@@ -843,6 +951,16 @@ validators['record'] = function(sc, v)
 end
 
 --- True when `value` can be encoded against `sc`.
+--
+-- Stricter than encode() for records -- a key the schema does not name
+-- disqualifies the value here and is ignored there -- because this is what
+-- picks a union's branch, and without that rule every table would match every
+-- record in a union.
+--
+-- @param sc a parsed schema
+-- @param value the value to test
+-- @return boolean; never raises, an unknown kind is simply not valid
+-- @function validate
 validate = function(sc, value)
     local fn = validators[sc.kind]
     if fn == nil then
@@ -851,6 +969,13 @@ validate = function(sc, value)
     return fn(sc, value)
 end
 
+--- True when `value` can be encoded against `sc`, parsing the schema first.
+--
+-- @param sc a schema, parsed or not
+-- @param value the value to test
+-- @return boolean
+-- @raise when the schema itself is invalid
+-- @function validate
 M.validate = function(sc, value)
     return validate(avro_schema.parse(sc), value)
 end
