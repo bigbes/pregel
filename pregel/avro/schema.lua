@@ -615,9 +615,84 @@ local function put_names(out, names)
     out[#out + 1] = ',"aliases":[' .. table.concat(parts, ',') .. ']'
 end
 
+local render_default
+
+--- Render a field default as JSON text, guided by the field's own schema.
+--
+-- json.encode alone cannot do it: an empty Lua table is both `[]` and `{}`, and
+-- it comes out as `[]` whatever the field's type. A schema given as a Lua table
+-- with `default = {}` on a map or record field therefore produced
+-- `"default":[]`, which fastavro and Java both refuse when they parse the
+-- container file's header. (A JSON-text schema escaped this only because
+-- Tarantool's json.decode tags `{}` with a map metatable.)
+--
+-- Only the container kinds need the guidance; json.encode spells everything
+-- else unambiguously. Map keys are sorted so that the same schema always
+-- renders the same bytes.
+render_default = function(out, sc, value)
+    local kind = sc.kind
+    if kind == 'union' then
+        -- The specification says a union default is a value of the first branch.
+        return render_default(out, sc.types[1], value)
+    end
+    if type(value) == 'table' then
+        if kind == 'map' then
+            local keys = {}
+            for k in pairs(value) do
+                keys[#keys + 1] = k
+            end
+            table.sort(keys)
+            out[#out + 1] = '{'
+            for i = 1, #keys do
+                if i > 1 then
+                    out[#out + 1] = ','
+                end
+                out[#out + 1] = quote(keys[i]) .. ':'
+                render_default(out, sc.values, value[keys[i]])
+            end
+            out[#out + 1] = '}'
+            return
+        end
+        if kind == 'record' then
+            out[#out + 1] = '{'
+            local written = 0
+            for i = 1, #sc.fields do
+                local f = sc.fields[i]
+                local got = value[f.name]
+                -- type() rather than ~= nil: box.NULL compares equal to nil.
+                if type(got) ~= 'nil' then
+                    written = written + 1
+                    if written > 1 then
+                        out[#out + 1] = ','
+                    end
+                    out[#out + 1] = quote(f.name) .. ':'
+                    render_default(out, f.type, got)
+                end
+            end
+            out[#out + 1] = '}'
+            return
+        end
+        if kind == 'array' then
+            out[#out + 1] = '['
+            for i = 1, #value do
+                if i > 1 then
+                    out[#out + 1] = ','
+                end
+                render_default(out, sc.items, value[i])
+            end
+            out[#out + 1] = ']'
+            return
+        end
+    end
+    out[#out + 1] = json.encode(value)
+end
+
 local tojson_of
 
-tojson_of = function(sc, seen, out)
+--- `enclosing` is the namespace a reader would apply to an unqualified name at
+--  this point, which is what decides whether a null namespace has to be spelled
+--  out below.
+tojson_of = function(sc, seen, out, enclosing)
     local kind = sc.kind
     if PRIMITIVE[kind] then
         if sc.props == nil then
@@ -635,7 +710,7 @@ tojson_of = function(sc, seen, out)
             if i > 1 then
                 out[#out + 1] = ','
             end
-            tojson_of(sc.types[i], seen, out)
+            tojson_of(sc.types[i], seen, out, enclosing)
         end
         out[#out + 1] = ']'
         return out
@@ -643,7 +718,7 @@ tojson_of = function(sc, seen, out)
     if kind == 'array' or kind == 'map' then
         out[#out + 1] = '{"type":"' .. kind .. '","' ..
                         (kind == 'array' and 'items' or 'values') .. '":'
-        tojson_of(kind == 'array' and sc.items or sc.values, seen, out)
+        tojson_of(kind == 'array' and sc.items or sc.values, seen, out, enclosing)
         put_props(out, sc.props)
         out[#out + 1] = '}'
         return out
@@ -654,8 +729,16 @@ tojson_of = function(sc, seen, out)
     end
     seen[sc.fullname] = true
     -- The name is emitted as a fullname, which makes the namespace attribute
-    -- redundant and the result independent of where the type is nested.
+    -- redundant and the result independent of where the type is nested -- with
+    -- one exception. A type in the null namespace has a fullname with no dot in
+    -- it, so nested inside a namespaced type a re-parse would hand it the
+    -- enclosing namespace and name a different type than the data was written
+    -- with. Spell the null namespace out, as Java's Schema.toString does.
     out[#out + 1] = '{"type":"' .. kind .. '","name":' .. quote(sc.fullname)
+    if sc.namespace == nil and enclosing ~= nil then
+        out[#out + 1] = ',"namespace":""'
+    end
+    enclosing = sc.namespace
     if sc.doc ~= nil then
         out[#out + 1] = ',"doc":' .. quote(sc.doc)
     end
@@ -668,12 +751,13 @@ tojson_of = function(sc, seen, out)
                 out[#out + 1] = ','
             end
             out[#out + 1] = '{"name":' .. quote(f.name) .. ',"type":'
-            tojson_of(f.type, seen, out)
+            tojson_of(f.type, seen, out, enclosing)
             if f.doc ~= nil then
                 out[#out + 1] = ',"doc":' .. quote(f.doc)
             end
             if f.has_default then
-                out[#out + 1] = ',"default":' .. json.encode(f.default_json)
+                out[#out + 1] = ',"default":'
+                render_default(out, f.type, f.default_json)
             end
             if f.order ~= nil then
                 out[#out + 1] = ',"order":' .. quote(f.order)

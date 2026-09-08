@@ -390,3 +390,76 @@ g.test_bad_default_is_rejected_on_use = function()
     t.assert_equals(ok, false)
     t.assert_str_contains(tostring(err), 'default for int must be a number')
 end
+
+--------------------------------------------------------------------------------
+-- tojson: what an object container file's avro.schema metadata carries
+--------------------------------------------------------------------------------
+
+--- tojson() emits every named type by fullname and nothing else, so a type in
+--  the null namespace nested inside a namespaced one came out as bare "Inner"
+--  and re-parsed as "a.b.Inner" -- a different type from the one the data was
+--  written with. Java's Schema.toString writes "namespace":"" here.
+g.test_tojson_keeps_a_null_namespace_nested_in_a_namespaced_type = function()
+    local sc = schema.parse('{"type":"record","name":"Outer","namespace":"a.b",' ..
+        '"fields":[{"name":"i","type":{"type":"record","name":"Inner",' ..
+        '"namespace":"","fields":[]}}]}')
+    t.assert_equals(sc.fields[1].type.fullname, 'Inner')
+
+    local again = schema.parse(sc:tojson())
+    t.assert_equals(again.fields[1].type.fullname, 'Inner')
+    t.assert_equals(again.fields[1].type.namespace, nil)
+    -- Same schema in, same fingerprint out.
+    t.assert_equals(again:canonical(), sc:canonical())
+    t.assert_equals(again:fingerprint_hex(), sc:fingerprint_hex())
+end
+
+--- A schema with no namespace anywhere needs no namespace attribute: the
+--  fullname is already unambiguous, and the header stays as it was.
+g.test_tojson_does_not_add_a_namespace_where_none_is_in_effect = function()
+    local sc = schema.parse('{"type":"record","name":"R","fields":[' ..
+                            '{"name":"a","type":"int"}]}')
+    t.assert_equals(sc:tojson(),
+        '{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}')
+end
+
+g.test_tojson_round_trips_a_namespaced_schema_unchanged = function()
+    local sc = schema.parse('{"type":"record","name":"a.b.Outer","fields":[' ..
+        '{"name":"i","type":{"type":"record","name":"a.b.Inner","fields":[]}}]}')
+    local again = schema.parse(sc:tojson())
+    t.assert_equals(again.fields[1].type.fullname, 'a.b.Inner')
+    t.assert_equals(again:canonical(), sc:canonical())
+end
+
+--- A default given in a Lua-table schema as an empty table is an empty Lua
+--  table, which json.encode renders as [] whatever the field's type. fastavro
+--  and Java both refuse "default":[] on a map or record field.
+g.test_tojson_renders_an_empty_map_or_record_default_as_an_object = function()
+    local sc = schema.parse({type = 'record', name = 'R', fields = {
+        {name = 'm', type = {type = 'map', values = 'int'}, default = {}},
+    }})
+    t.assert_str_contains(sc:tojson(), '"default":{}')
+    t.assert_equals(schema.parse(sc:tojson()):canonical(), sc:canonical())
+
+    local rec = schema.parse({type = 'record', name = 'R', fields = {
+        {name = 'r', type = {type = 'record', name = 'Inner', fields = {}},
+         default = {}},
+    }})
+    t.assert_str_contains(rec:tojson(), '"default":{}')
+end
+
+--- The array direction must not regress: an empty array default is [].
+g.test_tojson_renders_an_empty_array_default_as_an_array = function()
+    local sc = schema.parse({type = 'record', name = 'R', fields = {
+        {name = 'a', type = {type = 'array', items = 'int'}, default = {}},
+    }})
+    t.assert_str_contains(sc:tojson(), '"default":[]')
+end
+
+--- A union default is a value of the first branch, so an empty table under a
+--  union of map goes out as an object too.
+g.test_tojson_renders_an_empty_union_default_by_its_first_branch = function()
+    local sc = schema.parse({type = 'record', name = 'R', fields = {
+        {name = 'u', type = {{type = 'map', values = 'int'}, 'null'}, default = {}},
+    }})
+    t.assert_str_contains(sc:tojson(), '"default":{}')
+end
