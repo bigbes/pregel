@@ -9,6 +9,9 @@
 --         - '127.0.0.1:3302'
 --         - '127.0.0.1:3303'
 --       pool_size: 1000
+--
+-- `workers` may be left out: the role then reads the cluster config and takes
+-- every instance running pregel.roles.worker for a job of this `name`.
 --       autostart: false               # run the job as soon as it can
 --       user: pregel                   # net.box user for outgoing calls
 --       password: secret
@@ -64,9 +67,6 @@ end
 
 local function validate(cfg)
     common.check_cfg(ROLE, cfg, SPEC)
-    if cfg.workers == nil then
-        error("%s: option 'workers' is required", ROLE)
-    end
     common.load_app(ROLE, cfg.app, {'obtain_name'})
 end
 
@@ -121,8 +121,11 @@ local function apply(cfg)
 
     local app = common.load_app(ROLE, cfg.app, {'obtain_name'})
 
+    -- Resolved once, here: a running job cannot change its worker list.
+    local workers = cfg.workers or common.discover_workers(ROLE, cfg.name)
+
     local instance = master.new(cfg.name, {
-        workers        = cfg.workers,
+        workers        = workers,
         obtain_name    = app.obtain_name,
         master_preload = app.master_preload,
         pool_size      = cfg.pool_size,
@@ -146,7 +149,7 @@ local function apply(cfg)
         state.fiber = fiber.create(autostart_body(instance, app))
     end
     log.info("%s: job '%s' is configured over %d worker(s), autostart %s",
-             ROLE, cfg.name, #cfg.workers, tostring(cfg.autostart or false))
+             ROLE, cfg.name, #workers, tostring(cfg.autostart or false))
 end
 
 local function stop()

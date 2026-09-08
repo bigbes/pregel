@@ -10,6 +10,12 @@
 --         - '127.0.0.1:3302'           # this instance included
 --         - '127.0.0.1:3303'
 --       pool_size: 1000
+--
+-- `master` and `workers` may both be left out: the role then reads the cluster
+-- config and takes every instance that runs pregel.roles.worker (or
+-- pregel.roles.master) for a job of this `name`. That is resolved once, by the
+-- apply that creates the job -- adding a worker to the cluster does not move a
+-- running one, and cannot: see the note on reconfiguration below.
 --       delayed_push: false
 --       squash_only: false
 --       queue_engine: space            # 'space' or 'table'
@@ -56,7 +62,7 @@ local error = require('pregel.utils').error
 local ROLE = 'pregel.roles.worker'
 
 local SPEC = common.spec({
-    master       = {types = {string = true}, required = true},
+    master       = {types = {string = true}},
     delayed_push = {types = {boolean = true}},
     squash_only  = {types = {boolean = true}},
     queue_engine = {
@@ -80,9 +86,6 @@ local state = {
 
 local function validate(cfg)
     common.check_cfg(ROLE, cfg, SPEC)
-    if cfg.workers == nil then
-        error("%s: option 'workers' is required", ROLE)
-    end
     common.load_app(ROLE, cfg.app, {'compute', 'obtain_name'})
 end
 
@@ -101,9 +104,14 @@ local function apply(cfg)
 
     local app = common.load_app(ROLE, cfg.app, {'compute', 'obtain_name'})
 
+    -- Resolved once, here, and not re-read on a later apply: a running job
+    -- cannot change its worker list, which is what the check above says.
+    local workers = cfg.workers or common.discover_workers(ROLE, cfg.name)
+    local master_uri = cfg.master or common.discover_master(ROLE, cfg.name)
+
     local instance = worker.new(cfg.name, {
-        workers        = cfg.workers,
-        master         = cfg.master,
+        workers        = workers,
+        master         = master_uri,
         compute        = app.compute,
         combiner       = app.combiner,
         obtain_name    = app.obtain_name,
@@ -121,8 +129,10 @@ local function apply(cfg)
 
     state.worker = instance
     state.cfg = table.deepcopy(cfg)
+    -- The URIs are not logged: roles_cfg may spell one as
+    -- 'user:password@host:port', and a log line is the wrong place for that.
     log.info("%s: job '%s' is running over %d worker(s)", ROLE, cfg.name,
-             #cfg.workers)
+             #workers)
 end
 
 --- Tear the job down: pusher fibers, waitpool fibers, net.box connections and

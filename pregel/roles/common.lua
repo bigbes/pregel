@@ -213,6 +213,109 @@ function M.add_aggregators(instance, app)
 end
 
 -------------------------------------------------------------------------------
+-- Discovery
+-------------------------------------------------------------------------------
+
+M.WORKER_ROLE = 'pregel.roles.worker'
+M.MASTER_ROLE = 'pregel.roles.master'
+
+--- The URI another instance can be reached at.
+--
+-- config:instance_uri() answers with a table, not a string: {uri = ..., login
+-- = ..., params = ...}, where the login is whatever iproto.advertise.peer
+-- carries -- the replication user, in a stock cbuilder config. Only the
+-- address is taken from it; who pregel connects as is roles_cfg's `user`, and
+-- borrowing the replication login would connect the graph traffic as a user
+-- that has no lua_call grant and every reason not to get one.
+local function peer_uri(config, instance)
+    local uri = config:instance_uri('peer', {instance = instance})
+    if type(uri) == 'table' then
+        uri = uri.uri
+    end
+    if type(uri) ~= 'string' then
+        return nil
+    end
+    return uri
+end
+
+local function has_role(roles, role)
+    for _, name in ipairs(roles or {}) do
+        if name == role then
+            return true
+        end
+    end
+    return false
+end
+
+--- Every instance in the cluster running `role` for the job called `job`.
+--
+-- Returns an array of URIs ordered by instance name, so two instances reading
+-- the same config produce the same list. (mpool re-orders the buckets by peer
+-- uuid anyway, which is what actually makes the sharding agree; this only
+-- keeps the logs and the errors reproducible.)
+--
+-- The job name is part of the test on purpose: one cluster can run several
+-- pregel jobs, and an instance belongs to the one whose name its own roles_cfg
+-- names.
+function M.instances_of(role_name, job)
+    local config = require('config')
+    local rv = {}
+    for instance in pairs(config:instances()) do
+        local roles = config:get('roles', {instance = instance})
+        if has_role(roles, role_name) then
+            local roles_cfg = config:get('roles_cfg', {instance = instance})
+            local cfg = (roles_cfg or {})[role_name]
+            if type(cfg) == 'table' and cfg.name == job then
+                table.insert(rv, {
+                    instance = instance,
+                    uri      = peer_uri(config, instance),
+                })
+            end
+        end
+    end
+    table.sort(rv, function(a, b) return a.instance < b.instance end)
+    return rv
+end
+
+--- URIs only, refusing an instance the config gives no address for.
+local function uris_of(role, role_name, job)
+    local rv = {}
+    for _, found in ipairs(M.instances_of(role_name, job)) do
+        if found.uri == nil then
+            error("%s: cannot discover the URI of instance '%s', which runs " ..
+                  "%s for job '%s'; set the URIs in roles_cfg instead",
+                  role, found.instance, role_name, job)
+        end
+        table.insert(rv, found.uri)
+    end
+    return rv
+end
+
+--- Every worker of `job`, from the cluster config.
+function M.discover_workers(role, job)
+    local uris = uris_of(role, M.WORKER_ROLE, job)
+    if #uris == 0 then
+        error("%s: no instance in the cluster config runs %s for job '%s'; " ..
+              "set roles_cfg.workers instead", role, M.WORKER_ROLE, job)
+    end
+    return uris
+end
+
+--- The single master of `job`, from the cluster config.
+function M.discover_master(role, job)
+    local uris = uris_of(role, M.MASTER_ROLE, job)
+    if #uris == 0 then
+        error("%s: no instance in the cluster config runs %s for job '%s'; " ..
+              "set roles_cfg.master instead", role, M.MASTER_ROLE, job)
+    end
+    if #uris > 1 then
+        error("%s: %d instances in the cluster config run %s for job '%s'; " ..
+              "a job has one master", role, #uris, M.MASTER_ROLE, job)
+    end
+    return uris[1]
+end
+
+-------------------------------------------------------------------------------
 -- Misc
 -------------------------------------------------------------------------------
 
