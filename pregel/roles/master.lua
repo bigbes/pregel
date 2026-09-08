@@ -91,6 +91,17 @@ end
 -- Everything here can block for as long as the job takes, which is why it is a
 -- fiber and not part of apply(): a config apply that waited for a graph
 -- algorithm to converge would hold up the whole config framework.
+--- Has this fiber been cancelled?
+--
+-- There is no fiber.is_cancelled in Lua -- it exists in the C API only, and
+-- calling it raises 'attempt to call field is_cancelled (a nil value)', which
+-- inside an xpcall message handler becomes 'error in error handling' and takes
+-- the real error with it. fiber.testcancel() is the Lua spelling, and it
+-- raises rather than answering, so the question is asked through pcall.
+local function is_cancelled()
+    return not pcall(fiber.testcancel)
+end
+
 --- Log a failure with the frames it happened in, the way utils.xpcall_tb does.
 --
 -- Not xpcall_tb itself, because stop() cancels this fiber and the cancellation
@@ -99,7 +110,7 @@ end
 -- an instance used to produce.
 local function autostart_traceback(instance)
     return function(err)
-        if fiber.is_cancelled() then
+        if is_cancelled() then
             return err
         end
         log.error("%s: job '%s' failed: %s", ROLE, instance.name, tostring(err))
@@ -141,7 +152,7 @@ local function autostart_body(instance, app)
             -- so both tests below hold for a cancellation -- and neither the
             -- 'idle' stop() has just set nor the 'loading' of a job that
             -- replaced this one is ours to overwrite.
-            if fiber.is_cancelled() or state.master ~= instance then
+            if is_cancelled() or state.master ~= instance then
                 log.info("%s: job '%s' was stopped while running", ROLE,
                          instance.name)
                 return
