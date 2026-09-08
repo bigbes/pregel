@@ -273,6 +273,10 @@ local worker_mt = {
         -- once every message this shard produced has been acknowledged by the
         -- worker that owns its receiver.
         --
+        -- A vertex is computed when it is active or has a message waiting, and
+        -- ends the superstep halted unless its compute function voted to stay
+        -- awake -- see pregel.vertex.
+        --
         -- @param superstep the superstep number, which vertices read
         -- @return 'ok'
         -- @raise whatever a compute function or a delivery raised
@@ -294,7 +298,12 @@ local worker_mt = {
                 end
                 local vertex_object = self.vertex_pool:pop(tuple)
                 vertex_object.__superstep = superstep
-                vertex_object:vote_halt(false)
+                -- No vote_halt(false) here: halting is what a compute
+                -- function that says nothing now means, and waking a halted
+                -- vertex before its compute would both record a vote it never
+                -- cast and mark it modified for a flag that ends up back where
+                -- it started. Being computed at all is the wake-up; see
+                -- tuple_filter.
                 vertex_compute(vertex_object)
                 self.mqueue:delete(vertex_object.__id)
                 self.vertex_pool:push(vertex_object)

@@ -22,6 +22,11 @@ end
 
 --- A vertex object wired to a fake instance, with `compute_func` as its
 -- compute function.
+--
+-- A compute function here that ends with vote_halt(false) is keeping the halt
+-- flag out of the test: not voting halts the vertex, which would move the
+-- second field of every tuple asserted below and turn a test about edges into
+-- a test about halting. The halt rule itself is under "Halt by default".
 local function make(compute_func, opts)
     local pregel = fake_pregel.new(opts)
     local pool = vertex.pool_new{
@@ -152,6 +157,103 @@ g.test_vote_halt_tracks_in_progress = function()
 end
 
 -------------------------------------------------------------------------------
+-- Halt by default
+--
+-- A compute function that returns without voting leaves its vertex halted; the
+-- 1.6 behaviour was the opposite, and a job whose compute forgot to vote ran
+-- until something killed it. The three cases below are the whole rule, and
+-- each one also pins what it costs: whether the vertex ends active, and
+-- whether the tuple is written at all.
+-------------------------------------------------------------------------------
+
+g.test_a_silent_compute_halts_the_vertex = function()
+    local pool, pregel = make(function() end, {in_progress = 1})
+    local v = pop(pool, 'alice', false, 0, {})
+
+    compute(v)
+
+    t.assert_equals(v.__halt, true)
+    t.assert_equals(pregel.in_progress, 0)
+    -- The halt is a change, so it is persisted -- reading it back from the
+    -- space is the only thing later supersteps go by.
+    t.assert_equals(pregel.data_space:last(), {'alice', true, 0, {}})
+end
+
+g.test_vote_halt_false_keeps_the_vertex_active = function()
+    local pool, pregel = make(function(self)
+        self:vote_halt(false)
+    end, {in_progress = 1})
+    local v = pop(pool, 'alice', false, 0, {})
+
+    compute(v)
+
+    t.assert_equals(v.__halt, false)
+    t.assert_equals(pregel.in_progress, 1)
+    -- Nothing changed, so nothing is written.
+    t.assert_equals(#pregel.data_space.replaced, 0)
+end
+
+g.test_vote_halt_true_halts_the_vertex = function()
+    local pool, pregel = make(function(self)
+        self:vote_halt(true)
+    end, {in_progress = 1})
+    local v = pop(pool, 'alice', false, 0, {})
+
+    compute(v)
+
+    t.assert_equals(v.__halt, true)
+    t.assert_equals(pregel.in_progress, 0)
+    t.assert_equals(pregel.data_space:last(), {'alice', true, 0, {}})
+end
+
+-- The message-woken case: the vertex is already halted when compute runs, so
+-- the default halt must be a no-op rather than another decrement.
+g.test_a_silent_compute_on_a_halted_vertex_costs_nothing = function()
+    local pool, pregel = make(function() end, {in_progress = 0})
+    local v = pop(pool, 'alice', true, 0, {})
+
+    compute(v)
+
+    t.assert_equals(v.__halt, true)
+    t.assert_equals(pregel.in_progress, 0)
+    t.assert_equals(#pregel.data_space.replaced, 0)
+end
+
+-- ...and a halted vertex that votes to stay awake is counted once, which is
+-- what makes vote_halt(false) worth having at all.
+g.test_a_halted_vertex_can_vote_itself_active = function()
+    local pool, pregel = make(function(self)
+        self:vote_halt(false)
+    end, {in_progress = 0})
+    local v = pop(pool, 'alice', true, 0, {})
+
+    compute(v)
+
+    t.assert_equals(v.__halt, false)
+    t.assert_equals(pregel.in_progress, 1)
+    t.assert_equals(pregel.data_space:last(), {'alice', false, 0, {}})
+end
+
+-- The flag is per vertex, not per pooled object: the same table serves
+-- thousands of vertices, and a vote by one of them must not speak for the
+-- next.
+g.test_the_vote_does_not_survive_apply = function()
+    local pool, pregel = make(function() end, {in_progress = 2})
+    local v = pop(pool, 'alice', false, 0, {})
+    v:vote_halt(false)
+    t.assert_equals(v.__voted, true)
+
+    pool:push(v)
+    local v2 = pop(pool, 'bob', false, 0, {})
+    t.assert_is(v2, v)
+    t.assert_equals(v2.__voted, false)
+
+    compute(v2)
+    t.assert_equals(v2.__halt, true)
+    t.assert_equals(pregel.in_progress, 1)
+end
+
+-------------------------------------------------------------------------------
 -- send_message
 -------------------------------------------------------------------------------
 
@@ -181,6 +283,7 @@ end
 g.test_add_edge_local_two_arg_form = function()
     local pool, pregel = make(function(self)
         self:add_edge('carol', 5)
+        self:vote_halt(false)
     end)
     local v = pop(pool, 'alice', false, 0, {{'bob', 1}})
     compute(v)
@@ -239,6 +342,7 @@ end
 g.test_delete_edge_local = function()
     local pool, pregel = make(function(self)
         self:delete_edge('bob')
+        self:vote_halt(false)
     end)
     local v = pop(pool, 'alice', false, 0, {{'bob', 1}, {'carol', 2}})
     compute(v)
@@ -383,9 +487,12 @@ end
 -- compute / persistence
 -------------------------------------------------------------------------------
 
+-- Halted to begin with, so the compute really does nothing at all: a compute
+-- that touches neither the value nor the edges still halts an active vertex,
+-- and that is a change like any other.
 g.test_compute_does_not_write_an_untouched_vertex = function()
     local pool, pregel = make(function() end)
-    local v = pop(pool, 'alice', false, 7, {{'bob', 1}})
+    local v = pop(pool, 'alice', true, 7, {{'bob', 1}})
     t.assert_equals(compute(v), false)
     t.assert_equals(#pregel.data_space.replaced, 0)
 end
@@ -393,6 +500,7 @@ end
 g.test_compute_writes_a_changed_value = function()
     local pool, pregel = make(function(self)
         self:set_value(99)
+        self:vote_halt(false)
     end)
     local v = pop(pool, 'alice', false, 7, {{'bob', 1}})
     t.assert_equals(compute(v), true)
@@ -405,6 +513,7 @@ end
 g.test_compute_writes_edge_changes_without_a_value_change = function()
     local pool, pregel = make(function(self)
         self:add_edge('carol', 5)
+        self:vote_halt(false)
     end)
     local v = pop(pool, 'alice', false, 7, {})
     t.assert_equals(compute(v), false)
@@ -429,7 +538,7 @@ end
 -- left in them by one graph vertex was applied to the next one the object
 -- served. apply() has to clear them.
 g.test_apply_clears_pending_edge_mutations = function()
-    local pool, pregel = make()
+    local pool, pregel = make(function(self) self:vote_halt(false) end)
     local v = pop(pool, 'alice', false, 0, {})
     -- Queue mutations without running compute(), the way a compute function
     -- that raised part-way through would leave them.

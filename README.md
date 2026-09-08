@@ -594,14 +594,23 @@ The compute function is handed a vertex object. Vertex objects are pooled and
 reused across the vertices of a superstep, so nothing may be kept between
 calls.
 
+**Halting is the default.** A compute function that returns without calling
+`vote_halt` leaves its vertex halted, exactly as if it had ended with
+`vote_halt(true)`. A vertex that wants another superstep without a message to
+wake it asks with `vote_halt(false)`; a message wakes a halted vertex either
+way. So a compute function that forgets to vote ends the job rather than
+running it forever — which is what it used to do.
+
 Base:
 
 * `vertex:get_name()` — the name pregel routes and stores by.
 * `vertex:get_value()` / `vertex:set_value(value)` — the user value.
 * `vertex:get_superstep()` — the superstep number, counting from 1.
 * `vertex:vote_halt([is_halted = true])` — a halted vertex with no messages is
-  skipped in later supersteps. A vertex is automatically un-halted for a
-  superstep in which it has messages waiting.
+  skipped in later supersteps. A vertex with messages waiting is computed
+  whether it is halted or not, but it stays halted afterwards unless that
+  superstep's compute called `vote_halt(false)`. Not calling `vote_halt` at all
+  halts the vertex.
 * `vertex:get_worker_context()` — the `worker_context` this instance was
   created with, shared by every vertex on it.
 

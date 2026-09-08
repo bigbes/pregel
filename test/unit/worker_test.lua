@@ -623,6 +623,68 @@ g.test_run_superstep_skips_halted_vertices_without_messages = function()
     drop_worker(w)
 end
 
+-- Halt by default, through a real superstep rather than through the vertex
+-- object: run_superstep() used to un-halt every vertex it computed, so a
+-- compute that never voted kept the whole graph active and the master looped
+-- forever. What the worker has to get right is `in_progress`, since that is
+-- the only thing the master sees.
+local function run_one_superstep_with(compute)
+    local w, name = make_worker({compute = compute})
+    w.data_space:replace{'a', false, {name = 'a'}, {}}
+    w.data_space:replace{'b', false, {name = 'b'}, {}}
+    w.in_progress = 2
+    local m = make_master(name)
+    w:run_superstep(1)
+    local vertices = vertices_of(w)
+    local rv = {in_progress = w.in_progress,
+                a = vertices['a'].halted, b = vertices['b'].halted}
+    m:stop()
+    drop_worker(w)
+    return rv
+end
+
+g.test_a_silent_compute_halts_every_vertex = function()
+    t.assert_equals(run_one_superstep_with(function() end),
+                    {in_progress = 0, a = true, b = true})
+end
+
+g.test_vote_halt_false_leaves_every_vertex_active = function()
+    t.assert_equals(run_one_superstep_with(function(self)
+        self:vote_halt(false)
+    end), {in_progress = 2, a = false, b = false})
+end
+
+g.test_vote_halt_true_halts_every_vertex = function()
+    t.assert_equals(run_one_superstep_with(function(self)
+        self:vote_halt(true)
+    end), {in_progress = 0, a = true, b = true})
+end
+
+-- A compute that votes to stay awake keeps the job going with no message in
+-- flight at all -- which is the loop max_supersteps exists to bound, and the
+-- shape the halt-by-default rule stops a forgetful compute from falling into.
+g.test_a_never_halting_compute_keeps_running = function()
+    local steps = 0
+    local w, name = make_worker({
+        compute = function(self)
+            self:vote_halt(false)
+        end,
+    })
+    w.data_space:replace{'a', false, {name = 'a'}, {}}
+    w.in_progress = 1
+    local m = make_master(name)
+    for step = 1, 3 do
+        w:run_superstep(step)
+        w:after_superstep()
+        steps = step
+        t.assert_equals(w.in_progress, 1, 'superstep ' .. step)
+    end
+    t.assert_equals(steps, 3)
+    t.assert_equals(w.mqueue:len(), 0)
+    m:stop()
+    drop_worker(w)
+end
+
 -------------------------------------------------------------------------------
 -- Master
 -------------------------------------------------------------------------------

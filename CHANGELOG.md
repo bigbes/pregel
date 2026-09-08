@@ -38,6 +38,7 @@ than ported — the vendored C Avro binding and the tarantoolctl deployment.
 
 ### Changed
 
+- Halting is what a superstep does by default: a compute function that returns without calling `vote_halt` leaves its vertex halted, where it used to leave it active. `run_superstep` un-halted every vertex it was about to compute, so a compute that never voted kept the whole graph active and the master looped until something killed it. A vertex that wants another superstep with no message to wake it says `vote_halt(false)`; a message still wakes a halted vertex, and every example already voted explicitly (pregel-3v3).
 - RPC between instances is `conn:call()` against the `_G.pregel` registry rather than `conn:eval()`, so a peer needs `execute` on four `lua_call` names instead of `execute` on `universe`.
 - Spaces and indexes are created for Tarantool 3: `space:auto_increment()` is gone, so the primary keys of the queue and topology-mutation spaces draw from a sequence.
 - `worker.new`'s `squash_only` and `queue_engine` options are read from the options table, so they now do something.

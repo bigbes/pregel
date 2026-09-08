@@ -4,6 +4,13 @@
 -- back, so the same table serves thousands of graph vertices and apply() has to
 -- leave no trace of the previous one.
 --
+-- Halting is the default: a compute function that returns without calling
+-- vote_halt leaves its vertex halted, exactly as if it had called
+-- vote_halt(true). A vertex that wants another superstep without a message to
+-- wake it says so with vote_halt(false); a message wakes a halted vertex
+-- either way. So the job a compute function forgets to end is the one that
+-- ends immediately, rather than the one that never ends.
+--
 -- Tuple layout of data_<name>:
 --   1 <id>    string   vertex name
 --   2 <halt>  boolean  voted to halt
@@ -16,6 +23,11 @@ local json = require('json')
 
 local table_clear = require('table.clear')
 
+-- Declared here so the private compute() below can reach vote_halt: the
+-- default halt has to go through the public method rather than assign
+-- __halt itself, or the worker's count of active vertices drifts.
+local vertex_methods
+
 --- Methods the worker drives the object with, kept off the user-facing
 --  metatable so a compute function cannot reach them by accident.
 local vertex_private_methods = {
@@ -27,6 +39,10 @@ local vertex_private_methods = {
     -- @function apply
     apply = function(self, tuple)
         self.__modified = false
+        -- Cleared per vertex, not per object: whether the *previous* vertex's
+        -- compute voted says nothing about this one, and it is the absence of
+        -- a vote that halts.
+        self.__voted = false
         self.__id, self.__halt, self.__value, self.__edges = tuple:unpack(1, 4)
         -- The pool hands this object straight on to the next vertex, so edge
         -- mutations the previous one requested and did not get to flush would
@@ -36,6 +52,14 @@ local vertex_private_methods = {
         return self
     end,
     --- Run the user's compute function and persist what it changed.
+    --
+    -- A compute function that returned without calling vote_halt leaves the
+    -- vertex halted: the default halt is applied here, between the user's
+    -- function and the write, and it goes through vote_halt(true) so the
+    -- worker's count of active vertices stays exact and an already-halted
+    -- vertex is not marked modified for nothing. It cannot be applied by
+    -- run_superstep() instead -- by the time compute() has returned the tuple
+    -- is already written, and the halt would need a second write.
     --
     -- The tuple is replaced only when something actually changed -- the value,
     -- the halt flag, or a queued edge addition or removal -- so a vertex that
@@ -47,6 +71,9 @@ local vertex_private_methods = {
     -- @function compute
     compute = function(self)
         self:__compute_func()
+        if not self.__voted then
+            vertex_methods.vote_halt(self, true)
+        end
         if self.__modified or
            #self.__edges_add > 0 or
            #self.__edges_del > 0 then
@@ -107,7 +134,7 @@ local vertex_private_methods = {
     end,
 }
 
-local vertex_methods = {
+vertex_methods = {
     --[[--
     -- | Base API
     -- * self:vote_halt        ([is_halted = true])
@@ -124,14 +151,24 @@ local vertex_methods = {
     --]]--
     --- Declare this vertex done (or undo that).
     --
+    -- Halting is the default outcome of a superstep: a compute function that
+    -- returns without calling this leaves the vertex halted, so
+    -- vote_halt(false) is how a vertex asks for another superstep it has no
+    -- message to earn. A halted vertex is woken again by a message -- it is
+    -- computed in the superstep the message is read in -- but staying awake
+    -- past that superstep still takes a vote_halt(false).
+    --
     -- Maintains the worker's count of active vertices, so it must be the only
-    -- way the halt flag is set. A halted vertex is woken again by a message,
-    -- which is what makes an unhalt from here rarely necessary.
+    -- way the halt flag is set.
     --
     -- @param is_halted boolean, default true
     -- @function vote_halt
     vote_halt = function(self, is_halted)
         if is_halted == nil then is_halted = true end
+        -- Recorded whichever way the vote went: compute() reads it to tell a
+        -- compute function that decided to stay awake from one that said
+        -- nothing at all.
+        self.__voted = true
         if self.__halt ~= is_halted then
             self.__modified = true
             self.__halt = is_halted
@@ -389,6 +426,7 @@ local function vertex_new()
         __superstep           = 0,
         __id                  = 0,
         __modified            = false,
+        __voted               = false,
         __halt                = false,
         __edges               = nil,
         __value               = 0,

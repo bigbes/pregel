@@ -60,6 +60,26 @@ local function expected_max()
     return best
 end
 
+-- cluster:run() waits on the master for as long as the master takes, which is
+-- the right default -- an algorithm is allowed to be slow -- and exactly wrong
+-- for the two tests below, whose subject is a run that must *stop*. Break
+-- either mechanism and an unbounded run has nothing to end it, so the suite
+-- would hang here instead of failing. This is the same call with a deadline on
+-- the net.box request, so the failure is a message rather than a wedged
+-- runner; the whole 50-vertex ring converges in under a second.
+local RUN_TIMEOUT = 30
+
+local function run_bounded()
+    return c.master:exec(function()
+        local m = _G.master_instance
+        m:wait_up()
+        if m.preload_func ~= nil then
+            m:preload()
+        end
+        return m:start()
+    end, nil, {timeout = RUN_TIMEOUT})
+end
+
 -------------------------------------------------------------------------------
 
 g.test_max_value_over_a_ring = function()
@@ -88,6 +108,53 @@ g.test_max_value_over_a_ring = function()
 
     -- Nothing left undelivered.
     t.assert_equals(c:pending_messages('maxval'), 0)
+end
+
+-- The same algorithm with the vote_halt(true) taken out. It has to reach the
+-- same answer in the same number of supersteps: not voting halts the vertex,
+-- so the only thing the explicit vote in MAX_VALUE_COMPUTE buys is being
+-- explicit. Before halt-by-default this compute never terminated -- the master
+-- would still be looping when the test timed out.
+local FORGETFUL_MAX_VALUE_COMPUTE = [[
+function(self)
+    local value = self:get_value().value
+    local best = value
+    for _, msg in self:pairs_messages() do
+        if msg > best then best = msg end
+    end
+    if self:get_superstep() == 1 or best > value then
+        local v = self:get_value()
+        self:set_value({id = v.id, name = v.name, value = best})
+        for _, dest in self:pairs_edges() do
+            self:send_message(dest, best)
+        end
+    end
+end
+]]
+
+g.test_max_value_without_an_explicit_vote = function()
+    c = cluster.new(WORKER_COUNT)
+    c:create_workers('maxval', MAX_VALUE_COMPUTE)
+    c:create_master('maxval', GRAPH_PATH)
+    local voted_supersteps = run_bounded()
+    c:stop()
+
+    c = cluster.new(WORKER_COUNT)
+    c:create_workers('forgetful', FORGETFUL_MAX_VALUE_COMPUTE)
+    c:create_master('forgetful', GRAPH_PATH)
+
+    local supersteps = run_bounded()
+
+    local vertices = c:collect_vertices('forgetful')
+    local best = expected_max()
+    for _, v in ipairs(VERTICES) do
+        local got = vertices[v.name]
+        t.assert_not_equals(got, nil, 'vertex ' .. v.name .. ' is missing')
+        t.assert_equals(got.value.value, best, 'vertex ' .. v.name)
+        t.assert_equals(got.halted, true, 'vertex ' .. v.name)
+    end
+    t.assert_equals(supersteps, voted_supersteps)
+    t.assert_equals(c:pending_messages('forgetful'), 0)
 end
 
 -- The whole point of a cluster: the vertices are actually spread over the
