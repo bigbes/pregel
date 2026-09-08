@@ -231,8 +231,9 @@ tt status pregel
  pregel:worker3  RUNNING  77302  RW    ready   running  --
 ```
 
-The master role's `status()` follows the autostart fiber through `idle`,
-`loading`, `running` and then `done` (or `failed`, with the error):
+The master role's `status()` starts at `connecting` — see [Waiting for the
+peers](#waiting-for-the-peers) — and then follows the autostart fiber through
+`idle`, `loading`, `running` and `done` (or `failed`, with the error):
 
 ```
 $ tt connect pregel:master -f - <<< "return require('pregel.roles.master').status()"
@@ -272,7 +273,11 @@ Both roles take:
 * `workers` — array of every worker's net.box URI. Left out, it is discovered
   from the cluster config.
 * `pool_size` — messages per outgoing batch (default 1000).
-* `user`, `password` — the net.box credentials for outgoing calls.
+* `user`, `password` — the net.box credentials for outgoing calls. A
+  `password` without a `user` is refused: the peers would connect as `guest`
+  and the password would go unused.
+* `connect_timeout` — seconds the role keeps trying to reach its peers before
+  giving up (default 300).
 
 `pregel.roles.worker` also takes:
 
@@ -289,15 +294,58 @@ Both roles take:
 background fiber that waits for every worker, preloads the graph and runs the
 supersteps.
 
-Two limits are deliberate. A running job cannot be reconfigured: an apply that
+One limit is deliberate: a running job cannot be reconfigured. An apply that
 changes `roles_cfg` while the job exists fails with a message saying to stop
 the role first, because the worker list is resolved once and moving it under a
-running job cannot be done consistently. And both roles refuse to apply on a
-read-only instance, since both write — a worker creates the job's spaces, and
-both hand out the privileges their peers need.
+running job cannot be done consistently.
 
 An unknown key in `roles_cfg` is refused by name rather than ignored, so a
-typo stops the config from applying.
+typo stops the config from applying. So is an empty `name`, `app`, `master` or
+`user`, and an aggregator option the app module misspells.
+
+### Waiting for the peers
+
+`apply()` never waits for another instance. It is called from the config
+framework's synchronous `post_apply`, so an apply that waited would hold up the
+instance's whole startup — and an error raised from it during startup is fatal,
+which means one instance that is down would take every other one with it. The
+role builds its message pool without connecting and hands the waiting to a
+fiber of its own:
+
+* `status().state` is `connecting` until every peer has answered, with
+  `status().error` carrying net.box's own reason for the last attempt
+  (`connect to ...: No such file or directory`, `User not found or supplied
+  credentials are invalid`, ...). Each failed attempt is logged at warn level.
+* After `connect_timeout` the role gives up: `status().state` becomes `failed`
+  and the reason is published as a `warn` alert in `config:info().alerts`. The
+  instance stays up and `config:info().status` stays `ready`, because a peer
+  that is down is not a broken configuration. A `config:reload()` starts a
+  fresh attempt.
+* A rejected authentication is not retried to the timeout: net.box would keep
+  trying a hopeless login, and the answer is already known.
+
+### Replicas
+
+A role on a read-only instance does nothing. `roles:` is normally written at
+replicaset scope, so every replica of a worker replicaset carries the role
+whether or not anyone meant it to; refusing to apply there would make the
+replica's config unappliable, which at startup exits the process. Instead the
+role logs that it is inert, reports `status()` as `{state = 'read_only'}`, and
+picks the job up on the first `config:reload()` after the instance becomes
+read-write.
+
+Discovery follows the same rule from the other side: a replicaset is one
+participant of the job, not one per instance. It is addressed through the
+instance that will be read-write — the only one, if only one carries the role;
+otherwise the `rw` one under `replication.failover: off`, or the replicaset's
+`leader` under `manual`. Under `election` and `supervised` failover the config
+names no leader, so the role says so and asks for an explicit `workers` list
+rather than guessing.
+
+A discovered peer keeps the transport parameters of its `iproto.listen` entry,
+so a cluster listening with `transport: ssl` (Enterprise) is dialled over SSL.
+It does not keep the login from `iproto.advertise.peer`: that is the
+replication user, and the graph traffic connects as `roles_cfg.user`.
 
 Neither the `lua_call` grant nor the `credentials` section can name the job's
 spaces, because they do not exist when the credentials applier first runs. The
