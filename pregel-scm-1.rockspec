@@ -38,5 +38,6 @@ build = {
         ['pregel.math.vector']       = 'pregel/math/vector.lua',
         ['pregel.math.gd']           = 'pregel/math/gd.lua',
         ['pregel.math.auc']          = 'pregel/math/auc.lua',
+        ['pregel.math.percentile']   = 'pregel/math/percentile.lua',
     },
 }
