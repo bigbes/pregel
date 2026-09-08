@@ -41,5 +41,10 @@ build = {
         ['pregel.math.percentile']   = 'pregel/math/percentile.lua',
         ['pregel.math']              = 'pregel/math/init.lua',
         ['pregel.math.mf']           = 'pregel/math/mf.lua',
+        ['pregel.compress']          = 'pregel/compress/init.lua',
+        ['pregel.compress.lib']      = 'pregel/compress/lib.lua',
+        ['pregel.compress.zlib']     = 'pregel/compress/zlib.lua',
+        ['pregel.compress.zstd']     = 'pregel/compress/zstd.lua',
+        ['pregel.compress.lz4']      = 'pregel/compress/lz4.lua',
     },
 }
