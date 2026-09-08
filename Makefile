@@ -16,6 +16,14 @@ LUATEST_LUA     := $(ROCKS)/share/tarantool/rocks/luatest/scm-1/bin/luatest
 ROCKS_LUA_PATH  := $(ROCKS)/share/tarantool/?.lua;$(ROCKS)/share/tarantool/?/init.lua;;
 ROCKS_LUA_CPATH := $(ROCKS)/lib/tarantool/?.so;;
 
+# luatest wipes its VARDIR (default /tmp/t, shared by every luatest on the
+# host) at startup, so two checkouts running the suite at once delete each
+# other's live servers. Keep it private to this checkout. It has to stay short:
+# every server gets a unix socket under it and macOS caps socket paths at 103
+# bytes, which a path inside a deep checkout exceeds -- so key a /tmp
+# directory by a checksum of the checkout path instead of nesting it inside.
+export VARDIR ?= /tmp/pregel-t/$(firstword $(shell printf '%s' '$(CURDIR)' | cksum))
+
 .PHONY: deps lint lint-all test test-under test-ee
 
 deps:
