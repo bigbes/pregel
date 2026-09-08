@@ -311,6 +311,31 @@ g.test_a_server_may_carry_uri_params = function()
     pool:stop()
 end
 
+-- self_idx is what a worker-side loader is handed as its share of the graph,
+-- and it is only known once the pool has resolved its connections. Whoever
+-- needs it waits here rather than connecting a second time, which would race
+-- the close of the local bucket's own connection.
+g.test_wait_ready_blocks_until_the_pool_is_connected = function()
+    local pool = mpool.new('unit', {URI}, {connect_async = true})
+    local ok, err = pcall(pool.wait_ready, pool, 0.2)
+    t.assert_equals(ok, false)
+    t.assert_str_contains(tostring(err), 'did not reach all 1 peer(s)')
+
+    local reached = false
+    fiber.create(function()
+        pool:wait_ready(10)
+        reached = true
+    end)
+    fiber.sleep(0.05)
+    t.assert_equals(reached, false, 'wait_ready returned before the connect')
+
+    pool:wait_connected(30)
+    t.helpers.retrying({timeout = 5}, function()
+        t.assert_equals(reached, true)
+    end)
+    pool:stop()
+end
+
 g.test_a_server_must_be_a_uri_or_a_uri_table = function()
     t.assert_error_msg_contains('a URI string or a', function()
         mpool.new('unit', {42}, {connect_async = true})

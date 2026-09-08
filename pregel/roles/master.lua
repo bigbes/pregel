@@ -49,7 +49,7 @@ local common = require('pregel.roles.common')
 
 local utils     = require('pregel.utils')
 local error     = utils.error
-local xpcall_tb = utils.xpcall_tb
+local traceback = utils.traceback
 
 local ROLE = 'pregel.roles.master'
 
@@ -58,10 +58,12 @@ local SPEC = common.spec({
 })
 
 local state = {
-    cfg    = nil,
-    master = nil,
-    fiber  = nil,
-    status = {state = 'idle'},
+    cfg     = nil,
+    master  = nil,
+    fiber   = nil,
+    -- The fiber that waits for the workers; see common.connector.
+    connect = nil,
+    status  = {state = 'idle'},
 }
 
 local function set_status(name, extra)
@@ -82,10 +84,32 @@ end
 -- Everything here can block for as long as the job takes, which is why it is a
 -- fiber and not part of apply(): a config apply that waited for a graph
 -- algorithm to converge would hold up the whole config framework.
+--- Log a failure with the frames it happened in, the way utils.xpcall_tb does.
+--
+-- Not xpcall_tb itself, because stop() cancels this fiber and the cancellation
+-- arrives here as an error like any other: logging it at error level with a
+-- traceback is exactly the "spurious job failed" noise that taking the role off
+-- an instance used to produce.
+local function autostart_traceback(instance)
+    return function(err)
+        if fiber.is_cancelled() then
+            return err
+        end
+        log.error("%s: job '%s' failed: %s", ROLE, instance.name, tostring(err))
+        for _, frame in ipairs(traceback()) do
+            local name = frame.name and
+                         string.format(" function '%s'", frame.name) or ''
+            log.error('[%-4s]%s at <%s:%d>', frame.what, name, frame.file,
+                      frame.line)
+        end
+        return err
+    end
+end
+
 local function autostart_body(instance, app)
     return function()
         fiber.self():name('pregel_master_autostart', {truncate = true})
-        local ok, err = xpcall_tb(function()
+        local ok, err = xpcall(function()
             set_status('loading', {superstep = 0})
             instance:wait_up()
             if instance.preload_func ~= nil then
@@ -103,14 +127,22 @@ local function autostart_body(instance, app)
             set_status('done', {superstep = supersteps})
             log.info("%s: job '%s' finished after %d superstep(s)", ROLE,
                      instance.name, supersteps)
-        end)
+        end, autostart_traceback(instance))
         if not ok then
+            -- Two ways this is not a job failure. stop() cancels this fiber,
+            -- and it does so *after* taking the job out of the module state,
+            -- so both tests below hold for a cancellation -- and neither the
+            -- 'idle' stop() has just set nor the 'loading' of a job that
+            -- replaced this one is ours to overwrite.
+            if fiber.is_cancelled() or state.master ~= instance then
+                log.info("%s: job '%s' was stopped while running", ROLE,
+                         instance.name)
+                return
+            end
             set_status('failed', {
                 superstep = instance.superstep_count,
                 error     = tostring(err),
             })
-            log.error("%s: job '%s' failed: %s", ROLE, instance.name,
-                      tostring(err))
         end
     end
 end
@@ -139,6 +171,9 @@ local function apply(cfg)
         pool_size      = cfg.pool_size,
         user           = cfg.user,
         password       = cfg.password,
+        -- apply() must not wait for anyone: it runs inside the config
+        -- framework's synchronous post_apply. See common.connector.
+        connect_async  = true,
     })
     common.add_aggregators(instance, app)
     if cfg.user ~= nil then
@@ -153,9 +188,22 @@ local function apply(cfg)
     state.cfg = table.deepcopy(cfg)
     set_status('idle', {superstep = 0})
 
-    if cfg.autostart then
-        state.fiber = fiber.create(autostart_body(instance, app))
-    end
+    -- The job starts once the workers are reachable, not before: wait_up()
+    -- would otherwise be the first thing to notice, from inside the superstep
+    -- loop, where a missing worker is much harder to read.
+    state.connect = common.connector(ROLE, {
+        job      = cfg.name,
+        pool     = instance.mpool,
+        timeout  = cfg.connect_timeout,
+        on_ready = function()
+            -- stop() may have run while this was connecting; the role is then
+            -- no longer ours to start a job for.
+            if state.master ~= instance or not cfg.autostart then
+                return
+            end
+            state.fiber = fiber.create(autostart_body(instance, app))
+        end,
+    }):start()
     log.info("%s: job '%s' is configured over %d worker(s), autostart %s",
              ROLE, cfg.name, #workers, tostring(cfg.autostart or false))
 end
@@ -163,16 +211,25 @@ end
 local function stop()
     local instance = state.master
     local worker_fiber = state.fiber
+    local connect = state.connect
+    -- Cleared before the cancel below, so the autostart fiber's error path can
+    -- tell "the job I belong to is gone" from "the job failed" -- setting the
+    -- terminal state first was what left status() at failed/'fiber is
+    -- cancelled' after the role was taken off the instance.
     state.master = nil
     state.fiber = nil
     state.cfg = nil
-    set_status('idle')
+    state.connect = nil
 
+    if connect ~= nil then
+        connect:stop()
+    end
     if worker_fiber ~= nil and worker_fiber:status() ~= 'dead' then
         -- Cancelling is the only way out: the fiber may be blocked on a
         -- superstep that will not finish once the connections below are gone.
         worker_fiber:cancel()
     end
+    set_status('idle')
     if instance == nil then
         return
     end
@@ -187,13 +244,20 @@ end
 
 --- Where the autostarted job got to:
 --
---   {state = 'idle'|'loading'|'running'|'done'|'failed',
---    superstep = <number>, error = <string, when failed>}
+--   {state = 'idle'|'connecting'|'loading'|'running'|'done'|'failed',
+--    superstep = <number>, error = <string, when failed or connecting>}
 --
--- It follows the autostart fiber. A job driven by hand through get() moves
--- `superstep` (the master keeps it current) but leaves `state` at 'idle'.
+-- It follows the autostart fiber, except while the workers are still being
+-- reached: 'connecting' comes first and nothing can have started before it is
+-- over. A job driven by hand through get() moves `superstep` (the master keeps
+-- it current) but leaves `state` at 'idle'.
 local function status()
     local rv = table.deepcopy(state.status)
+    local connect = state.connect
+    if connect ~= nil and connect.state ~= 'connected' then
+        rv.state = connect.state
+        rv.error = connect.error
+    end
     if state.master ~= nil then
         rv.name = state.master.name
         rv.superstep = state.master.superstep_count

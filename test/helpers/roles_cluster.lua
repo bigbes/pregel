@@ -56,6 +56,19 @@ helper.server_opts = {
     },
 }
 
+--- The same, over a graph of `count` vertices.
+--
+-- A ring needs about one superstep per vertex, so this is how a test buys
+-- itself a job that is still running when it looks at it.
+function helper.server_opts_for(count)
+    return {
+        env = {
+            LUA_PATH = ROOT .. '/?.lua;' .. ROOT .. '/?/init.lua;;',
+            PREGEL_TEST_VERTICES = tostring(count),
+        },
+    }
+end
+
 --- Where an instance listens, matching cbuilder's default iproto.listen.
 --
 -- Every instance of the cluster shares one working directory, so this relative
@@ -69,6 +82,12 @@ function helper.worker_name(i)
 end
 
 helper.MASTER_NAME = 'master'
+
+--- A worker URI nothing ever listens on.
+--
+-- Adding it to roles_cfg.workers is how a test says "one participant of this
+-- job is down", which is the case that used to kill every other instance.
+helper.GHOST_URI = 'unix/:./ghost.iproto'
 
 -------------------------------------------------------------------------------
 -- The config
@@ -84,6 +103,10 @@ helper.MASTER_NAME = 'master'
 -- opts.pool_size    -- roles_cfg.pool_size for the workers
 -- opts.drop_worker  -- index of a worker whose roles list is left empty, as if
 --                      the role had been taken off that instance
+-- opts.drop_master  -- the same for the master instance
+-- opts.ghost_worker -- add helper.GHOST_URI to every worker list, so the job
+--                      has one participant that is not there
+-- opts.connect_timeout -- roles_cfg.connect_timeout for both roles
 function helper.config(opts)
     opts = opts or {}
     local job     = opts.job or helper.JOB
@@ -104,13 +127,17 @@ function helper.config(opts)
     for i = 1, count do
         worker_uris[i] = helper.uri(helper.worker_name(i))
     end
+    if opts.ghost_worker then
+        table.insert(worker_uris, helper.GHOST_URI)
+    end
 
     local function base_cfg()
         return {
-            name     = job,
-            app      = helper.APP,
-            user     = helper.USER,
-            password = helper.PASSWORD,
+            name            = job,
+            app             = helper.APP,
+            user            = helper.USER,
+            password        = helper.PASSWORD,
+            connect_timeout = opts.connect_timeout,
         }
     end
 
@@ -122,10 +149,14 @@ function helper.config(opts)
 
     builder:use_group('pregel')
     builder:use_replicaset('r_master')
-    builder:add_instance(helper.MASTER_NAME, {
-        roles     = {helper.MASTER_ROLE},
-        roles_cfg = {[helper.MASTER_ROLE] = master_cfg},
-    })
+    if opts.drop_master then
+        builder:add_instance(helper.MASTER_NAME, {roles = {}, roles_cfg = {}})
+    else
+        builder:add_instance(helper.MASTER_NAME, {
+            roles     = {helper.MASTER_ROLE},
+            roles_cfg = {[helper.MASTER_ROLE] = master_cfg},
+        })
+    end
 
     for i = 1, count do
         local worker_cfg = base_cfg()
@@ -165,6 +196,42 @@ function helper.master_status(cluster)
     return cluster[helper.MASTER_NAME]:exec(function(role)
         return require(role).status()
     end, {helper.MASTER_ROLE})
+end
+
+--- The worker role's status(), as seen on one instance.
+function helper.worker_status(cluster, instance_name)
+    return cluster[instance_name]:exec(function(role)
+        return require(role).status()
+    end, {helper.WORKER_ROLE})
+end
+
+--- What the config framework itself says about this instance.
+--
+-- A role that reports a problem without dying does it here: config:info()
+-- carries the status and the alerts, and an operator sees them in
+-- `tt status`/the console rather than in the log.
+function helper.config_info(cluster, instance_name)
+    return cluster[instance_name]:exec(function()
+        local info = require('config'):info()
+        local alerts = {}
+        for _, alert in ipairs(info.alerts or {}) do
+            table.insert(alerts, {type = alert.type, message = alert.message})
+        end
+        return {status = info.status, alerts = alerts}
+    end)
+end
+
+--- Block until `fn(cluster)` returns a table whose state is `state`.
+function helper.wait_role_state(cluster, fn, state, timeout)
+    local last
+    luatest.helpers.retrying({timeout = timeout or 60, delay = 0.1}, function()
+        last = fn(cluster)
+        if last.state ~= state then
+            error(string.format("role status is '%s', want '%s'",
+                                tostring(last.state), state))
+        end
+    end)
+    return last
 end
 
 --- Block until the autostarted job reports `state`, or fail the test.
@@ -239,6 +306,23 @@ function helper.mpool_fibers(cluster, instance_name)
             local name = info.name or ''
             if name:find('pusher_handler', 1, true) ~= nil or
                name:find('waitpool_handler', 1, true) ~= nil then
+                table.insert(rv, name)
+            end
+        end
+        table.sort(rv)
+        return rv
+    end)
+end
+
+--- Names of the fibers the master role runs: the autostart one and the fiber
+-- that waits for the workers. Both must be gone once the role is stopped.
+function helper.master_fibers(cluster)
+    return cluster[helper.MASTER_NAME]:exec(function()
+        local rv = {}
+        for _, info in pairs(require('fiber').info()) do
+            local name = info.name or ''
+            if name:find('pregel_master_autostart', 1, true) ~= nil or
+               name:find('pregel_connect', 1, true) ~= nil then
                 table.insert(rv, name)
             end
         end

@@ -696,6 +696,27 @@ local mpool_mt = {
             self.connected = true
             return self
         end,
+        --- Block until the pool is connected, whoever does the connecting.
+        --
+        -- Not wait_connected() itself, and deliberately: with connect_async
+        -- the owner of the waiting is the role's fiber, and a second fiber
+        -- running wait_connected() concurrently would race it -- resolving the
+        -- pool closes the local bucket's connection, and a fiber waiting on
+        -- that very connection sees the close as a failure. This is what a
+        -- worker asked to preload waits on, because self_idx -- the shard a
+        -- worker-side loader reads -- is one of the things being resolved.
+        wait_ready = function(self, timeout)
+            local deadline = clock.monotonic() + timeout
+            while not self.connected do
+                if clock.monotonic() > deadline then
+                    error(0, "mpool: '%s' did not reach all %d peer(s) " ..
+                          'within %s seconds', tostring(self.name),
+                          self.bucket_cnt, tostring(timeout))
+                end
+                fiber.sleep(0.01)
+            end
+            return self
+        end,
         stop = function(self)
             self.waitpool:stop()
             for _, bucket in ipairs(self.buckets) do

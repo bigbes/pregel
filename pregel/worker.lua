@@ -108,8 +108,12 @@ local info_functions = setmetatable({
     end
 })
 
---- Wait until the instance called `name` exists here and has reached its
--- master. This is the first thing the master asks of every worker.
+--- Wait until the instance called `name` exists here, has reached its master
+-- and has reached the other workers. This is the first thing the master asks
+-- of every worker, and it is the barrier the whole run rests on: the shard
+-- index a worker-side loader is handed (mpool.self_idx) is only known once the
+-- message pool has resolved its connections, and a preload that ran before
+-- that would give every worker the same share of the graph.
 local function wait_ready(name)
     local deadline = fiber.clock() + WAIT_TIMEOUT
     while workers[name] == nil do
@@ -124,6 +128,7 @@ local function wait_ready(name)
         error("pregel worker '%s' cannot reach its master within %d seconds",
               tostring(name), WAIT_TIMEOUT)
     end
+    instance.mpool:wait_ready(WAIT_TIMEOUT)
     return true
 end
 

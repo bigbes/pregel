@@ -92,8 +92,10 @@ local SPEC = common.spec({
 -- would need a second copy of this module, which the roles applier will not
 -- create -- one role name, one instance of it.
 local state = {
-    cfg    = nil,
-    worker = nil,
+    cfg     = nil,
+    worker  = nil,
+    -- The fiber that waits for the peers; see common.connector.
+    connect = nil,
 }
 
 local function validate(cfg)
@@ -138,11 +140,19 @@ local function apply(cfg)
         user           = cfg.user,
         password       = cfg.password,
         grant_to       = cfg.user,
+        -- apply() must not wait for anyone: it runs inside the config
+        -- framework's synchronous post_apply. See common.connector.
+        connect_async  = true,
     })
     common.add_aggregators(instance, app)
 
     state.worker = instance
     state.cfg = table.deepcopy(cfg)
+    state.connect = common.connector(ROLE, {
+        job     = cfg.name,
+        pool    = instance.mpool,
+        timeout = cfg.connect_timeout,
+    }):start()
     -- The URIs are not logged: roles_cfg may spell one as
     -- 'user:password@host:port', and a log line is the wrong place for that.
     log.info("%s: job '%s' is running over %d worker(s)", ROLE, cfg.name,
@@ -159,8 +169,13 @@ end
 -- leave nothing to re-register when the role comes back).
 local function stop()
     local instance = state.worker
+    local connect = state.connect
     state.worker = nil
     state.cfg = nil
+    state.connect = nil
+    if connect ~= nil then
+        connect:stop()
+    end
     if instance == nil then
         return
     end
@@ -173,18 +188,30 @@ local function get()
     return state.worker
 end
 
---- What this instance is doing: 'idle' before apply and after stop, 'running'
--- once the job exists.
+--- What this instance is doing:
+--
+--   {state = 'idle'|'connecting'|'running'|'failed', name = <job>,
+--    in_progress = <n>, messages = <n>, error = <string, when not connected>}
+--
+-- 'idle' before apply and after stop; 'connecting' while the job exists but
+-- some peer has not answered yet; 'failed' once the role has given up on them
+-- (the job object is still there, and a config reload retries).
 local function status()
     if state.worker == nil then
         return {state = 'idle'}
     end
-    return {
+    local rv = {
         state       = 'running',
         name        = state.worker.name,
         in_progress = state.worker.in_progress,
         messages    = state.worker.mqueue:len(),
     }
+    local connect = state.connect
+    if connect ~= nil and connect.state ~= 'connected' then
+        rv.state = connect.state
+        rv.error = connect.error
+    end
+    return rv
 end
 
 return {

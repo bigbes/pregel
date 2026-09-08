@@ -10,11 +10,28 @@
 -- reason the role failed to validate or apply, so the messages name the role,
 -- the option and what was expected.
 
+local log   = require('log')
+local clock = require('clock')
+local fiber = require('fiber')
+
 local utils       = require('pregel.utils')
 local is_callable = utils.is_callable
 local error       = utils.error
 
 local M = {}
+
+--- How long a role keeps trying to reach its peers before giving up, in
+-- seconds. Generous on purpose: the cost of waiting is a job that has not
+-- started yet, and the cost of giving up early is an operator who has to
+-- reload the config after fixing whatever was down.
+M.CONNECT_TIMEOUT = 300
+-- How long one connect attempt waits before the outcome is logged. Not a
+-- deadline: the next attempt follows immediately. It exists so a peer that is
+-- down is reported every few seconds instead of once, at the very end.
+local CONNECT_ATTEMPT = 5
+-- The pause between attempts, which matters only for a failure that comes back
+-- at once -- rejected credentials, say.
+local CONNECT_RETRY   = 1
 
 -------------------------------------------------------------------------------
 -- roles_cfg checking
@@ -66,6 +83,16 @@ M.common_spec = {
     },
     user         = {types = {string = true}},
     password     = {types = {string = true}},
+    -- Seconds the role keeps trying to reach its peers. See M.connector.
+    connect_timeout = {
+        types = {number = true},
+        check = function(v)
+            if v <= 0 then
+                return false, 'a positive number of seconds'
+            end
+            return true
+        end,
+    },
 }
 
 --- Build a spec from M.common_spec plus `extra`.
@@ -237,6 +264,163 @@ function M.add_aggregators(instance, app)
     for name, opts in pairs(app.aggregators or {}) do
         instance:add_aggregator(name, opts)
     end
+end
+
+-------------------------------------------------------------------------------
+-- Reporting a problem without dying
+-------------------------------------------------------------------------------
+
+-- One namespace per role name, created on first use: config only hands out a
+-- namespace once, and both roles may live in the same process.
+local alert_namespaces = {}
+
+local function alerts_of(role)
+    local ns = alert_namespaces[role]
+    if ns ~= nil then
+        return ns
+    end
+    local config = require('config')
+    if not is_callable(config.new_alerts_namespace) then
+        return nil
+    end
+    local ok, rv = pcall(config.new_alerts_namespace, config, role)
+    if not ok then
+        return nil
+    end
+    alert_namespaces[role] = rv
+    return rv
+end
+
+--- Publish an alert under `key`, replacing whatever was there before.
+--
+-- This is the whole reason a connection failure is not raised. The config
+-- framework gives a role two ways to report: raising from validate()/apply(),
+-- which becomes an error alert and, during startup, exits the process; and the
+-- role's own alerts namespace, which -- measured on CE 3.9 and EE 3.7 --
+-- accepts type = 'warn' only and leaves config:info().status at 'ready'. A
+-- peer that is down is not a broken configuration, so it goes here. A broken
+-- configuration still raises; see check_cfg and load_app.
+function M.alert(role, key, message)
+    local ns = alerts_of(role)
+    if ns == nil then
+        return
+    end
+    pcall(ns.set, ns, key, {type = 'warn', message = message})
+end
+
+--- Withdraw the alert published under `key`.
+function M.alert_clear(role, key)
+    local ns = alerts_of(role)
+    if ns == nil then
+        return
+    end
+    pcall(ns.unset, ns, key)
+end
+
+-------------------------------------------------------------------------------
+-- Connecting to the peers
+-------------------------------------------------------------------------------
+
+local connector_mt = {
+    __index = {
+        --- Keep trying until the pool is connected or the timeout runs out.
+        run = function(self)
+            local deadline = clock.monotonic() + self.timeout
+            local attempt = 0
+            while not self.stopped do
+                attempt = attempt + 1
+                local left = deadline - clock.monotonic()
+                local ok, err = pcall(self.pool.wait_connected, self.pool,
+                                      left < CONNECT_ATTEMPT and left or
+                                      CONNECT_ATTEMPT)
+                if ok then
+                    self.state = 'connected'
+                    self.error = nil
+                    M.alert_clear(self.role, self.key)
+                    log.info("%s: job '%s' reached all %d peer(s) after %d " ..
+                             'attempt(s)', self.role, self.job,
+                             self.pool.bucket_cnt, attempt)
+                    if self.on_ready ~= nil then
+                        self.on_ready()
+                    end
+                    return
+                end
+                self.error = tostring(err)
+                if self.stopped then
+                    return
+                end
+                log.warn("%s: job '%s' is not connected yet (attempt %d): %s",
+                         self.role, self.job, attempt, self.error)
+                if clock.monotonic() >= deadline then
+                    self.state = 'failed'
+                    local message = string.format(
+                        "%s: job '%s' could not reach its peers within %s " ..
+                        'second(s): %s', self.role, self.job,
+                        tostring(self.timeout), self.error)
+                    log.error('%s', message)
+                    M.alert(self.role, self.key, message)
+                    return
+                end
+                M.alert(self.role, self.key, string.format(
+                    "%s: job '%s' is waiting for its peers: %s", self.role,
+                    self.job, self.error))
+                fiber.sleep(CONNECT_RETRY)
+            end
+        end,
+        --- Start the fiber. Returns at once.
+        start = function(self)
+            self.fiber = fiber.create(function()
+                fiber.self():name('pregel_connect', {truncate = true})
+                local ok, err = pcall(self.run, self)
+                if not ok and not self.stopped then
+                    self.state = 'failed'
+                    self.error = tostring(err)
+                    log.error("%s: the connect fiber of job '%s' failed: %s",
+                              self.role, self.job, self.error)
+                end
+            end)
+            return self
+        end,
+        stop = function(self)
+            local f = self.fiber
+            self.stopped = true
+            self.fiber = nil
+            if f ~= nil and f:status() ~= 'dead' then
+                f:cancel()
+            end
+            M.alert_clear(self.role, self.key)
+        end,
+    },
+}
+
+--- Wait for a pregel instance's peers in a fiber of its own.
+--
+-- apply() is called from the config framework's post_apply, which is
+-- synchronous: an apply that waits for every peer holds up the instance's
+-- entire startup, and an error raised from it at startup is fatal -- the
+-- process exits. Measured on a three-worker cluster with one worker left down:
+-- every other instance died 30 seconds later, and bringing the missing one up
+-- afterwards recovered nothing. So a job whose peers are not all there is a job
+-- that waits, visibly (status().state == 'connecting') and noisily (a warn per
+-- attempt, and an alert), and never a cluster that cannot start.
+--
+-- opts.job      -- job name, for the messages
+-- opts.pool     -- the mpool to connect (built with connect_async)
+-- opts.timeout  -- seconds before giving up (default M.CONNECT_TIMEOUT)
+-- opts.on_ready -- called once, in the fiber, when the pool is connected
+function M.connector(role, opts)
+    return setmetatable({
+        role     = role,
+        job      = opts.job,
+        pool     = opts.pool,
+        timeout  = opts.timeout or M.CONNECT_TIMEOUT,
+        on_ready = opts.on_ready,
+        key      = 'peers',
+        state    = 'connecting',
+        error    = nil,
+        fiber    = nil,
+        stopped  = false,
+    }, connector_mt)
 end
 
 -------------------------------------------------------------------------------

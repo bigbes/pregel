@@ -154,6 +154,101 @@ g.test_removing_the_role_stops_the_worker = function()
     assert_max_value_everywhere(c)
 end
 
+-- Taking the master role off an instance while its job is running. Nothing
+-- covered this at all, which is where the status below was left stuck: stop()
+-- used to set 'idle' and *then* cancel the autostart fiber, so the
+-- cancellation landed in that fiber's failure branch and overwrote it.
+g.test_removing_the_master_role_mid_job_leaves_it_idle = function()
+    -- A ring long enough that the job is certainly still running when the
+    -- role is taken away: one superstep carries the value one hop.
+    local vertices = 1500
+    local c = Cluster:new(helper.config({autostart = true}),
+                          helper.server_opts_for(vertices))
+    c:start()
+    helper.wait_state(c, 'running')
+
+    c:sync(helper.config({autostart = true, drop_master = true}))
+    helper.reload(c, helper.MASTER_NAME)
+
+    t.assert_equals(helper.master_status(c), {state = 'idle'})
+    t.assert_equals(helper.master_fibers(c), {},
+                    'stopping the role left the master fibers running')
+
+    -- And it stays idle: the cancelled fiber must not come back and write
+    -- 'failed' over the state stop() set.
+    c[helper.MASTER_NAME]:exec(function() require('fiber').sleep(0.5) end)
+    t.assert_equals(helper.master_status(c), {state = 'idle'})
+
+    t.assert_equals(c[helper.MASTER_NAME]:grep_log('job .* failed'), nil,
+                    'stopping the role logged the job as failed')
+    t.assert_equals(c[helper.MASTER_NAME]:grep_log('fiber is cancelled'), nil,
+                    'the cancellation reached the log as an error')
+end
+
+-------------------------------------------------------------------------------
+-- A participant that is not there
+-------------------------------------------------------------------------------
+
+-- The role's apply() runs inside the config framework's synchronous
+-- post_apply, and an error raised from it at startup is fatal. Connecting
+-- there meant one instance that was down killed every other one in the cluster
+-- 30 s later, and nothing retried afterwards.
+g.test_a_peer_that_is_down_does_not_stop_the_cluster = function()
+    local c = Cluster:new(helper.config({ghost_worker = true}),
+                          helper.server_opts)
+    c:start()
+
+    local worker1 = helper.worker_name(1)
+    t.assert_equals(helper.worker_status(c, worker1).state, 'connecting',
+                    'the role should still be waiting for the missing peer')
+    -- The first attempt is a few seconds long, so the reason appears a moment
+    -- after the state does. It has to say which peer and what net.box saw.
+    t.helpers.retrying({timeout = 30, delay = 0.5}, function()
+        local status = helper.worker_status(c, worker1)
+        t.assert_equals(status.state, 'connecting')
+        t.assert_str_contains(tostring(status.error), 'ghost.iproto')
+        t.assert_str_contains(tostring(status.error), 'No such file')
+    end)
+
+    -- The instance is alive and the job is registered: the graph is simply
+    -- waiting for a peer, which is what an operator can act on.
+    t.assert_equals(helper.worker_registered(c, worker1), true)
+    t.assert_equals(helper.master_status(c).state, 'connecting')
+
+    -- The other instances came up too, rather than being taken down with it.
+    for i = 2, helper.WORKER_COUNT do
+        t.assert_equals(helper.worker_registered(c, helper.worker_name(i)),
+                        true)
+    end
+end
+
+-- Giving up is reported through the role's own alerts namespace, not by
+-- raising: measured on 3.9 and on EE 3.7, a role's namespace accepts
+-- type='warn' only, and raising from apply() at startup exits the process.
+g.test_giving_up_on_a_peer_is_an_alert_and_not_a_dead_instance = function()
+    local c = Cluster:new(helper.config({ghost_worker = true,
+                                         connect_timeout = 1}),
+                          helper.server_opts)
+    c:start()
+
+    local worker1 = helper.worker_name(1)
+    local status = helper.wait_role_state(c, function(cluster)
+        return helper.worker_status(cluster, worker1)
+    end, 'failed', 30)
+    t.assert_str_contains(tostring(status.error), 'ghost.iproto')
+
+    local info = helper.config_info(c, worker1)
+    t.assert_equals(info.status, 'ready')
+    local said = false
+    for _, alert in ipairs(info.alerts) do
+        if alert.message:find('ghost.iproto', 1, true) ~= nil then
+            said = true
+            t.assert_equals(alert.type, 'warn')
+        end
+    end
+    t.assert_equals(said, true, 'no alert names the peer that never answered')
+end
+
 -------------------------------------------------------------------------------
 -- (5): discovery
 -------------------------------------------------------------------------------
