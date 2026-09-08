@@ -340,6 +340,41 @@ g.test_a_task_with_too_few_labels_fails_without_taking_the_job_down = function()
     fio.rmtree(dir)
 end
 
+g.test_a_labels_file_with_no_task_is_refused_at_startup = function()
+    local dir = fio.tempdir()
+    local path = fio.pathjoin(dir, 'labels.avro')
+    local writer = require('pregel.avro.ocf').open(path, {
+        mode   = 'w',
+        schema = {
+            type = 'record', name = 'Label',
+            fields = {
+                {name = 'task',   type = 'string'},
+                {name = 'vid',    type = 'string'},
+                {name = 'target', type = 'int'   },
+            },
+        },
+    })
+    writer:close()
+
+    -- Not a job that runs and produces nothing: a user vertex halts once every
+    -- task it can see is terminal, and with no tasks it would wait for the
+    -- first one forever. The worker role has to refuse the config instead.
+    local cluster = Cluster:new(helper.config({
+        name    = EXAMPLE,
+        app_cfg = app_cfg({labels = path}),
+    }), helper.server_opts)
+    local ok, err = pcall(function() cluster:start() end)
+    t.assert_equals(ok, false, 'the cluster started on an empty labels file')
+    -- All luatest sees is a process that went away; the reason is in that
+    -- instance's own log, because an error raised while the config is being
+    -- applied at startup exits the process.
+    t.assert_str_contains(tostring(err), 'Process is terminated')
+    t.assert(cluster[helper.worker_name(1)]:grep_log('names no task'),
+             'the worker did not say why it refused the config')
+
+    fio.rmtree(dir)
+end
+
 -------------------------------------------------------------------------------
 -- The mutation this suite is built to catch
 -------------------------------------------------------------------------------

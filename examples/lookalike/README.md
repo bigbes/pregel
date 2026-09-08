@@ -339,6 +339,11 @@ publishes `{state = 'failed', report = {reason = ...}}` instead of a model; the
 other tasks finish, and the users score what they can and stop waiting for what
 they cannot. `test/examples/lookalike_test.lua` runs exactly that case.
 
+A labels file that names **no** task at all is the one input this example
+refuses outright, while the role is validating its config. It is not a job that
+runs and produces nothing: a user vertex halts once every task it can see is
+terminal, and with no tasks it would wait for the first one to appear forever.
+
 ## The test
 
 `test/examples/lookalike_test.lua` runs this app module through
@@ -355,11 +360,13 @@ each task:
 Plus: every user holds a score and a percentile per task and the score is the
 model applied to that user's own features (recomputed outside the job); the rank
 is monotone in the score; the reports carry the sizes; the population is spread
-over all three workers; and the starved-task case above.
+over all three workers; and both refusal cases above.
 
-Two mutations were run against it, and both turn it red rather than merely
-changing a number:
+Three mutations were run against it, and all three turn it red rather than
+merely changing a number:
 
     max_iter = 0                 task1 AUC: Assertion failed: 0.5 >= 0.9
     hinge gradient sign flipped  task1 AUC: Assertion failed: 0.13636 >= 0.9
                                  task1 sign agreement: 0.11111 >= 0.8
+    empty-roster guard removed   the cluster started on an empty labels file:
+                                 expected: false, actual: true

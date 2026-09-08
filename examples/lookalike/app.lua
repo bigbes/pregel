@@ -311,8 +311,17 @@ function app.worker_context(app_cfg)
         resolved[key] = cfg[key] or fallback
     end
 
-    local labels, roster =
-        read_labels(common.resolve(HERE, cfg.labels, 'labels'))
+    local labels_path = common.resolve(HERE, cfg.labels, 'labels')
+    local labels, roster = read_labels(labels_path)
+    -- Refused here rather than left to run, because the job would not stop: a
+    -- user vertex halts once every task it can see is terminal, and with no
+    -- tasks at all it sees none, waits for the first one to appear, and waits
+    -- forever. A startup error naming the file is the only useful thing to do
+    -- with a label file that names no task.
+    if #roster == 0 then
+        error(string.format('lookalike: %s names no task, so there is ' ..
+                            'nothing for this job to train', labels_path))
+    end
 
     local context = setmetatable({
         cfg      = resolved,
