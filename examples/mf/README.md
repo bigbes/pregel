@@ -78,7 +78,7 @@ that is one writer walking its own ratings, not two writers racing.
 One consequence worth knowing before reading a transcript: the order a vertex
 reads its messages in is the order they arrived, so two runs of the same
 configuration end at slightly different models. Three runs of the fixture below
-scored 0.5872, 0.5877 and 0.5884.
+scored 0.49109, 0.49077 and 0.49076.
 
 ## What is global, and how it gets there
 
@@ -169,15 +169,15 @@ same breath as it prints `NOT RUNNING` for all four. Give it a second.
      mf:worker3  RUNNING  37554  RW    ready   running  --
 
 The committed `config.yaml` trains on `test/fixtures/ratings` — 50 users, 30
-items, 378 training and 95 held-out ratings — for 30 epochs at rank 3. It is
-over before `tt status` has finished printing: 2 ms to load and 130 ms for the
-31 supersteps.
+items, 378 training and 95 held-out ratings — for 150 epochs at rank 3. It is
+over before `tt status` has finished printing: 2 ms to load and 630 ms for the
+151 supersteps.
 
     echo "require('pregel.roles.master').status()" | tt connect mf:master -f -
     ---
     - state: done
       name: mf
-      superstep: 31
+      superstep: 151
     ...
 
 ## Score it
@@ -196,14 +196,36 @@ exactly the credentials the job already runs on, and the `lua_call` list in
       ratings: 95
       items: 30
       users: 50
-      rmse: 0.58721719973898
+      rmse: 0.49108502674296
       missing: 0
     ...
 
-0.587 on ratings the job never saw. The number to compare it against is 0.680,
-which is what answering every held-out rating with `mu` scores — that is the
-floor a recommender that has learnt nothing lands on, and the margin is the
-whole of what the factors bought.
+0.491 on ratings the job never saw. One number on its own says nothing about a
+recommender, so here are the three it sits between.
+
+| | held-out RMSE | what it is |
+| --- | --- | --- |
+| mean-only | 0.680 | answering every held-out rating with `mu`. A model that has learnt nothing lands here |
+| **this example** | **0.491** | 150 epochs, rank 3 |
+| best known on this split | ~0.49 | sequential SGD in numpy reaches 0.488; this app's own schedule, swept over epochs, learning rate, decay and lambda outside the cluster, bottoms out at 0.4906 |
+| the noise | 0.286 | the factors in `truth.json` — the ones the ratings were *drawn* from — scored on the held-out half, after the generator's clip and half-point rounding. 0.241 without them |
+
+So the factors buy 0.680 → 0.491, and there is essentially nothing left on the
+table: what remains between 0.491 and 0.286 is the noise the generator added,
+which no model can fit because nothing in the data explains it.
+
+Getting there took 150 epochs rather than the 30 this example used to run. The
+schedule is the reason — each side steps from the neighbours as they were an
+epoch ago, so an epoch here is worth less than a sequential SGD's — and at 30
+epochs with a 0.98 decay the fit stopped at 0.587, less than half the distance
+from the baseline to what the fixture supports, with the training error still
+falling by 0.03 over its last five epochs. The learning rate and the L2 penalty
+are unchanged; only `epochs` and `decay` moved.
+
+The train RMSE ends at 0.180, which is *below* the 0.228 the hidden factors
+themselves score on the training half — the model is fitting some of the noise
+by then. That is what the held-out number is for, and it is why more epochs
+stop helping rather than because the optimiser has stalled.
 
 `missing` counts test ratings naming a user or an item the model has never
 seen. Factorisation cannot answer those at all, so they are left out of the
@@ -214,15 +236,15 @@ The training error per epoch comes off the master too. Under `tt` the app
 module's name is what `roles_cfg.app` says — `app`, resolved through
 `$PWD/?.lua` — where the test suite loads the same file as `examples.mf.app`:
 
-    echo "local h = require('app').train_history() local rv = {} for _, e in ipairs(h) do if e.epoch % 5 == 0 or e.epoch == 1 then table.insert(rv, {epoch = e.epoch, count = e.count, rmse = e.rmse}) end end return rv" | tt connect mf:master -f -
+    echo "local h = require('app').train_history() local rv = {} for _, e in ipairs(h) do if e.epoch % 25 == 0 or e.epoch == 1 then table.insert(rv, {epoch = e.epoch, count = e.count, rmse = e.rmse}) end end return rv" | tt connect mf:master -f -
     ---
-    - - {'count': 378, 'rmse': 0.57253719208603, 'epoch': 1}
-      - {'count': 378, 'rmse': 0.44129972581071, 'epoch': 5}
-      - {'count': 378, 'rmse': 0.42979143021465, 'epoch': 10}
-      - {'count': 378, 'rmse': 0.42135247156449, 'epoch': 15}
-      - {'count': 378, 'rmse': 0.40672742063519, 'epoch': 20}
-      - {'count': 378, 'rmse': 0.38255819770215, 'epoch': 25}
-      - {'count': 378, 'rmse': 0.3538011091483, 'epoch': 30}
+    - - {'count': 378, 'rmse': 0.57261815787511, 'epoch': 1}
+      - {'count': 378, 'rmse': 0.36385933303678, 'epoch': 25}
+      - {'count': 378, 'rmse': 0.25098021590668, 'epoch': 50}
+      - {'count': 378, 'rmse': 0.21526943652465, 'epoch': 75}
+      - {'count': 378, 'rmse': 0.1965724573264, 'epoch': 100}
+      - {'count': 378, 'rmse': 0.1860194883432, 'epoch': 125}
+      - {'count': 378, 'rmse': 0.17993000891938, 'epoch': 150}
     ...
 
 `count` is 378 in every row, and that is worth more than it looks: it is the
@@ -272,9 +294,13 @@ to the workers:
     lr: 0.05
     decay: 0.99
 
-`rank: 5` because the generator hid five factors per side; more epochs because a
-bigger matrix has more to fit, and a slower `decay` so the learning rate is
-still worth something at epoch 60. Then start it exactly as above.
+`rank: 5` because the generator hid five factors per side, and 60 epochs rather
+than the fixture's 150 because 7939 ratings over 700 vertices give an epoch far
+more to learn from than 378 over 80 do — `decay` is the same 0.99, which at
+epoch 60 still leaves the learning rate at 55% of where it started. 60 is not
+where this one converges either; the epoch table below is still falling at the
+end of it, and it is a demonstration rather than a tuned run. Then start it
+exactly as above.
 
     echo "require('pregel.roles.master').status()" | tt connect mf:master -f -
     ---
@@ -293,9 +319,9 @@ still worth something at epoch 60. Then start it exactly as above.
       missing: 0
     ...
 
-0.470 against 0.711 for predicting the mean — a wider margin than on the small
-fixture, because 7939 ratings support ten factors per vertex far better than
-378 support six.
+0.470 against 0.711 for predicting the mean — a wider margin in absolute terms
+than on the small fixture, because 7939 ratings support ten factors per vertex
+far better than 378 support six.
 
     echo "local h = require('app').train_history() local rv = {} for _, e in ipairs(h) do if e.epoch == 1 or e.epoch % 15 == 0 then table.insert(rv, {epoch = e.epoch, count = e.count, rmse = e.rmse}) end end return rv" | tt connect mf:master -f -
     ---
@@ -318,7 +344,7 @@ Loading the 7939 ratings — 700 vertices and 15878 edges — takes 53 ms, and t
 `test/examples/mf_test.lua` runs this app module through `luatest.cluster` on
 the committed fixture and checks what the algorithm is *for* rather than
 re-deriving it: the held-out RMSE beats the mean-only baseline by a wide
-margin, the training error falls in all thirty epochs, every training rating is
+margin, the training error falls in all 150 epochs, every training rating is
 counted exactly once per epoch, the vectors have the configured rank, and both
 directions of every rating are in the graph. The held-out score is read by
 running `evaluate.lua` on the master, so the test covers the half of the

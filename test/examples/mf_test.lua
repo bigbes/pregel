@@ -32,7 +32,7 @@ local EXAMPLE = 'mf'
 local JOB     = 'mf'
 
 local RANK   = 3
-local EPOCHS = 30
+local EPOCHS = 150
 
 -- test/fixtures/ratings: 50 users, 30 items, 378 train and 95 test ratings.
 local TRAIN_RATINGS = 378
@@ -52,11 +52,19 @@ local TEST  = '../../test/fixtures/ratings/test.avro'
 -- and on every shard count -- but the order a vertex reads its messages in is
 -- the order they arrived, and a vertex chains its own updates as it walks
 -- them, so a different interleaving is a slightly different model. Three runs
--- of this cluster gave 0.5872, 0.5877 and 0.5884.
+-- of this cluster gave 0.49109, 0.49077 and 0.49076.
 --
--- 0.60 is about ten times that spread above the top of it, and well below the
--- 0.6801 a model that learnt nothing scores -- see baseline_rmse.
-local TEST_RMSE_MAX = 0.60
+-- 0.52 is chosen against what the fixture supports rather than against that
+-- spread, which is only 0.0003 wide. The floor is 0.286 -- the hidden factors
+-- in truth.json, scored on the held-out half after the generator's clip and
+-- rounding -- and the best a rank-3 model gets on this split is about 0.49,
+-- from a sequential numpy SGD (0.488) and from a sweep of this app's own
+-- schedule outside the cluster (0.4906). So the example runs at its ceiling,
+-- 0.52 is a real regression bound rather than a number every run happens to
+-- clear, and it is far below the 0.6801 a model that learnt nothing scores --
+-- see baseline_rmse. Before the epochs went from 30 to 150 the same example
+-- scored 0.587, which this threshold refuses.
+local TEST_RMSE_MAX = 0.52
 
 local function app_cfg(overrides)
     local cfg = {
@@ -65,7 +73,7 @@ local function app_cfg(overrides)
         rank   = RANK,
         epochs = EPOCHS,
         lr     = 0.05,
-        decay  = 0.98,
+        decay  = 0.99,
         lambda = 0.05,
     }
     for key, value in pairs(overrides or {}) do

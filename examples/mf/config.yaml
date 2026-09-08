@@ -49,9 +49,16 @@ groups:
                   # two halves of the example pointing at one dataset.
                   test: '../../test/fixtures/ratings/test.avro'
                   rank: 3
-                  epochs: 30
+                  # 150 epochs at decay 0.99 rather than 30 at 0.98. The
+                  # schedule here is Jacobi-style -- each side steps from the
+                  # neighbours as they were an epoch ago -- so it converges
+                  # more slowly per epoch than a sequential SGD, and 30 epochs
+                  # left the fit less than halfway from the mean-only baseline
+                  # to what this fixture supports. See the README for the
+                  # numbers on both sides of it.
+                  epochs: 150
                   lr: 0.05
-                  decay: 0.98
+                  decay: 0.99
                   lambda: 0.05
       worker1:
         instances:
