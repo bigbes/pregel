@@ -1,44 +1,79 @@
+--- Per-receiver message queues.
+--
+-- A queue holds messages addressed to vertex names. Two engines implement the
+-- same interface:
+--
+--   * 'space' -- a Tarantool space, so the queue survives a restart and can
+--     hold more messages than fit in a Lua table;
+--   * 'table' -- a plain Lua table, for a run that never needs the messages
+--     after the process exits.
+--
+-- Interface: put, pairs, len, delete, truncate, drop, squash, receiver_closure.
+--
+-- A `combiner` folds several messages for one receiver into one. It runs
+-- either on every put (the default) or once per superstep from squash(), when
+-- `squash_only` is set -- combining on put costs a read of the receiver's
+-- messages per put, which is the wrong trade when a receiver gets many.
+
 local log = require('log')
-local fun = require('fun')
-local yaml = require('yaml')
-local json = require('json')
 
 local collections = require('pregel.utils.collections')
 local is_callable = require('pregel.utils').is_callable
-local error = require('pregel.utils').error
+
+local fmtstring = string.format
+
+local SPACE_PREFIX = 'pregel_tube_'
 
 local tube_list
 
+local function space_name_of(name)
+    return SPACE_PREFIX .. name
+end
+
+--- Number of messages stats claims for `receiver`, without materialising it.
+--
+-- stats is a defaultdict, so a plain read would create the counter and make
+-- the receiver visible to every later pairs() over stats.
+local function stat_count(self, receiver)
+    return rawget(self.stats, receiver) or 0
+end
+
+-------------------------------------------------------------------------------
+-- 'space' engine
+-------------------------------------------------------------------------------
+
 local tube_space_methods = {
     pairs = function(self, receiver)
-        assert(receiver ~= nil)
-        local fun, param, state = self.space.index.receiver:pairs(receiver)
+        assert(receiver ~= nil, 'receiver is nil')
+        local gen, param, state = self.space.index.receiver:pairs({receiver})
         return function()
-            local key, val = fun(param, state)
-            if val == nil then
+            local tuple
+            state, tuple = gen(param, state)
+            if tuple == nil then
                 return nil
             end
-            return key, val[3]
+            return state, tuple[3]
         end
     end,
     receiver_closure = function(self)
-        local last = 0
+        -- GT on the partial key {receiver} skips every message of that
+        -- receiver at once, so this walks distinct receivers, not messages.
+        local last = nil
         return function()
-            while true do
-                local rv = self.space.index.receiver:select({ last }, {
-                    limit = 1,
-                    iterator = 'GT'
-                })
-                if rv[1] == nil then break end
-                last = rv[1][2]
-                return last
+            local tuple = self.space.index.receiver:select(last, {
+                limit = 1,
+                iterator = 'GT'
+            })[1]
+            if tuple == nil then
+                return nil
             end
-            return nil
+            last = {tuple[2]}
+            return tuple[2]
         end
     end,
     put = function(self, receiver, message)
-        assert(receiver ~= nil)
-        assert(message  ~= nil)
+        assert(receiver ~= nil, 'receiver is nil')
+        assert(message ~= nil, 'message is nil')
         if self.combiner ~= nil and self.squash_only == false then
             local rv = message
             for _, msg in self:pairs(receiver) do
@@ -48,157 +83,211 @@ local tube_space_methods = {
             message = rv
         end
         self.stats[receiver] = self.stats[receiver] + 1
-        return self.space:auto_increment{receiver, message}
-    end,
-    len = function(self, receiver)
-        local val = nil
-        if receiver == nil then
-            val = self.space:len()
-        else
-            val = self.space.index.receiver:count{receiver}
-            assert(val == self.stats[receiver])
-        end
-        return val
-    end,
-    delete = function(self, receiver)
-        if receiver == nil then
-            self.stats = collections.defaultdict(0)
-            return self.space:truncate()
-        end
-        fun.iter(self.space.index.receiver:select{receiver}):map(
-            function(tuple) return tuple[1] end
-        ):each(
-            function(key) self.space:delete(key) end
-        )
-        self.stats[receiver] = nil
-    end,
-    truncate = function(self)
-        self:delete()
-    end,
-    drop = function(self)
-        tube_list[ self.name ] = nil
-        self.space:drop()
-        self.name = nil
-        self.stats = nil
-        setmetatable(self, nil)
-    end,
-    squash = function(self)
-        if self.combiner ~= nil and self.squash_only == true then
-            for receiver in self:receiver_closure() do
-                local rv = nil
-                for _, v in self:pairs(receiver) do
-                    if rv == nil then
-                        rv = v
-                    else
-                        rv = self.combiner(rv, v)
-                    end
-                end
-                self:delete(receiver)
-                self:put(receiver, rv)
-            end
-        end
-    end
-}
-
-local tube_table_methods = {
-    pairs = function(self, receiver)
-        assert(receiver ~= nil)
-        return pairs(self.container[receiver])
-    end,
-    receiver_closure = function(self)
-        local fun, param, state = pairs(self.container)
-        return function()
-            local key, val = fun(param, state)
-            if val == nil then
-                return nil
-            end
-            return key
-        end
-    end,
-    put = function(self, receiver, message)
-        assert(receiver ~= nil)
-        assert(message  ~= nil)
-
-        if self.combiner ~= nil and self.squash_only == false then
-            local rv = message
-            for _, msg in self:pairs(receiver) do
-                rv = self.combiner(rv, msg)
-            end
-            self:delete(receiver)
-            message = rv
-        end
-        self.stats[receiver] = self.stats[receiver] + 1
-        table.insert(self.container[receiver], message)
+        self.space:insert{box.NULL, receiver, message}
         return message
     end,
     len = function(self, receiver)
-        local len = 0
         if receiver == nil then
-            for k, v in pairs(self.container) do
-                len = len + #v
+            return self.space:len()
+        end
+        return self.space.index.receiver:count({receiver})
+    end,
+    delete = function(self, receiver)
+        if receiver == nil then
+            self.space:truncate()
+            self.stats = collections.defaultdict(0)
+            return
+        end
+        -- select() returns a snapshot, so deleting while walking it is safe.
+        for _, tuple in ipairs(self.space.index.receiver:select({receiver})) do
+            self.space:delete{tuple[1]}
+        end
+        self.stats[receiver] = nil
+    end,
+    drop = function(self)
+        self.space:drop()
+    end,
+}
+
+-------------------------------------------------------------------------------
+-- 'table' engine
+-------------------------------------------------------------------------------
+
+local tube_table_methods = {
+    pairs = function(self, receiver)
+        assert(receiver ~= nil, 'receiver is nil')
+        -- rawget, not container[receiver]: reading must not create a bucket,
+        -- or every vertex the worker polls would become a live receiver.
+        local messages = rawget(self.container, receiver)
+        if messages == nil then
+            return function() return nil end
+        end
+        return pairs(messages)
+    end,
+    receiver_closure = function(self)
+        local gen, param, state = pairs(self.container)
+        return function()
+            local value
+            state, value = gen(param, state)
+            if value == nil then
+                return nil
             end
-        else
-            len = #(self.container[receiver] or {})
+            return state
+        end
+    end,
+    put = function(self, receiver, message)
+        assert(receiver ~= nil, 'receiver is nil')
+        assert(message ~= nil, 'message is nil')
+        if self.combiner ~= nil and self.squash_only == false then
+            local rv = message
+            for _, msg in self:pairs(receiver) do
+                rv = self.combiner(rv, msg)
+            end
+            self:delete(receiver)
+            message = rv
+        end
+        self.stats[receiver] = self.stats[receiver] + 1
+        local messages = rawget(self.container, receiver)
+        if messages == nil then
+            messages = {}
+            self.container[receiver] = messages
+        end
+        table.insert(messages, message)
+        return message
+    end,
+    len = function(self, receiver)
+        if receiver ~= nil then
+            local messages = rawget(self.container, receiver)
+            return messages == nil and 0 or #messages
+        end
+        local len = 0
+        for _, messages in pairs(self.container) do
+            len = len + #messages
         end
         return len
     end,
     delete = function(self, receiver)
         if receiver == nil then
-            self.container = collections.defaultdict(function(key)
-                return {}
-            end)
+            self.container = {}
             self.stats = collections.defaultdict(0)
-        else
-            self.container[receiver] = nil
-            self.stats[receiver] = nil
+            return
         end
-    end,
-    truncate = function(self)
-        self:delete()
+        self.container[receiver] = nil
+        self.stats[receiver] = nil
     end,
     drop = function(self)
-        tube_list[ self.name ] = nil
-        self.name = nil
-        self.stats = nil
-        setmetatable(self, nil)
+        self.container = nil
     end,
+}
+
+-------------------------------------------------------------------------------
+-- Shared
+-------------------------------------------------------------------------------
+
+local tube_common_methods = {
+    truncate = function(self)
+        return self:delete()
+    end,
+    --- Fold every receiver's messages down to one with the combiner.
+    --
+    -- Only does anything in squash_only mode; otherwise put() has already
+    -- combined and there is nothing left to fold.
     squash = function(self)
-        if self.combiner ~= nil and self.squash_only == true then
-            for receiver in self:receiver_closure() do
-                local rv = nil
-                for _, v in self:pairs(receiver) do
-                    if rv == nil then
-                        rv = v
-                    else
-                        rv = self.combiner(rv, v)
-                    end
+        if self.combiner == nil or self.squash_only == false then
+            return
+        end
+        -- Collect the receivers before touching any of them: squash deletes
+        -- and re-puts each one, and mutating a Lua table underneath its own
+        -- pairs() iterator is undefined.
+        local receivers = {}
+        for receiver in self:receiver_closure() do
+            table.insert(receivers, receiver)
+        end
+        for _, receiver in ipairs(receivers) do
+            local rv = nil
+            for _, message in self:pairs(receiver) do
+                if rv == nil then
+                    rv = message
+                else
+                    rv = self.combiner(rv, message)
                 end
-                self:delete(receiver)
+            end
+            self:delete(receiver)
+            if rv ~= nil then
                 self:put(receiver, rv)
             end
         end
-    end
+    end,
 }
 
-local function verify_queue(queue)
-    log.info('verifying queue')
-    for k in queue:receiver_closure() do
-        local len = queue.space.index.receiver:len{k}
-        local cnt = queue.stats[k]
-        if len ~= cnt then
-            print('%d ~= %d for key "%s"', len, cnt, k)
-        end
-    end
-    for k, v in pairs(queue.stats) do
-        local len = queue.space.index.receiver:len{k}
-        if v ~= k then
-            print('%d ~= %d for key "%s"', len, v, k)
-        end
-    end
-    log.info('finished')
+--- Detach the queue: it can no longer be used, and queue.new() will build a
+-- fresh one under the same name.
+local function tube_drop(self)
+    tube_list[self.name] = nil
+    self:__drop()
+    self.name = nil
+    self.stats = nil
+    self.space = nil
+    setmetatable(self, nil)
 end
 
+local function methods_of(engine_methods)
+    local result = {}
+    for k, v in pairs(tube_common_methods) do result[k] = v end
+    for k, v in pairs(engine_methods) do result[k] = v end
+    result.__drop = result.drop
+    result.drop = tube_drop
+    return result
+end
+
+local tube_space_mt = { __index = methods_of(tube_space_methods) }
+local tube_table_mt = { __index = methods_of(tube_table_methods) }
+
+--- Cross-check the per-receiver counters against what the queue actually holds.
+--
+-- Returns `true, {}` when they agree and `false, {problem, ...}` when they do
+-- not; every problem is also logged.
+local function verify_queue(queue)
+    local problems = {}
+    local seen = {}
+    local function check(receiver)
+        if seen[receiver] then
+            return
+        end
+        seen[receiver] = true
+        local len = queue:len(receiver)
+        local cnt = stat_count(queue, receiver)
+        if len ~= cnt then
+            table.insert(problems, fmtstring(
+                'receiver %q: queue holds %d message(s), stats says %d',
+                tostring(receiver), len, cnt))
+        end
+    end
+
+    for receiver in queue:receiver_closure() do
+        check(receiver)
+    end
+    for receiver in pairs(queue.stats) do
+        check(receiver)
+    end
+
+    for _, problem in ipairs(problems) do
+        log.error('<queue verify, %s> %s', tostring(queue.name), problem)
+    end
+    return #problems == 0, problems
+end
+
+--- Open (or create) the queue called `name`.
+--
+-- options.combiner    -- callable(a, b) -> c, folds two messages into one
+-- options.squash_only -- run the combiner from squash() only (default false)
+-- options.engine      -- 'space' (default) or 'table'
+--
+-- A queue that already exists is returned as it is; the options of the second
+-- call are ignored, which is what makes queue.list a cache rather than a
+-- factory.
 local function tube_new(name, options)
+    assert(type(name) == 'string', 'queue name must be a string')
     assert(type(options) == 'nil' or type(options) == 'table',
            'options must be "table" or "nil"')
     options = options or {}
@@ -213,57 +302,68 @@ local function tube_new(name, options)
     if squash_only == nil then squash_only = false end
 
     local engine = options.engine or 'space'
-    assert(type(engine) == 'string', 'options.engine must be "string" or "nil"')
+    assert(engine == 'space' or engine == 'table',
+           'options.engine must be "space", "table" or "nil"')
 
     local self = rawget(tube_list, name)
-    if self == nil then
-        self = {
-            name        = name,
-            engine      = engine,
-            combiner    = combiner,
-            squash_only = squash_only,
-            stats       = collections.defaultdict(0)
-        }
-
-        if engine == 'table' then
-            self.container = collections.defaultdict(function(key)
-                return {}
-            end)
-            self = setmetatable(self, { __index = tube_table_methods })
-        elseif engine == 'space' then
-            local space = box.space['pregel_tube_' .. name]
-
-            if space == nil then
-                space = box.schema.create_space('pregel_tube_' .. name)
-                space:create_index('primary' , {
-                    type = 'TREE',
-                    parts = {1, 'NUM'}
-                })
-                space:create_index('receiver', {
-                    type = 'TREE',
-                    parts = {2, 'STR'},
-                    unique = false
-                })
-            else
-                space:pairs():each(function(tuple)
-                    local _, rcvr, msg = tuple:unpack()
-                    self.stats[rcvr] = self.stats[rcvr] + 1
-                end)
-            end
-            self.space = space
-            self = setmetatable(self, { __index = tube_space_methods })
-        else
-            assert(false)
-        end
-
-        tube_list[name] = self
+    if self ~= nil then
+        return self
     end
+
+    self = {
+        name        = name,
+        engine      = engine,
+        combiner    = combiner,
+        squash_only = squash_only,
+        stats       = collections.defaultdict(0)
+    }
+
+    if engine == 'table' then
+        self.container = {}
+        setmetatable(self, tube_table_mt)
+    else
+        local space_name = space_name_of(name)
+        local existed = box.space[space_name] ~= nil
+        local space = box.schema.space.create(space_name, {
+            if_not_exists = true,
+            format = {
+                {name = 'id',       type = 'unsigned'},
+                {name = 'receiver', type = 'string'  },
+                {name = 'message',  type = 'any'     },
+            }
+        })
+        -- space:auto_increment() is gone in Tarantool 3; the primary key is
+        -- filled by a sequence instead, and box.NULL in field 1 draws from it.
+        space:create_index('primary', {
+            type          = 'TREE',
+            parts         = {{field = 1, type = 'unsigned'}},
+            sequence      = true,
+            if_not_exists = true
+        })
+        space:create_index('receiver', {
+            type          = 'TREE',
+            parts         = {{field = 2, type = 'string'}},
+            unique        = false,
+            if_not_exists = true
+        })
+        self.space = space
+        setmetatable(self, tube_space_mt)
+        if existed then
+            -- Rebuild the counters from what survived the restart.
+            for _, tuple in space:pairs() do
+                self.stats[tuple[2]] = self.stats[tuple[2]] + 1
+            end
+        end
+    end
+
+    tube_list[name] = self
     return self
 end
 
+-- Reading a name whose space already exists adopts it, with default options.
 tube_list = setmetatable({}, {
-    __index = function(self, name)
-        if box.space['pregel_tube_' .. name] ~= nil then
+    __index = function(_, name)
+        if type(name) == 'string' and box.space[space_name_of(name)] ~= nil then
             return tube_new(name)
         end
         return nil
@@ -272,6 +372,6 @@ tube_list = setmetatable({}, {
 
 return {
     verify = verify_queue,
-    list = tube_list,
-    new = tube_new
+    list   = tube_list,
+    new    = tube_new
 }

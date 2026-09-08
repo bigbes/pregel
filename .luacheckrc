@@ -14,6 +14,7 @@ ignore = {
 include_files = {
     'pregel/**/*.lua',
     'test/**/*_test.lua',
+    'test/helpers/*.lua',
     'test/instances/*.lua',
     'examples/**/*.lua',
 }
