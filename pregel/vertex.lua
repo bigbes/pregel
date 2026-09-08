@@ -1,22 +1,28 @@
-local fun  = require('fun')
-local log  = require('log')
+--- The vertex object user compute functions are handed.
+--
+-- Vertices are pooled: run_superstep() pops one object per tuple and pushes it
+-- back, so the same table serves thousands of graph vertices and apply() has to
+-- leave no trace of the previous one.
+--
+-- Tuple layout of data_<name>:
+--   1 <id>    string   vertex name
+--   2 <halt>  boolean  voted to halt
+--   3 <value> any      user value
+--   4 <edges> array    array of {destination_name, edge_value}
+
 local json = require('json')
 
---[[--
--- Tuple structure:
--- <id>    - string <TODO: maybe it's better to give ability to user decide>
--- <halt>  - <MP_BOOL>
--- <value> - <MP_ANY>
--- <edges> - <MP_ARRAY of <'id', MP_ANY>>
---]]--
+local table_clear = require('table.clear')
+
 local vertex_private_methods = {
     apply = function(self, tuple)
         self.__modified = false
         self.__id, self.__halt, self.__value, self.__edges = tuple:unpack(1, 4)
-        -- self.__id, self.__halt = tuple:unpack(1, 2)
-        -- self.__tuple = tuple
-        -- self.__value = nil
-        -- self.__edges = nil
+        -- The pool hands this object straight on to the next vertex, so edge
+        -- mutations the previous one requested and did not get to flush would
+        -- otherwise be applied to this one.
+        table_clear(self.__edges_add)
+        table_clear(self.__edges_del)
         return self
     end,
     compute = function(self)
@@ -35,7 +41,8 @@ local vertex_private_methods = {
                         table.insert(idx_to_rm, idx)
                     end
                 end
-                for k = #idx_to_rm, 1 do
+                -- Descending, so removing one does not shift the next.
+                for k = #idx_to_rm, 1, -1 do
                     table.remove(self.__edges, idx_to_rm[k])
                 end
             end
@@ -44,7 +51,7 @@ local vertex_private_methods = {
                 if edge == nil then
                     break
                 end
-                table.insert(self.__edges)
+                table.insert(self.__edges, edge)
             end
             self.__pregel.data_space:replace{
                 self.__id, self.__halt, self.__value, self.__edges
@@ -59,38 +66,37 @@ local vertex_private_methods = {
         table.insert(self.__edges_add, {dest, value})
     end,
     delete_edge = function(self, dest)
-       table.insert(self.__edges_del, dest)
+        table.insert(self.__edges_del, dest)
     end,
 }
 
 local vertex_methods = {
     --[[--
     -- | Base API
-    -- * self:vote_halt       ([is_halted = true])
-    -- * self:pairs_edges     ()
-    -- * self:pairs_messages  ()
-    -- * self:send_message    (receiver_id, value)
-    -- * self:get_value       ()
-    -- * self:set_value       (value)
-    -- * self:get_name        ()
-    -- * self:get_superstep   ()
-    -- * self:get_aggragation (name)
-    -- * self:set_aggregation (name, value)
+    -- * self:vote_halt        ([is_halted = true])
+    -- * self:pairs_edges      ()
+    -- * self:pairs_messages   ()
+    -- * self:send_message     (receiver_id, value)
+    -- * self:get_value        ()
+    -- * self:set_value        (value)
+    -- * self:get_name         ()
+    -- * self:get_superstep    ()
+    -- * self:get_aggregation  (name)
+    -- * self:set_aggregation  (name, value)
+    -- * self:get_worker_context ()
     --]]--
     vote_halt = function(self, is_halted)
         if is_halted == nil then is_halted = true end
         if self.__halt ~= is_halted then
             self.__modified = true
             self.__halt = is_halted
-            self.__pregel.in_progress = self.__pregel.in_progress + (is_halted and -1 or 1)
+            self.__pregel.in_progress =
+                self.__pregel.in_progress + (is_halted and -1 or 1)
         end
     end,
     pairs_edges = function(self)
-        -- if self.__edges == nil then
-        --     self.__edges = self.__tuple[4]
-        -- end
         local last = 0
-        return function(pos)
+        return function()
             last = last + 1
             local edge = self.__edges[last]
             if edge == nil then
@@ -103,15 +109,15 @@ local vertex_methods = {
         return self.__pregel.mqueue:pairs(self.__id)
     end,
     send_message = function(self, receiver, msg)
+        -- The third element is the sender: message.deliver documents
+        -- {receiver, message, sent_from} and a combiner or a compute function
+        -- that wants to answer has no other way to learn who asked.
         self.__pregel.mpool:by_id(receiver):put(
                 'message.deliver',
-                {receiver, msg}
+                {receiver, msg, self.__id}
         )
     end,
     get_value = function(self)
-        -- if self.__value == nil then
-        --     self.__value = self.__tuple[3]
-        -- end
         return self.__value
     end,
     set_value = function(self, new)
@@ -132,10 +138,14 @@ local vertex_methods = {
     end,
     --[[--
     -- | Topology mutation API
-    -- * self:add_vertex     (value)
-    -- * self:add_edge       ([src = self:get_name(), ]dest, value)
-    -- * self:delete_vertex  ([src][, vertices = true])
-    -- * self:delete_edge    ([src = self:get_name(), ]dest)
+    --
+    -- These take effect between supersteps, not immediately: they are queued
+    -- as topology mutations on the worker that owns the vertex in question.
+    --
+    -- * self:add_vertex    (value)
+    -- * self:add_edge      ([src = self:get_name(), ]dest, value)
+    -- * self:delete_vertex ([src = self:get_name()][, edges = false])
+    -- * self:delete_edge   ([src = self:get_name(), ]dest)
     --]]--
     add_vertex = function(self, value)
         assert(value ~= nil, 'value is nil')
@@ -146,9 +156,8 @@ local vertex_methods = {
         )
     end,
     add_edge = function(self, src, dest, value)
-        local delayed = true
         if value == nil then
-            delayed = false
+            -- Two-argument form: add_edge(dest, value).
             value = dest
             dest  = src
             src   = self:get_name()
@@ -156,50 +165,47 @@ local vertex_methods = {
         if value == nil then
             value = json.NULL
         end
-        assert(src ~= nil,   'unreachable')
-        assert(dest ~= nil,  'destination is nil')
-        assert(value ~= nil, 'unreachable')
-        if delayed and src == self:get_name() then
-            delayed = false
-        end
-        if not delayed or src == self:get_name() then
+        assert(dest ~= nil, 'destination is nil')
+        if src == self:get_name() then
             vertex_private_methods.add_edge(self, dest, value)
         else
+            -- The worker on the far side stores this against `src`, so the
+            -- source has to travel with it: edge.store.delayed is
+            -- {src, dest, value}.
             self.__pregel.mpool:by_id(src):put(
                     'edge.store.delayed',
-                    {dest, value}
+                    {src, dest, value}
             )
         end
     end,
-    -- deleting of all input edges is NIY
-    -- only complex version can be implemented (full scan)
+    -- deleting all inbound edges is not implemented: only the full-scan
+    -- version can be, and nothing needs it yet.
     delete_vertex = function(self, vertex_name, edges)
-        if edges == nil then
-            edges       = vertex_name
-            vertex_name = self:get_name()
+        -- Both arguments are optional and only the flag can be a boolean, so
+        -- that is what tells delete_vertex(true) from delete_vertex('name').
+        if type(vertex_name) == 'boolean' then
+            edges = vertex_name
+            vertex_name = nil
         end
+        vertex_name = vertex_name or self:get_name()
         if edges == nil then
             edges = false
         end
-        assert(vertex_name ~= nil, 'unreachable')
-        assert(edges ~= nil,  'unreachable')
-        -- TODO: !!!!!
-        assert(edges == false, 'for now')
+        assert(edges == false, 'deleting inbound edges is not implemented')
         self.__pregel.mpool:by_id(vertex_name):put(
                 'vertex.delete.delayed',
                 {vertex_name, edges}
         )
     end,
     delete_edge = function(self, src, dest)
-        local delayed = true
         if dest == nil then
-            delayed = false
+            -- One-argument form: delete_edge(dest).
             dest = src
             src = self:get_name()
         end
-        assert(src ~= nil,  'unreachable')
+        assert(src ~= nil, 'source is nil')
         assert(dest ~= nil, 'destination is nil')
-        if not delayed or src == self:get_name() then
+        if src == self:get_name() then
             vertex_private_methods.delete_edge(self, dest)
         else
             self.__pregel.mpool:by_id(src):put(
@@ -214,24 +220,23 @@ local vertex_methods = {
 }
 
 local function vertex_new()
-    local self = setmetatable({
-        -- can't access from inside
+    return setmetatable({
+        -- reset by apply() for every vertex this object serves
         __superstep           = 0,
         __id                  = 0,
         __modified            = false,
         __halt                = false,
         __edges               = nil,
         __value               = 0,
-        -- assigned once per vertex
+        __edges_del           = {},
+        __edges_add           = {},
+        -- assigned once, when the pool creates the object
         __pregel              = nil,
         __compute_func        = nil,
         __write_solution_func = nil,
-        __edges_del           = {},
-        __edges_add           = {},
     }, {
         __index = vertex_methods
     })
-    return self
 end
 
 local vertex_pool_methods = {

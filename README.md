@@ -278,7 +278,7 @@ to each vertex on each worker node.
 > system combines those values using a reduction operator, and the resulting
 > value is made available to all vertices in superstep S + 1.
 
-* `vertex:get_aggragation(name)` - get value from aggregator
+* `vertex:get_aggregation(name)` - get value from aggregator
 * `vertex:set_aggregation(name, value)` - set aggregator value
 
 **Topology mutation part**
