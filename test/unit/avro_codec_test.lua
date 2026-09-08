@@ -211,6 +211,23 @@ g.test_enum = function()
     t.assert_error_msg_contains('not a symbol', codec.encode, schema.parse(spec), 'NOPE')
 end
 
+--- An enum default exists for schema resolution -- a reader that does not know
+--  the writer's symbol. An index the *writer's own* schema has no symbol for is
+--  corrupt data, and returning the default silently invented a value.
+--  fastavro 1.12.2 raises IndexError for it.
+g.test_enum_rejects_an_out_of_range_index_even_with_a_default = function()
+    local sc = schema.parse(
+        '{"type":"enum","name":"E","symbols":["A","B"],"default":"A"}')
+    t.assert_error_msg_contains('has no symbol at index 5',
+                                codec.decode, sc, unhex('0a'))
+    -- Without a default the error was already correct; it must stay.
+    local plain = schema.parse('{"type":"enum","name":"E","symbols":["A","B"]}')
+    t.assert_error_msg_contains('has no symbol at index 5',
+                                codec.decode, plain, unhex('0a'))
+    -- An index the schema does have still decodes.
+    t.assert_equals(codec.decode(sc, unhex('02')), 'B')
+end
+
 --------------------------------------------------------------------------------
 -- Complex types
 --------------------------------------------------------------------------------
@@ -220,6 +237,22 @@ g.test_array = function()
     assert_bytes('{"type":"array","items":"long"}', {1, 2}, '04 02 04 00')
     assert_bytes('{"type":"array","items":"long"}', {},     '00')
     assert_bytes('{"type":"array","items":"string"}', {'a'}, '02 02 61 00')
+end
+
+--- encoders.array only looked at #value, so a map-shaped table -- which the
+--  validator does reject -- encoded as an empty array and the data vanished
+--  without an error. encode() and validate() must agree.
+g.test_array_rejects_a_table_that_is_not_a_sequence = function()
+    local sc = schema.parse('{"type":"array","items":"int"}')
+    t.assert_equals(codec.validate(sc, {a = 1}), false)
+    t.assert_error_msg_contains('expects a sequence', codec.encode, sc, {a = 1})
+    -- A hole truncates the array under Lua's # semantics; refuse that too.
+    t.assert_error_msg_contains('expects a sequence', codec.encode, sc, {1, nil, 3})
+    -- A sequence with extra string keys is still not one.
+    t.assert_error_msg_contains('expects a sequence', codec.encode, sc, {1, 2, x = 3})
+    -- Genuine sequences are unaffected.
+    t.assert_equals(hex(codec.encode(sc, {1, 2})), '04 02 04 00')
+    t.assert_equals(hex(codec.encode(sc, {})), '00')
 end
 
 g.test_array_reader_accepts_several_blocks = function()
@@ -374,6 +407,22 @@ g.test_decode_honours_pos_and_returns_the_next_one = function()
     local v, pos = codec.decode(sc, data, 3)
     t.assert_equals(v, 'foo')
     t.assert_equals(pos, 7)
+end
+
+--- decode()/skip() checked the data but not pos, so pos = 0 made data:byte(0)
+--  nil and the varint reader died inside bit.band with a raw Lua error naming
+--  a line of codec.lua.
+g.test_decode_and_skip_reject_a_bad_pos = function()
+    local sc = schema.parse('"int"')
+    for _, bad in ipairs({0, -1, 1.5}) do
+        t.assert_error_msg_contains('pos must be a positive integer',
+                                    codec.decode, sc, '\2', bad)
+        t.assert_error_msg_contains('pos must be a positive integer',
+                                    codec.skip, sc, '\2', bad)
+    end
+    -- A pos past the end is a different, already correct, error.
+    t.assert_error_msg_contains('unexpected end of input',
+                                codec.decode, sc, '\2', 5)
 end
 
 g.test_truncated_input_is_reported = function()

@@ -323,6 +323,17 @@ encoders['array'] = function(sc, value, out)
         fail('array expects a table, got %s', type(value))
     end
     local n = #value
+    -- #value alone would encode a map-shaped table as an empty array and a
+    -- table with a hole as a truncated one, losing the data without an error --
+    -- while validate() rejected both. This is the validator's own test.
+    local seen = 0
+    for _ in pairs(value) do
+        seen = seen + 1
+    end
+    if seen ~= n then
+        fail('array expects a sequence: the table has %d key(s) and a length of %d',
+             seen, n)
+    end
     if n > 0 then
         put_long(out, n)
         for i = 1, n do
@@ -498,13 +509,16 @@ decoders['fixed'] = function(sc, data, pos)
     return data:sub(pos, pos + sc.size - 1), pos + sc.size
 end
 
+--- An index the writer's own schema has no symbol for is corrupt data.
+--
+-- The enum `default` is not a fallback here: the specification gives it to
+-- *schema resolution*, for a reader that does not know a symbol the writer
+-- wrote, and pregel.avro.resolve handles that case itself. Returning it for an
+-- index out of the writer's own range invented a value out of damaged bytes.
 decoders['enum'] = function(sc, data, pos)
     local idx, next_pos = get_int(data, pos)
     local sym = sc.symbols[idx + 1]
     if sym == nil then
-        if sc.default ~= nil then
-            return sc.default, next_pos
-        end
         fail('enum %s has no symbol at index %d', sc.fullname, idx)
     end
     return sym, next_pos
@@ -686,8 +700,24 @@ end
 
 M.skip_value = skip_value
 
+--- Reject a starting offset the readers cannot make sense of.
+--
+-- Positions are 1-based. Without this, pos = 0 made data:byte(0) nil and the
+-- varint reader died inside bit.band with a raw Lua error naming a line of this
+-- file rather than the caller's mistake. A pos past the end of the buffer is
+-- fine here; the readers report that as a truncated input.
+local function check_pos(pos)
+    if type(pos) ~= 'number' or pos < 1 or pos % 1 ~= 0 then
+        fail('pos must be a positive integer, got %s', tostring(pos))
+    end
+    return pos
+end
+
 function M.skip(sc, data, pos)
-    return skip_value(avro_schema.parse(sc), data, pos or 1)
+    if type(data) ~= 'string' then
+        fail('skip expects a string, got %s', type(data))
+    end
+    return skip_value(avro_schema.parse(sc), data, check_pos(pos or 1))
 end
 
 -- pregel.avro.resolve requires this module, so it is loaded on first use rather
@@ -706,13 +736,14 @@ function M.decode(sc, data, pos, reader_schema)
     if type(data) ~= 'string' then
         fail('decode expects a string, got %s', type(data))
     end
+    pos = check_pos(pos or 1)
     if reader_schema ~= nil then
         if resolve_mod == nil then
             resolve_mod = require('pregel.avro.resolve')
         end
-        return resolve_mod.decode(sc, data, pos or 1, reader_schema)
+        return resolve_mod.decode(sc, data, pos, reader_schema)
     end
-    local value, next_pos = decode_value(sc, data, pos or 1)
+    local value, next_pos = decode_value(sc, data, pos)
     if value == NULL then
         -- A null at the top level has no table slot to keep alive.
         return nil, next_pos
