@@ -458,31 +458,127 @@ local function has_role(roles, role)
     return false
 end
 
---- Every instance in the cluster running `role` for the job called `job`.
+--- Each replicaset's configured leader, keyed by replicaset name.
 --
--- Returns an array of URIs ordered by instance name, so two instances reading
--- the same config produce the same list. (mpool re-orders the buckets by peer
--- uuid anyway, which is what actually makes the sharding agree; this only
--- keeps the logs and the errors reproducible.)
+-- config:cluster_config() is the only public way to it: `leader` is a
+-- replicaset-level option and is not part of the instance config schema at
+-- all, so config:get('leader', {instance = ...}) answers "[instance_config]
+-- leader: No such field in the schema" (measured on CE 3.9 and EE 3.7).
+local function leaders_of(config)
+    local rv = {}
+    if not is_callable(config.cluster_config) then
+        return rv
+    end
+    local ok, cluster = pcall(config.cluster_config, config)
+    if not ok or type(cluster) ~= 'table' then
+        return rv
+    end
+    for _, group in pairs(cluster.groups or {}) do
+        for name, replicaset in pairs(group.replicasets or {}) do
+            rv[name] = replicaset.leader
+        end
+    end
+    return rv
+end
+
+--- The one instance of `members` that will be read-write.
+--
+-- A replicaset is one participant of a job, not one per instance: its replicas
+-- carry the role because `roles:` is written at replicaset scope, and they
+-- cannot run it (see check_writable). Counting them made every other instance
+-- dial an address that would never serve pregel.
+--
+-- Which instance that is has to be answered from the config, because discovery
+-- runs before anything has connected. Two failover modes say so statically;
+-- the other two do not, and there the honest answer is to ask the operator.
+local function rw_member(role, role_name, job, replicaset, members, config,
+                         leaders)
+    if #members == 1 then
+        return members[1]
+    end
+    local failover = config:get('replication.failover',
+                                {instance = members[1].instance})
+    if failover == nil or failover == box.NULL then
+        failover = 'off'
+    end
+
+    if failover == 'off' then
+        local rw = {}
+        for _, member in ipairs(members) do
+            if config:get('database.mode', {instance = member.instance}) ==
+               'rw' then
+                table.insert(rw, member)
+            end
+        end
+        if #rw == 1 then
+            return rw[1]
+        end
+        error("%s: replicaset '%s' runs %s for job '%s' on %d instances and " ..
+              "%d of them are 'database.mode: rw'; a job takes one worker " ..
+              'per replicaset, so name exactly one or list the URIs in ' ..
+              'roles_cfg instead', role, replicaset, role_name, job, #members,
+              #rw)
+    end
+
+    if failover == 'manual' then
+        local leader = leaders[replicaset]
+        for _, member in ipairs(members) do
+            if member.instance == leader then
+                return member
+            end
+        end
+        error("%s: replicaset '%s' runs %s for job '%s' on %d instances and " ..
+              "its leader (%s) is not one of them; list the URIs in " ..
+              'roles_cfg instead', role, replicaset, role_name, job, #members,
+              leader == nil and 'unset' or "'" .. tostring(leader) .. "'")
+    end
+
+    error("%s: replicaset '%s' runs %s for job '%s' on %d instances under " ..
+          "'%s' failover, which names no leader in the config; list the URIs " ..
+          'in roles_cfg instead', role, replicaset, role_name, job, #members,
+          tostring(failover))
+end
+
+--- Every participant of `job` running `role_name`: one per replicaset.
+--
+-- Returns an array of {instance, uri} ordered by instance name, so two
+-- instances reading the same config produce the same list.
 --
 -- The job name is part of the test on purpose: one cluster can run several
 -- pregel jobs, and an instance belongs to the one whose name its own roles_cfg
 -- names.
-function M.instances_of(role_name, job)
+function M.instances_of(role, role_name, job)
     local config = require('config')
-    local rv = {}
-    for instance in pairs(config:instances()) do
+    local instances = config:instances()
+    local by_replicaset = {}
+    local names = {}
+    for instance, info in pairs(instances) do
         local roles = config:get('roles', {instance = instance})
         if has_role(roles, role_name) then
             local roles_cfg = config:get('roles_cfg', {instance = instance})
             local cfg = (roles_cfg or {})[role_name]
             if type(cfg) == 'table' and cfg.name == job then
-                table.insert(rv, {
+                local replicaset = info.replicaset_name or instance
+                if by_replicaset[replicaset] == nil then
+                    by_replicaset[replicaset] = {}
+                    table.insert(names, replicaset)
+                end
+                table.insert(by_replicaset[replicaset], {
                     instance = instance,
                     uri      = peer_uri(config, instance),
                 })
             end
         end
+    end
+
+    local leaders = leaders_of(config)
+    local rv = {}
+    table.sort(names)
+    for _, replicaset in ipairs(names) do
+        local members = by_replicaset[replicaset]
+        table.sort(members, function(a, b) return a.instance < b.instance end)
+        table.insert(rv, rw_member(role, role_name, job, replicaset, members,
+                                   config, leaders))
     end
     table.sort(rv, function(a, b) return a.instance < b.instance end)
     return rv
@@ -491,7 +587,7 @@ end
 --- URIs only, refusing an instance the config gives no address for.
 local function uris_of(role, role_name, job)
     local rv = {}
-    for _, found in ipairs(M.instances_of(role_name, job)) do
+    for _, found in ipairs(M.instances_of(role, role_name, job)) do
         if found.uri == nil then
             error("%s: cannot discover the URI of instance '%s', which runs " ..
                   "%s for job '%s'; set the URIs in roles_cfg instead",
@@ -551,18 +647,27 @@ function M.deep_equal(a, b)
     return true
 end
 
---- Refuse to run on a read-only instance.
+--- May this instance run the role? False on a read-only one.
 --
 -- Both roles write to the instance: a worker creates its spaces, and both hand
 -- out the privileges the other participants need to reach them. Beyond that,
 -- an instance that merely follows another one has no business running half a
--- pregel job -- two masters over one set of workers is worse than a config
--- that refuses to apply.
+-- pregel job -- two masters over one set of workers would be worse.
+--
+-- Inert rather than refused, and that is the point. `roles:` is normally
+-- written at replicaset scope, so the replicas of a worker replicaset carry
+-- the role whether or not anyone meant them to; raising here made their config
+-- unappliable, and at startup an unappliable config exits the process. So the
+-- role does nothing, says so once, and the next reload -- after a promotion,
+-- say -- picks the job up.
 function M.check_writable(role)
     if box.info.ro then
-        error("%s: the instance is read-only; this role needs a read-write " ..
-              "instance", role)
+        log.info('%s: the instance is read-only, so this role does nothing ' ..
+                 'here; a config reload once the instance is read-write ' ..
+                 'starts the job', role)
+        return false
     end
+    return true
 end
 
 return M

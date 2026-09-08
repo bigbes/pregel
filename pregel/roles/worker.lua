@@ -96,6 +96,8 @@ local state = {
     worker  = nil,
     -- The fiber that waits for the peers; see common.connector.
     connect = nil,
+    -- This instance is a read-only replica, so the role is inert here.
+    read_only = false,
 }
 
 local function validate(cfg)
@@ -114,7 +116,11 @@ local function apply(cfg)
               'the role first', ROLE)
     end
 
-    common.check_writable(ROLE)
+    if not common.check_writable(ROLE) then
+        state.read_only = true
+        return
+    end
+    state.read_only = false
 
     local app = common.load_app(ROLE, cfg.app, {'compute', 'obtain_name'})
 
@@ -173,6 +179,7 @@ local function stop()
     state.worker = nil
     state.cfg = nil
     state.connect = nil
+    state.read_only = false
     if connect ~= nil then
         connect:stop()
     end
@@ -190,13 +197,18 @@ end
 
 --- What this instance is doing:
 --
---   {state = 'idle'|'connecting'|'running'|'failed', name = <job>,
---    in_progress = <n>, messages = <n>, error = <string, when not connected>}
+--   {state = 'idle'|'read_only'|'connecting'|'running'|'failed',
+--    name = <job>, in_progress = <n>, messages = <n>,
+--    error = <string, when not connected>}
 --
--- 'idle' before apply and after stop; 'connecting' while the job exists but
--- some peer has not answered yet; 'failed' once the role has given up on them
--- (the job object is still there, and a config reload retries).
+-- 'idle' before apply and after stop; 'read_only' when the instance is a
+-- replica and the role is therefore inert here; 'connecting' while the job
+-- exists but some peer has not answered yet; 'failed' once the role has given
+-- up on them (the job object is still there, and a config reload retries).
 local function status()
+    if state.read_only then
+        return {state = 'read_only'}
+    end
     if state.worker == nil then
         return {state = 'idle'}
     end

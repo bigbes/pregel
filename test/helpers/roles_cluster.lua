@@ -81,6 +81,11 @@ function helper.worker_name(i)
     return 'worker' .. i
 end
 
+--- The read-only replica of worker `i`, when the config has one.
+function helper.replica_name(i)
+    return helper.worker_name(i) .. 'r'
+end
+
 helper.MASTER_NAME = 'master'
 
 --- A worker URI nothing ever listens on.
@@ -107,6 +112,12 @@ helper.GHOST_URI = 'unix/:./ghost.iproto'
 -- opts.ghost_worker -- add helper.GHOST_URI to every worker list, so the job
 --                      has one participant that is not there
 -- opts.connect_timeout -- roles_cfg.connect_timeout for both roles
+-- opts.replica_worker -- index of a worker whose replicaset gets a second
+--                        instance ('<name>r') carrying the same role with the
+--                        same roles_cfg, which is what `roles:` at replicaset
+--                        scope produces. Switches the cluster to manual
+--                        failover with the first instance as the leader, and
+--                        turns the WAL on, since replication needs one.
 function helper.config(opts)
     opts = opts or {}
     local job     = opts.job or helper.JOB
@@ -120,8 +131,13 @@ function helper.config(opts)
             lua_call    = helper.LUA_CALL,
         }},
     })
-    -- Nothing in these tests outlives the cluster.
-    builder:set_global_option('wal.mode', 'none')
+    -- Nothing in these tests outlives the cluster -- but a replica has to read
+    -- its leader's WAL, so a replicated cluster pays for one.
+    builder:set_global_option('wal.mode',
+                              opts.replica_worker and 'write' or 'none')
+    if opts.replica_worker then
+        builder:set_global_option('replication.failover', 'manual')
+    end
 
     local worker_uris = {}
     for i = 1, count do
@@ -171,10 +187,26 @@ function helper.config(opts)
             roles, roles_cfg = {}, {}
         end
         builder:use_replicaset('r_worker' .. i)
+        if opts.replica_worker then
+            builder:set_replicaset_option('leader', helper.worker_name(i))
+        end
         builder:add_instance(helper.worker_name(i), {
             roles     = roles,
             roles_cfg = roles_cfg,
         })
+        if opts.replica_worker == i then
+            -- The same roles and the same roles_cfg, because that is what
+            -- writing them at replicaset scope produces.
+            builder:add_instance(helper.replica_name(i), {
+                roles     = roles,
+                roles_cfg = roles_cfg,
+            })
+        end
+    end
+
+    if opts.replica_worker then
+        builder:use_replicaset('r_master')
+        builder:set_replicaset_option('leader', helper.MASTER_NAME)
     end
 
     return builder:config()

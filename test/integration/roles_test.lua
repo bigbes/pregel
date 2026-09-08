@@ -283,3 +283,55 @@ g.test_the_roles_find_each_other_in_the_cluster_config = function()
     end, {helper.WORKER_ROLE})
     t.assert_equals(#uris, helper.WORKER_COUNT)
 end
+
+-- A replicaset written as `roles: [pregel.roles.worker]` puts the role on the
+-- replica too, and discovery used to count the replica as a second worker of
+-- the job -- so every instance tried to connect to an address that would never
+-- serve pregel, and the whole cluster died 30 s later. One worker per
+-- replicaset, addressed through the leader.
+g.test_discovery_takes_one_worker_per_replicaset = function()
+    local config = helper.config({autostart = true, discovery = true,
+                                  replica_worker = 1})
+    local c = Cluster:new(config, helper.server_opts)
+    c:start()
+
+    helper.wait_state(c, 'done')
+    assert_max_value_everywhere(c)
+
+    local uris = c[helper.worker_name(1)]:exec(function(role)
+        return require(role).get().workers
+    end, {helper.WORKER_ROLE})
+    t.assert_equals(#uris, helper.WORKER_COUNT,
+                    'the read-only replica was counted as a worker')
+    for _, uri in ipairs(uris) do
+        local address = type(uri) == 'table' and uri.uri or uri
+        t.assert_not_str_contains(address, helper.replica_name(1),
+                                  'a replica is among the discovered workers')
+    end
+end
+
+-- The other half of the same config: the replica carries the role and cannot
+-- run it. Refusing to apply is worse than not running -- at startup that is a
+-- fatal config error and the process exits -- so the role goes inert and says
+-- so. Nothing covered this at all: check_writable could be deleted from both
+-- roles and the suite stayed green.
+g.test_the_role_is_inert_on_a_read_only_instance = function()
+    local c = Cluster:new(helper.config({autostart = true, discovery = true,
+                                         replica_worker = 1}),
+                          helper.server_opts)
+    c:start()
+
+    local replica = helper.replica_name(1)
+    t.assert_equals(c[replica]:exec(function() return box.info.ro end), true)
+    t.assert_equals(helper.worker_status(c, replica), {state = 'read_only'})
+    t.assert_equals(helper.worker_registered(c, replica), false,
+                    'the read-only instance created a job anyway')
+
+    -- The instance itself is healthy, which is the whole point.
+    t.assert_equals(c[replica]:exec(function()
+        return require('config'):info().status
+    end), 'ready')
+
+    -- And the job still runs on the rest of the cluster.
+    helper.wait_state(c, 'done')
+end

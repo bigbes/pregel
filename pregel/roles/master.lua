@@ -63,6 +63,8 @@ local state = {
     fiber   = nil,
     -- The fiber that waits for the workers; see common.connector.
     connect = nil,
+    -- This instance is a read-only replica, so the role is inert here.
+    read_only = false,
     status  = {state = 'idle'},
 }
 
@@ -156,7 +158,12 @@ local function apply(cfg)
               'the role first', ROLE)
     end
 
-    common.check_writable(ROLE)
+    if not common.check_writable(ROLE) then
+        state.read_only = true
+        set_status('read_only')
+        return
+    end
+    state.read_only = false
 
     local app = common.load_app(ROLE, cfg.app, {'obtain_name'})
 
@@ -220,6 +227,7 @@ local function stop()
     state.fiber = nil
     state.cfg = nil
     state.connect = nil
+    state.read_only = false
 
     if connect ~= nil then
         connect:stop()
@@ -244,12 +252,14 @@ end
 
 --- Where the autostarted job got to:
 --
---   {state = 'idle'|'connecting'|'loading'|'running'|'done'|'failed',
+--   {state = 'idle'|'read_only'|'connecting'|'loading'|'running'|'done'|
+--            'failed',
 --    superstep = <number>, error = <string, when failed or connecting>}
 --
 -- It follows the autostart fiber, except while the workers are still being
 -- reached: 'connecting' comes first and nothing can have started before it is
--- over. A job driven by hand through get() moves `superstep` (the master keeps
+-- over. 'read_only' means the instance is a replica and the role is inert
+-- here. A job driven by hand through get() moves `superstep` (the master keeps
 -- it current) but leaves `state` at 'idle'.
 local function status()
     local rv = table.deepcopy(state.status)
