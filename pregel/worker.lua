@@ -403,12 +403,14 @@ local worker_mt = {
                 else
                     local edge_list = tuple:totable()[4]
                     for _, req in ipairs(group) do
+                        -- Every parallel edge to that destination goes, the
+                        -- same as the local delete_edge path; walk backwards
+                        -- so removal does not shift the indexes still ahead.
                         local removed = false
-                        for idx, edge in ipairs(edge_list) do
-                            if edge[1] == req.dest then
+                        for idx = #edge_list, 1, -1 do
+                            if edge_list[idx][1] == req.dest then
                                 table.remove(edge_list, idx)
                                 removed = true
-                                break
                             end
                         end
                         log.info("<topology mutation, del_edge> '%s'->'%s': %s",

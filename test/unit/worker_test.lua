@@ -491,6 +491,19 @@ g.test_delete_edge_mutation = function()
     drop_worker(w)
 end
 
+-- Defect: the delayed edge-delete pass stopped at the first matching edge,
+-- while the local delete_edge path removes every parallel edge to that
+-- destination; one queued request left the other copies in place.
+g.test_delete_edge_mutation_removes_every_parallel_edge = function()
+    local w = make_worker()
+    w.data_space:replace{'a', false, {name = 'a'},
+                         {{'b', 1}, {'c', 2}, {'b', 3}, {'b', 4}}}
+    w:edge_delete_delayed('a', 'b')
+    w:apply_topology_mutations()
+    t.assert_equals(w.data_space:get{'a'}[4], {{'c', 2}})
+    drop_worker(w)
+end
+
 -- Defect: the edge-delete pass read data_space:get{src}[4] unguarded, so a
 -- mutation naming a vertex that is not here -- deleted in the same batch, or
 -- never stored -- crashed the whole superstep.
