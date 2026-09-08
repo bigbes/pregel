@@ -196,6 +196,44 @@ g.test_mismatched_record_names_are_rejected = function()
     assert_rejects(V1, reader, 'the names do not match')
 end
 
+--- The specification matches named types on the *unqualified* name: "both
+--  schemas are records with the same (unqualified) name". Matching on the
+--  fullname refused a namespaced writer against an unnamespaced reader, which
+--  fastavro 1.12.2 accepts.
+g.test_named_types_match_on_the_unqualified_name = function()
+    local W = '{"type":"record","name":"R","namespace":"n","fields":[' ..
+              '{"name":"a","type":"int"}]}'
+    local R = '{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}'
+    t.assert_equals(through(W, {a = 1}, R), {a = 1})
+    t.assert_equals(through(R, {a = 1}, W), {a = 1})
+    -- Two different namespaces, same short name.
+    local W2 = '{"type":"record","name":"R","namespace":"x.y","fields":[' ..
+               '{"name":"a","type":"int"}]}'
+    t.assert_equals(through(W, {a = 1}, W2), {a = 1})
+
+    local WE = '{"type":"enum","name":"E","namespace":"n","symbols":["A","B"]}'
+    local RE = '{"type":"enum","name":"E","symbols":["A","B"]}'
+    t.assert_equals(through(WE, 'B', RE), 'B')
+
+    local WF = '{"type":"fixed","name":"F","namespace":"n","size":2}'
+    local RF = '{"type":"fixed","name":"F","size":2}'
+    t.assert_equals(through(WF, 'ab', RF), 'ab')
+end
+
+--- Relaxing the namespace must not relax the name itself.
+g.test_different_unqualified_names_are_still_rejected = function()
+    local W = '{"type":"record","name":"R","namespace":"n","fields":[' ..
+              '{"name":"a","type":"int"}]}'
+    assert_rejects(W, '{"type":"record","name":"n.Q","fields":[' ..
+                      '{"name":"a","type":"int"}]}', 'the names do not match')
+    assert_rejects('{"type":"enum","name":"n.E","symbols":["A"]}',
+                   '{"type":"enum","name":"n.G","symbols":["A"]}',
+                   'the names do not match')
+    assert_rejects('{"type":"fixed","name":"n.F","size":2}',
+                   '{"type":"fixed","name":"n.G","size":2}',
+                   'the names do not match')
+end
+
 g.test_recursive_schema_resolves = function()
     local writer = [[{"type":"record","name":"Node","fields":[
         {"name":"label","type":"string"},

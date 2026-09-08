@@ -60,10 +60,17 @@ local function has_alias(sc_or_field, name)
     return false
 end
 
---- Named types match on fullname; the reader may also claim the writer's name
---  as an alias.
+--- Named types match on the *unqualified* name, which is what the
+--  specification's Schema Resolution section asks for: "both schemas are
+--  records with the same (unqualified) name", and likewise for enum and fixed.
+--
+-- The fullname is tried first so that a reader alias -- always a fullname --
+-- keeps working, and so an exact match never costs the extra comparison. When
+-- two branches of a reader union share a short name the first one still wins,
+-- which is both the spec's rule ("the first schema in the reader's union that
+-- matches") and what fastavro 1.12.2 does.
 local function names_match(w, r)
-    return w.fullname == r.fullname or has_alias(r, w.fullname)
+    return w.fullname == r.fullname or has_alias(r, w.fullname) or w.name == r.name
 end
 
 --- A shallow compatibility test, used to choose a branch when only the reader
