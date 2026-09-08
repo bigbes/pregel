@@ -211,6 +211,88 @@ g.test_max_supersteps_leaves_a_converging_job_alone = function()
     t.assert_le(supersteps, VERTEX_COUNT + 2)
 end
 
+-------------------------------------------------------------------------------
+-- A compute that raises
+-------------------------------------------------------------------------------
+
+-- Defect: a compute exception left the pooled vertex object out of the pool,
+-- so the worker spun in `while vertex_pool.count > 0` from the next superstep
+-- on. Nothing upstream turned that into a failure -- a bucket calls with no
+-- timeout and the waitpool only notices a handler that has *died* -- so the
+-- master stopped at send_wait('superstep') and stayed there. A hung job is the
+-- one outcome an operator cannot act on. See docs/api-design.md section 3.13.
+--
+-- Bounded on purpose: with the defect the master never answers, so an
+-- unbounded run would hang the suite rather than fail it.
+local function failing_compute(victim)
+    return string.format([[
+function(self)
+    if self:get_superstep() == 2 and self:get_name() == %q then
+        error('deliberate compute failure', 0)
+    end
+    self:vote_halt(false)
+end
+]], victim)
+end
+
+g.test_a_failed_compute_fails_the_job_instead_of_hanging_it = function()
+    local victim = VERTICES[7].name
+    c = cluster.new(WORKER_COUNT)
+    c:create_workers('failing', failing_compute(victim))
+    c:create_master('failing', GRAPH_PATH)
+
+    -- Caught in the master process rather than here: luatest's Server:exec
+    -- flattens a remote error to its message (a LuatestErrorWrapper with
+    -- `error` and `trace` and nothing else), and the structured half is the
+    -- point. The master is also where it has to be readable -- that is what
+    -- the master role's status() and an operator's console see.
+    local failure = c.master:exec(function()
+        local m = _G.master_instance
+        m:wait_up()
+        if m.preload_func ~= nil then
+            m:preload()
+        end
+        local ok, err = pcall(m.start, m)
+        if ok then
+            return {finished = true, supersteps = err}
+        end
+        local rv = {
+            message      = tostring(err),
+            is_box_error = box.error.is(err),
+            supersteps   = m.superstep_count,
+        }
+        if rv.is_box_error then
+            rv.type           = err.type
+            rv.pregel_code    = err.pregel_code
+            rv.vertex         = err.vertex
+            rv.superstep      = err.superstep
+            rv.has_traceback  = err.traceback ~= nil
+        end
+        return rv
+    end, nil, {timeout = RUN_TIMEOUT})
+
+    t.assert_equals(failure.finished, nil, 'master:start() must fail, not hang')
+    t.assert_str_contains(failure.message, string.format(
+        "pregel: compute failed on vertex '%s' in superstep 2: " ..
+        "deliberate compute failure", victim))
+    t.assert_equals(failure.is_box_error, true)
+    t.assert_equals(failure.type, 'PregelComputeFailed')
+    t.assert_equals(failure.pregel_code, 'COMPUTE_FAILED')
+    t.assert_equals(failure.vertex, victim)
+    t.assert_equals(failure.superstep, 2)
+    t.assert_equals(failure.has_traceback, true)
+    -- The master got one superstep in before the one that failed.
+    t.assert_equals(failure.supersteps, 2)
+
+    -- And the workers are usable afterwards rather than wedged: every pooled
+    -- vertex object is back.
+    for i, count in ipairs(c:each_worker(function()
+        return _G.worker_instance.vertex_pool.count
+    end)) do
+        t.assert_equals(count, 0, 'worker ' .. i .. ' leaked a vertex object')
+    end
+end
+
 -- The whole point of a cluster: the vertices are actually spread over the
 -- worker processes, and every worker holds a share of them.
 g.test_graph_is_sharded_across_workers = function()

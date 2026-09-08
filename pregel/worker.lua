@@ -50,6 +50,66 @@ local RPC_DELIVER       = 'pregel.worker.deliver'
 local RPC_DELIVER_BATCH = 'pregel.worker.deliver_batch'
 local RPC_WAIT          = 'pregel.worker.wait'
 
+-- The custom error type a failed compute is reported as. A caller tells one
+-- from any other failure with `err.type == COMPUTE_FAILED_TYPE`, and reads the
+-- rest off the error object -- see compute_failed() for the fields.
+local COMPUTE_FAILED_TYPE = 'PregelComputeFailed'
+
+--- Stop the superstep, blaming one vertex's compute function.
+--
+-- Raised as a box.error rather than a string so the structured fields survive
+-- the net.box hop to the master: a custom error's payload travels with it
+-- (measured on Tarantool CE 3.9 and EE 3.7), and the master's send_wait
+-- re-raises the object rather than its text. The message itself is a stable
+-- one-liner, so a test and an operator can both match on it.
+--
+-- @param id the vertex whose compute raised
+-- @param superstep the superstep it raised in
+-- @param err whatever the compute function raised
+-- @param traceback the traceback captured at the point of the failure
+-- @raise always
+local function compute_failed(id, superstep, err, traceback)
+    local message = tostring(err)
+    box.error(box.error.new{
+        type      = COMPUTE_FAILED_TYPE,
+        reason    = string.format(
+            "pregel: compute failed on vertex '%s' in superstep %s: %s",
+            tostring(id), tostring(superstep), message),
+        -- `code` and `message` are box.error's own keys and would be swallowed
+        -- rather than stored, so the two that collide carry a prefix. The
+        -- others are payload fields under their own names.
+        pregel_code    = 'COMPUTE_FAILED',
+        pregel_message = message,
+        vertex         = id,
+        superstep      = superstep,
+        traceback      = traceback,
+    })
+end
+
+--- Re-raise a caught error, keeping a box.error object whole.
+--
+-- The RPC entry points used to raise `tostring(err)`, which flattens a
+-- structured error to its message and drops the payload a compute failure
+-- carries -- and the payload is the half a caller can act on. A plain Lua
+-- error is still raised as text, since that is all it ever was.
+--
+-- @param err whatever was caught
+-- @raise always
+local function reraise(err)
+    if type(err) == 'cdata' and box.error.is(err) then
+        box.error(err)
+    end
+    error(tostring(err))
+end
+
+--- xpcall handler capturing the traceback while the failing stack is still up.
+--
+-- A pcall plus a traceback afterwards sees none of the frames below the error,
+-- which is the whole reason this runs as a message handler.
+local function compute_traceback(err)
+    return {message = err, traceback = debug.traceback('', 2)}
+end
+
 --- Reducer counting the vertices that have not voted to halt.
 --
 -- Field 2 is is_halted, so an active vertex is one whose flag is exactly
@@ -188,7 +248,7 @@ local function deliver_msg(name, msg, args)
     end)}
     local status = table.remove(rv, 1)
     if status == false then
-        error(tostring(rv[1]))
+        reraise(rv[1])
     end
     return unpack(rv)
 end
@@ -218,7 +278,7 @@ local function deliver_batch(name, msgs)
         return #msgs
     end)
     if status == false then
-        error(tostring(err))
+        reraise(err)
     end
     return #msgs
 end
@@ -277,9 +337,18 @@ local worker_mt = {
         -- ends the superstep halted unless its compute function voted to stay
         -- awake -- see pregel.vertex.
         --
+        -- A compute function that raises ends the superstep there: the
+        -- vertices already computed keep what they wrote, the rest are not
+        -- computed at all, and nothing is swapped or reported -- the queues
+        -- and the graph are left as the failure found them, which is what
+        -- makes the worker usable for a later job. The failed vertex keeps its
+        -- messages, since nothing about this superstep was committed.
+        --
         -- @param superstep the superstep number, which vertices read
         -- @return 'ok'
-        -- @raise whatever a compute function or a delivery raised
+        -- @raise a `PregelComputeFailed` box.error when a compute function
+        --  raised -- carrying `pregel_code`, `vertex`, `superstep`,
+        --  `pregel_message` and `traceback` -- and whatever a delivery raised
         -- @function run_superstep
         run_superstep = function(self, superstep)
             local function tuple_filter(tuple)
@@ -304,7 +373,23 @@ local worker_mt = {
                 -- cast and mark it modified for a flag that ends up back where
                 -- it started. Being computed at all is the wake-up; see
                 -- tuple_filter.
-                vertex_compute(vertex_object)
+                local ok, failure = xpcall(vertex_compute, compute_traceback,
+                                           vertex_object)
+                if not ok then
+                    -- The object goes back first, and unconditionally: a
+                    -- compute that raised used to skip this and leave
+                    -- vertex_pool.count up, which is a counter nothing else
+                    -- can bring down -- so the loop below spun forever and
+                    -- every later superstep on this worker did too.
+                    local id = vertex_object.__id
+                    self.vertex_pool:push(vertex_object)
+                    -- Stop at the first failure rather than carrying on: the
+                    -- vertices already computed have written their tuples and
+                    -- consumed their messages, so the rest of the shard would
+                    -- be computing against a half-applied superstep.
+                    compute_failed(id, superstep, failure.message,
+                                   failure.traceback)
+                end
                 self.mqueue:delete(vertex_object.__id)
                 self.vertex_pool:push(vertex_object)
                 return acc + 1

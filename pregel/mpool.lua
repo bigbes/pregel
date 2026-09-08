@@ -811,6 +811,12 @@ local function waitpool_handler(id, bucket)
                 self.rval[id] = rv
             else
                 self.errors[id] = tostring(rv)
+                -- The object as well as its text: a worker reports a failed
+                -- compute as a box.error whose payload names the vertex and
+                -- the superstep, and tostring() keeps only the message. See
+                -- __call, which re-raises it whole when it is the only
+                -- failure.
+                self.error_objects[id] = rv
             end
             self.channel_out:put(true)
         end
@@ -859,17 +865,26 @@ local waitpool_mt = {
     -- when one has already failed, so the error names all of them at once
     -- rather than whichever answered first.
     --
+    -- A structured failure is re-raised as itself rather than folded into the
+    -- summary: a worker reports a failed compute as a box.error carrying the
+    -- vertex, the superstep and the traceback, and master:start() is expected
+    -- to hand that on to its caller intact. Only when exactly one bucket
+    -- failed -- with more than one there is no single error to be, and naming
+    -- all of them is worth more than the payload of whichever came first.
+    --
     -- @param msg protocol message name
     -- @param args the message's argument
     -- @return array indexed by bucket id of {elapsed_seconds, results...}
-    -- @raise listing every bucket that failed, sorted so the message is the
-    --  same on every instance
+    -- @raise the single failure itself when it is a box.error, otherwise a
+    --  message listing every bucket that failed, sorted so it is the same on
+    --  every instance
     -- @function __call
     __call = function(self, msg, args)
-        self.rval   = {}
-        self.errors = {}
-        self.msg    = msg
-        self.args   = args
+        self.rval          = {}
+        self.errors        = {}
+        self.error_objects = {}
+        self.msg           = msg
+        self.args          = args
         -- An answer left over from a call that gave up on a dead handler would
         -- otherwise be read as one of this call's.
         while self.channel_out:get(0) ~= nil do end
@@ -881,9 +896,16 @@ local waitpool_mt = {
                 self:check_handlers()
             end
         end
-        local failures = {}
+        local failures, failed_ids = {}, {}
         for id, err in pairs(self.errors) do
             table.insert(failures, string.format('bucket %d: %s', id, err))
+            table.insert(failed_ids, id)
+        end
+        if #failed_ids == 1 then
+            local err = self.error_objects[failed_ids[1]]
+            if type(err) == 'cdata' and box.error.is(err) then
+                box.error(err)
+            end
         end
         if #failures > 0 then
             table.sort(failures)
@@ -915,6 +937,8 @@ local function waitpool_new(pool)
         channel_out = fiber.channel(pool.bucket_cnt),
         rval        = {},
         errors      = {},
+        -- The failures as they were caught, beside their text: see __call.
+        error_objects = {},
         msg         = nil,
         args        = nil
     }, waitpool_mt)

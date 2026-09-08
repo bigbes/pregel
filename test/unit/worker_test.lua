@@ -1,4 +1,5 @@
 local t = require('luatest')
+local fiber = require('fiber')
 
 local box_helper = require('test.helpers.box')
 local worker = require('pregel.worker')
@@ -681,6 +682,167 @@ g.test_a_never_halting_compute_keeps_running = function()
     end
     t.assert_equals(steps, 3)
     t.assert_equals(w.mqueue:len(), 0)
+    m:stop()
+    drop_worker(w)
+end
+
+-------------------------------------------------------------------------------
+-- A compute that raises
+-------------------------------------------------------------------------------
+
+-- Defect: a compute exception skipped both the message cleanup and the return
+-- of the pooled vertex object, so vertex_pool.count stayed up and every later
+-- superstep spun forever in `while self.vertex_pool.count > 0`. The worker was
+-- wedged for the life of the process and nothing turned that into a failure --
+-- the master simply stopped answering. See docs/api-design.md section 3.13.
+
+--- A worker over a, b, c whose compute raises on `victim`.
+local function make_failing_worker(victim, message)
+    local computed = {}
+    local w, name = make_worker({
+        compute = function(self)
+            local id = self:get_name()
+            table.insert(computed, id)
+            if id == victim then
+                error(message, 0)
+            end
+            -- Stay awake, so a later superstep computes this vertex again
+            -- without needing a message to wake it.
+            self:vote_halt(false)
+        end,
+    })
+    for _, id in ipairs({'a', 'b', 'c'}) do
+        w.data_space:replace{id, false, {name = id}, {}}
+    end
+    w.in_progress = 3
+    return w, name, computed
+end
+
+--- Run `fn` in a fiber and fail the test unless it finishes within `timeout`.
+--
+-- A wedged worker does not raise, it spins -- so the only way to assert
+-- against it is a bound. Without one this test hangs the whole suite instead
+-- of failing it.
+local function within(timeout, fn)
+    local done, failure = false, nil
+    local f = fiber.create(function()
+        local ok, err = pcall(fn)
+        if not ok then failure = err end
+        done = true
+    end)
+    f:set_joinable(true)
+    local deadline = fiber.clock() + timeout
+    while not done and fiber.clock() < deadline do
+        fiber.sleep(0.01)
+    end
+    if not done then
+        f:cancel()
+        return false, nil
+    end
+    f:join()
+    return true, failure
+end
+
+g.test_a_raising_compute_returns_its_vertex_to_the_pool = function()
+    local w, name, computed = make_failing_worker('b', 'boom')
+    local m = make_master(name)
+
+    local ok, err = pcall(w.run_superstep, w, 1)
+    t.assert_equals(ok, false, 'run_superstep must fail, not wedge')
+    t.assert_str_contains(tostring(err),
+        "pregel: compute failed on vertex 'b' in superstep 1: boom")
+
+    -- The pooled object is back, which is the whole of the wedge.
+    t.assert_equals(w.vertex_pool.count, 0)
+    -- Stopped at the first failure: c was never computed, so it cannot have
+    -- run against a half-applied superstep.
+    t.assert_equals(computed, {'a', 'b'})
+
+    m:stop()
+    drop_worker(w)
+end
+
+g.test_a_compute_failure_carries_a_structured_error = function()
+    local w, name = make_failing_worker('b', 'boom')
+    local m = make_master(name)
+
+    local _, err = pcall(w.run_superstep, w, 4)
+    t.assert_equals(type(err), 'cdata', 'the failure must be a box.error')
+    t.assert_equals(err.type, 'PregelComputeFailed')
+    t.assert_equals(err.pregel_code, 'COMPUTE_FAILED')
+    t.assert_equals(err.vertex, 'b')
+    t.assert_equals(err.superstep, 4)
+    t.assert_equals(err.pregel_message, 'boom')
+    t.assert_str_contains(err.traceback, 'stack traceback')
+
+    m:stop()
+    drop_worker(w)
+end
+
+-- The wedge itself: a later superstep on the same worker has to run. Bounded,
+-- because the defect makes it spin rather than fail.
+g.test_the_worker_survives_a_failed_compute = function()
+    local w, name = make_failing_worker('b', 'boom')
+    local m = make_master(name)
+    pcall(w.run_superstep, w, 1)
+
+    -- Same worker, a compute that cannot fail.
+    local computed = {}
+    w.vertex_pool.compute = function(self)
+        table.insert(computed, self:get_name())
+        self:vote_halt(false)
+    end
+    -- The pool hands out objects that captured the old compute, so drop them.
+    w.vertex_pool.container = {}
+
+    local finished = within(5, function() w:run_superstep(2) end)
+    t.assert_equals(finished, true,
+                    'superstep 2 did not finish: the worker is wedged')
+    table.sort(computed)
+    t.assert_equals(computed, {'a', 'b', 'c'})
+    t.assert_equals(w.vertex_pool.count, 0)
+
+    m:stop()
+    drop_worker(w)
+end
+
+-- The queue is left consistent: verify() cross-checks the per-receiver
+-- counters against what the queue actually holds, and a superstep abandoned
+-- halfway must not break that.
+g.test_a_failed_compute_leaves_the_queues_consistent = function()
+    local w, name = make_failing_worker('b', 'boom')
+    local m = make_master(name)
+    for _, id in ipairs({'a', 'b', 'c'}) do
+        worker.deliver(name, 'message.deliver', {id, 1, 'z'})
+    end
+    w:after_superstep()
+
+    pcall(w.run_superstep, w, 1)
+
+    t.assert_equals({queue.verify(w.mqueue)}, {true, {}})
+    t.assert_equals({queue.verify(w.mqueue_next)}, {true, {}})
+    -- The failed vertex keeps its message: nothing about this superstep was
+    -- committed, so nothing about it was consumed either.
+    t.assert_equals(w.mqueue:len('b'), 1)
+
+    m:stop()
+    drop_worker(w)
+end
+
+-- The RPC boundary: the payload has to survive deliver(), which is what the
+-- master reaches the worker through.
+g.test_the_superstep_rpc_reports_a_compute_failure = function()
+    local w, name = make_failing_worker('b', 'boom')
+    local m = make_master(name)
+
+    local ok, err = pcall(worker.deliver, name, 'superstep', 1)
+    t.assert_equals(ok, false)
+    t.assert_equals(type(err), 'cdata')
+    t.assert_equals(err.type, 'PregelComputeFailed')
+    t.assert_equals(err.vertex, 'b')
+    t.assert_str_contains(tostring(err),
+        "pregel: compute failed on vertex 'b' in superstep 1: boom")
+
     m:stop()
     drop_worker(w)
 end
