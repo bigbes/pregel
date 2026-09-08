@@ -94,6 +94,58 @@ g.test_int_rejects_out_of_range = function()
     t.assert_error_msg_contains('must be an integer', codec.encode, sc, 1.5)
 end
 
+--- A double past the int64 range used to reach i64(), which saturates, so
+--  `long` silently encoded 1e300 as 2^63-1. fastavro 1.12.2 raises
+--  OverflowError for every one of these.
+g.test_long_rejects_values_outside_the_int64_range = function()
+    local sc = schema.parse('"long"')
+    for _, v in ipairs({2^63, 1e19, 1e300, -1e300, -2^63 - 4096}) do
+        t.assert_error_msg_contains('out of the long range', codec.encode, sc, v)
+    end
+end
+
+--- A uint64 above INT64_MAX wrapped: ffi.new('uint64_t', -1) came out as -1.
+g.test_long_rejects_a_uint64_above_int64_max = function()
+    local sc = schema.parse('"long"')
+    t.assert_error_msg_contains('out of the long range',
+                                codec.encode, sc, ffi.new('uint64_t', -1))
+    t.assert_error_msg_contains('out of the long range', codec.encode, sc,
+                                ffi.new('uint64_t', 9223372036854775808ULL))
+end
+
+--- The boundaries themselves must keep encoding; the range check is exclusive
+--  at +2^63 and inclusive at -2^63.
+g.test_long_accepts_the_int64_boundaries = function()
+    local sc = schema.parse('"long"')
+    t.assert_equals(hex(codec.encode(sc, 9223372036854775807LL)),
+                    'fe ff ff ff ff ff ff ff ff 01')
+    t.assert_equals(hex(codec.encode(sc, -9223372036854775807LL - 1LL)),
+                    'ff ff ff ff ff ff ff ff ff 01')
+    t.assert_equals(hex(codec.encode(sc, ffi.new('uint64_t', 9223372036854775807ULL))),
+                    'fe ff ff ff ff ff ff ff ff 01')
+    -- -2^63 exactly, as a Lua double.
+    t.assert_equals(hex(codec.encode(sc, -2^63)), 'ff ff ff ff ff ff ff ff ff 01')
+end
+
+g.test_validate_rejects_a_long_outside_the_int64_range = function()
+    local sc = schema.parse('"long"')
+    t.assert_equals(codec.validate(sc, 1e300), false)
+    t.assert_equals(codec.validate(sc, 2^63), false)
+    t.assert_equals(codec.validate(sc, ffi.new('uint64_t', -1)), false)
+    t.assert_equals(codec.validate(sc, -2^63), true)
+    t.assert_equals(codec.validate(sc, 9223372036854775807LL), true)
+end
+
+--- With `long` accepting 1e300, branch selection saw two candidates and took
+--  the first. fastavro writes the double branch: 02 9c 75 00 88 3c e4 37 7e.
+g.test_union_of_long_and_double_picks_double_for_a_huge_value = function()
+    local sc = schema.parse('["long","double"]')
+    t.assert_equals(hex(codec.encode(sc, 1e300)),
+                    '02 9c 75 00 88 3c e4 37 7e')
+    -- A value both branches hold still goes down the first one.
+    t.assert_equals(hex(codec.encode(sc, 5)), '00 0a')
+end
+
 --------------------------------------------------------------------------------
 -- Primitives
 --------------------------------------------------------------------------------

@@ -92,6 +92,30 @@ local function fits_int(v)
     return is_integer(v) and v >= INT_MIN and v <= INT_MAX
 end
 
+-- The int64 bounds as doubles. -2^63 is exact; +2^63 is one past INT64_MAX and
+-- is exact too, so `v < LONG_LIMIT` is the right test for a Lua number -- the
+-- largest double below it, 2^63 - 1024, does fit.
+local LONG_MIN_D  = -9223372036854775808.0
+local LONG_LIMIT  = 9223372036854775808.0
+local U64_INT_MAX = 9223372036854775807ULL
+
+--- True when `v` is an integer the int64 range holds.
+--
+-- Without this, put_long() handed an out-of-range double to i64(), which
+-- saturates rather than failing, and a uint64 above INT64_MAX wrapped to a
+-- negative long. Both silently corrupted the value.
+local function fits_long(v)
+    if type(v) == 'number' then
+        return v % 1 == 0 and v >= LONG_MIN_D and v < LONG_LIMIT
+    end
+    if ffi.istype(ct_u64, v) then
+        return v <= U64_INT_MAX
+    end
+    return ffi.istype(ct_i64, v)
+end
+
+M.fits_long = fits_long
+
 --------------------------------------------------------------------------------
 -- Primitive writers
 --------------------------------------------------------------------------------
@@ -238,6 +262,9 @@ encoders['long'] = function(_, value, out)
     end
     if not is_integer(value) then
         fail('long must be an integer, got %s', tostring(value))
+    end
+    if not fits_long(value) then
+        fail('%s is out of the long range', tostring(value))
     end
     put_long(out, value)
 end
@@ -702,7 +729,7 @@ local validators = {}
 validators['null']    = function(_, v) return v == nil or v == NULL end
 validators['boolean'] = function(_, v) return type(v) == 'boolean' end
 validators['int']     = function(_, v) return fits_int(v) end
-validators['long']    = function(_, v) return is_integer(v) end
+validators['long']    = function(_, v) return is_integer(v) and fits_long(v) end
 validators['float']   = function(_, v) return is_number(v) end
 validators['double']  = function(_, v) return is_number(v) end
 validators['bytes']   = function(_, v) return type(v) == 'string' end
