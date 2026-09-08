@@ -528,19 +528,37 @@ local function has_role(roles, role)
     return false
 end
 
---- Each replicaset's configured leader, keyed by replicaset name.
+--- The whole cluster config document, or nil.
 --
--- config:cluster_config() is the only public way to it: `leader` is a
--- replicaset-level option and is not part of the instance config schema at
--- all, so config:get('leader', {instance = ...}) answers "[instance_config]
--- leader: No such field in the schema" (measured on CE 3.9 and EE 3.7).
+-- Nothing else has it. `leader` is a replicaset-level option and is not part
+-- of the instance config schema at all, so config:get('leader', {instance =
+-- ...}) answers "[instance_config] leader: No such field in the schema" --
+-- measured on CE 3.9 and EE 3.7, and there is no scope argument that changes
+-- that.
+--
+-- The public accessor is config:cluster_config(), which EE 3.7 does not have
+-- ("attempt to call method 'cluster_config' (a nil value)"). config:_cconfig()
+-- is the same document and exists on both, so it is the fallback rather than
+-- the first choice: a private method is a thing that can go away, and when it
+-- does, discovery says the leader is unset and asks for an explicit worker
+-- list instead of guessing wrong.
+local function cluster_config(config)
+    for _, method in ipairs({'cluster_config', '_cconfig'}) do
+        if is_callable(config[method]) then
+            local ok, cluster = pcall(config[method], config)
+            if ok and type(cluster) == 'table' then
+                return cluster
+            end
+        end
+    end
+    return nil
+end
+
+--- Each replicaset's configured leader, keyed by replicaset name.
 local function leaders_of(config)
     local rv = {}
-    if not is_callable(config.cluster_config) then
-        return rv
-    end
-    local ok, cluster = pcall(config.cluster_config, config)
-    if not ok or type(cluster) ~= 'table' then
+    local cluster = cluster_config(config)
+    if cluster == nil then
         return rv
     end
     for _, group in pairs(cluster.groups or {}) do
