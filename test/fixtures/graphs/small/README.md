@@ -55,3 +55,14 @@ kept in the second. The one-way file keeps the labels running uphill (2 -> 1,
 3 -> 2), so the first component comes apart into three while the four-cycle --
 still strongly connected -- does not: that contrast is the test that weakly
 connected components need a symmetric graph rather than a symmetric algorithm.
+
+`weights8.txt` is what `examples/topology-mutation` prunes: eight vertices and
+ten edges with weights 1 to 9,
+
+    a -9-> b   a -2-> c   b -3-> c   b -1-> d   c -7-> d
+    d -5-> e   e -4-> f   f -8-> g   f -6-> h   g -1-> h
+
+and `h` with no out-edges at all. The weights are chosen so that at threshold 5
+every case appears once: a vertex that keeps some edges and loses the rest, an
+edge exactly on the threshold (kept — the rule is "below", not "below or
+equal"), three vertices that lose everything, and one that never had anything.

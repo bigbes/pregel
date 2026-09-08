@@ -1,0 +1,86 @@
+# One master and three workers, each the read-write leader of a replicaset of
+# its own. The master loads the graph; the workers need app_cfg for the
+# threshold, which the compute function reads through the worker context.
+
+credentials:
+  users:
+    pregel:
+      password: 'secret'
+      privileges:
+        - permissions: [execute]
+          lua_call:
+            - pregel.worker.deliver
+            - pregel.worker.deliver_batch
+            - pregel.worker.wait
+            - pregel.master.deliver
+
+wal:
+  mode: none
+
+groups:
+  pregel:
+    replicasets:
+      master:
+        instances:
+          master:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3301'
+            roles: [pregel.roles.master]
+            roles_cfg:
+              pregel.roles.master:
+                name: topology
+                app: app
+                autostart: true
+                user: pregel
+                password: 'secret'
+                workers:
+                  - '127.0.0.1:3302'
+                  - '127.0.0.1:3303'
+                  - '127.0.0.1:3304'
+                app_cfg: &app_cfg
+                  # Relative to examples/topology-mutation/, resolved by the
+                  # app module: an instance's own working directory is under
+                  # var/lib and is no use as a base.
+                  #
+                  # Eight vertices, ten edges with weights from 1 to 9, chosen
+                  # so that at threshold 5 some vertices keep an edge, some
+                  # lose all of theirs, one edge sits exactly on the threshold
+                  # and is kept, and one vertex has no out-edges to begin with.
+                  graph: '../../test/fixtures/graphs/small/weights8.txt'
+                  threshold: 5
+      worker1:
+        instances:
+          worker1:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3302'
+            roles: [pregel.roles.worker]
+            roles_cfg: &worker_cfg
+              pregel.roles.worker:
+                name: topology
+                app: app
+                master: '127.0.0.1:3301'
+                workers:
+                  - '127.0.0.1:3302'
+                  - '127.0.0.1:3303'
+                  - '127.0.0.1:3304'
+                user: pregel
+                password: 'secret'
+                app_cfg: *app_cfg
+      worker2:
+        instances:
+          worker2:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3303'
+            roles: [pregel.roles.worker]
+            roles_cfg: *worker_cfg
+      worker3:
+        instances:
+          worker3:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3304'
+            roles: [pregel.roles.worker]
+            roles_cfg: *worker_cfg
