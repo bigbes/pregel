@@ -1,4 +1,5 @@
 local t = require('luatest')
+local clock = require('clock')
 local fiber = require('fiber')
 
 local box_helper = require('test.helpers.box')
@@ -211,6 +212,111 @@ end
 g.test_rejects_empty_server_list = function()
     t.assert_error_msg_contains('at least one server', function()
         mpool.new('unit', {})
+    end)
+end
+
+-------------------------------------------------------------------------------
+-- Connecting
+-------------------------------------------------------------------------------
+
+local DOWN = 'unix/:./no-such-peer.iproto'
+
+--- A URI that nothing listens on, distinct from DOWN.
+local DOWN2 = 'unix/:./no-such-peer-2.iproto'
+
+-- The whole point of connect_async: a Tarantool 3 role builds its pool inside
+-- apply(), which holds up the instance's config startup, so the pool must be
+-- usable as an object before any peer has answered.
+g.test_construction_does_not_wait_for_a_peer = function()
+    local started = clock.monotonic()
+    local pool = mpool.new('unit', {DOWN}, {connect_async = true})
+    local elapsed = clock.monotonic() - started
+    t.assert_lt(elapsed, 1, 'mpool.new blocked on an unreachable peer')
+    t.assert_equals(pool.connected, false)
+    pool:stop()
+end
+
+-- The bucket order decides which worker owns which vertex, so it has to be the
+-- same on every instance -- and it used to be derived from the peer uuids,
+-- which is why the pool could not be built without connecting first.
+g.test_bucket_order_does_not_depend_on_the_listed_order = function()
+    local one = mpool.new('unit', {DOWN, DOWN2}, {connect_async = true})
+    local two = mpool.new('unit', {DOWN2, DOWN}, {connect_async = true})
+    local function uris(pool)
+        local rv = {}
+        for _, bucket in ipairs(pool.buckets) do
+            table.insert(rv, bucket.uri)
+        end
+        return rv
+    end
+    t.assert_equals(uris(one), uris(two))
+    t.assert_equals(uris(one), {DOWN2, DOWN}, 'the order is the sorted one')
+    one:stop()
+    two:stop()
+end
+
+g.test_wait_connected_resolves_the_local_bucket = function()
+    local pool = mpool.new('unit', {URI}, {connect_async = true})
+    t.assert_equals(pool.self_idx, 0)
+    pool:wait_connected(30)
+    t.assert_equals(pool.connected, true)
+    t.assert_equals(pool.self_idx, 1)
+    t.assert_equals(pool.buckets[1].is_local, true)
+    t.assert_equals(pool.buckets[1].connection, nil)
+    t.assert_equals(pool.buckets[1].uuid, box.info.uuid)
+    pool:stop()
+end
+
+-- net.box knows exactly why it could not connect; reporting a bare timeout
+-- instead is what made a wrong password and a missing instance the same
+-- 30-second message.
+g.test_wait_connected_reports_why_a_peer_is_unreachable = function()
+    local pool = mpool.new('unit', {DOWN}, {connect_async = true})
+    local ok, err = pcall(pool.wait_connected, pool, 0.5)
+    pool:stop()
+    t.assert_equals(ok, false)
+    err = tostring(err)
+    t.assert_str_contains(err, DOWN)
+    t.assert_str_contains(err, 'No such file or directory')
+end
+
+-- Retrying a rejected authentication is hopeless, so waiting the whole connect
+-- timeout out only delays a message that is already available.
+g.test_wait_connected_refuses_bad_credentials_at_once = function()
+    local pool = mpool.new('unit', {URI}, {
+        connect_async = true,
+        user          = 'no-such-user',
+        password      = 'wrong',
+    })
+    local started = clock.monotonic()
+    local ok, err = pcall(pool.wait_connected, pool, 30)
+    local elapsed = clock.monotonic() - started
+    pool:stop()
+    t.assert_equals(ok, false)
+    t.assert_str_contains(tostring(err),
+                          'User not found or supplied credentials are invalid')
+    t.assert_lt(elapsed, 10, 'waited out the connect timeout on a hopeless auth')
+end
+
+-- A listener with parameters -- `transport: ssl` and the client-side ssl_*
+-- files -- reaches net.box only as {uri = ..., params = ...}; there is no
+-- separate option for it.
+g.test_a_server_may_carry_uri_params = function()
+    local pool = mpool.new('unit', {{uri = URI, params = {}}},
+                           {connect_async = true})
+    t.assert_equals(pool.buckets[1].uri, URI)
+    t.assert_equals(pool.buckets[1].params, {})
+    pool:wait_connected(30)
+    t.assert_equals(pool.buckets[1].is_local, true)
+    pool:stop()
+end
+
+g.test_a_server_must_be_a_uri_or_a_uri_table = function()
+    t.assert_error_msg_contains('a URI string or a', function()
+        mpool.new('unit', {42}, {connect_async = true})
+    end)
+    t.assert_error_msg_contains('a URI string or a', function()
+        mpool.new('unit', {{params = {}}}, {connect_async = true})
     end)
 end
 

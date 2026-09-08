@@ -30,7 +30,10 @@ local vertex_compute = vertex.vertex_private_methods.compute
 
 local workers = {}
 
-local RECONNECT_AFTER = 5
+-- Short for the same reason as mpool's: this is also the interval before the
+-- first retry, and the first attempt at a peer that is still bootstrapping
+-- always fails.
+local RECONNECT_AFTER = 0.1
 local WAIT_TIMEOUT    = 60
 
 local TOPMT_EDGE_DELETE   = 0
@@ -583,9 +586,17 @@ end
 -- options.preload_args   -- passed to worker_preload
 -- options.user           -- net.box user for the outgoing connections
 -- options.password       -- net.box password for the outgoing connections
+-- options.connect_async  -- build the message pool without waiting for any
+--                           peer; the caller then owns the waiting
+--                           (worker.mpool:wait_connected(timeout))
+-- options.connect_timeout-- seconds to wait for the peers when not async
 -- options.grant_to       -- user, or array of users, allowed to reach this
 --                           instance: they get the RPC grants and read/write
 --                           on this instance's spaces
+--
+-- A URI -- options.master and every entry of options.workers -- is either a
+-- net.box URI string or a {uri = ..., params = ...} table, the form a
+-- Tarantool 3 config uses for a listener with transport parameters.
 local function worker_new(name, options)
     assert(type(name) == 'string', 'name must be a string')
     assert(type(options) == 'table', 'options must be a table')
@@ -611,7 +622,9 @@ local function worker_new(name, options)
     assert(is_callable(compute),         'options.compute must be callable')
     assert(type(combiner) == 'nil' or is_callable(combiner),
            'options.combiner must be callable or "nil"')
-    assert(type(master_uri) == 'string', 'options.master must be a string')
+    assert(type(master_uri) == 'string' or
+           (type(master_uri) == 'table' and type(master_uri.uri) == 'string'),
+           'options.master must be a URI string or a {uri = ...} table')
     assert(type(squash_only) == 'boolean',
            'options.squash_only must be boolean or "nil"')
     assert(queue_engine == 'space' or queue_engine == 'table',
@@ -625,10 +638,12 @@ local function worker_new(name, options)
         master_uri     = master_uri,
         preload_func   = nil,
         mpool          = mpool.new(name, worker_uris, {
-            msg_count  = pool_size,
-            is_delayed = is_delayed,
-            user       = options.user,
-            password   = options.password,
+            msg_count       = pool_size,
+            is_delayed      = is_delayed,
+            user            = options.user,
+            password        = options.password,
+            connect_async   = options.connect_async,
+            connect_timeout = options.connect_timeout,
         }),
         aggregators    = {},
         in_progress    = 0,
@@ -662,7 +677,11 @@ local function worker_new(name, options)
         pregel  = self
     }
 
-    self.master = remote.new(master_uri, {
+    -- The table form is what carries a listener's transport parameters; net.box
+    -- takes them as part of the URI argument and has no `params` option.
+    self.master = remote.new(type(master_uri) == 'table' and
+                             {uri = master_uri.uri, params = master_uri.params}
+                             or master_uri, {
         user            = options.user,
         password        = options.password,
         wait_connected  = false,

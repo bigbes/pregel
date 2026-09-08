@@ -152,6 +152,14 @@ end
 -- options.preload_args   -- passed to master_preload
 -- options.user           -- net.box user for the outgoing connections
 -- options.password       -- net.box password for the outgoing connections
+-- options.connect_async  -- build the message pool without waiting for any
+--                           worker; the caller then owns the waiting
+--                           (master.mpool:wait_connected(timeout))
+-- options.connect_timeout-- seconds to wait for the workers when not async
+--
+-- A worker URI is either a net.box URI string or a {uri = ..., params = ...}
+-- table, the form a Tarantool 3 config uses for a listener with transport
+-- parameters.
 local function master_new(name, options)
     assert(type(name) == 'string', 'name must be a string')
     assert(type(options) == 'table', 'options must be a table')
@@ -167,9 +175,11 @@ local function master_new(name, options)
         preload_func    = nil,
         workers         = workers,
         mpool           = mpool.new(name, workers, {
-            msg_count = pool_size,
-            user      = options.user,
-            password  = options.password,
+            msg_count       = pool_size,
+            user            = options.user,
+            password        = options.password,
+            connect_async   = options.connect_async,
+            connect_timeout = options.connect_timeout,
         }),
         obtain_name     = obtain_name,
         aggregators     = {},

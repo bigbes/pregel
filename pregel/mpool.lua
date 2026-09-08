@@ -34,8 +34,18 @@ local xpcall_tb   = utils.xpcall_tb
 local is_callable = utils.is_callable
 local error       = utils.error
 
-local RECONNECT_AFTER  = 5
+-- How long net.box waits before retrying a failed connection. Short on
+-- purpose: this is the interval of the *first* retry too, and the first
+-- attempt of a cluster start regularly fails with "Instance bootstrap hasn't
+-- finished yet" -- with the 5 s this used to be, every instance paid five
+-- seconds for a peer that was ready in a few hundred milliseconds.
+local RECONNECT_AFTER  = 0.1
 local CONNECT_TIMEOUT  = 30
+-- One step of the wait_connected() poll. The wait is a poll rather than a
+-- single net.box wait so that a failure no retry can fix -- a rejected
+-- authentication -- is noticed while it happens instead of after the whole
+-- connect timeout.
+local CONNECT_POLL     = 0.1
 -- How long a producer blocked on a full bucket sleeps before re-checking. The
 -- flush broadcasts, so this is only a backstop against a lost wakeup.
 local FULL_POLL        = 0.1
@@ -65,6 +75,50 @@ local function safe_uri(u)
     end
     -- uri.format would put the login back; rebuild the authority by hand.
     return u:gsub('^.*@', '')
+end
+
+--- One entry of the `servers` array, as a {uri, params} pair.
+--
+-- A plain URI string is the common case. The table form is what a Tarantool 3
+-- cluster config hands out for a listener that has parameters -- `transport:
+-- ssl` and the client-side ssl_* files -- and net.box accepts those only as
+-- part of the URI argument ({uri = ..., params = ...}); there is no `params`
+-- connection option (measured on 3.9: "unexpected option 'params'").
+local function normalize_server(srv)
+    if type(srv) == 'string' then
+        return {uri = srv}
+    end
+    if type(srv) == 'table' and type(srv.uri) == 'string' then
+        return {uri = srv.uri, params = srv.params}
+    end
+    error(0, 'mpool: a server must be a URI string or a {uri = ..., ' ..
+             'params = ...} table, got %s', type(srv))
+end
+
+--- Connection failures that no amount of retrying will fix.
+--
+-- With reconnect_after set, net.box retries a rejected authentication for as
+-- long as it is allowed to, so without this a wrong password costs the whole
+-- connect timeout and is then reported as a timeout rather than as a refusal.
+-- The state cannot be used to tell the two apart: measured on 3.9, a wrong
+-- password, an unknown user and a peer that is simply down all leave
+-- conn.state == 'error_reconnect'. conn.error does say which.
+local FATAL_CONNECT_ERRORS = {
+    'User not found or supplied credentials are invalid',
+    'Session access is denied',
+}
+
+local function is_fatal_connect_error(err)
+    if err == nil then
+        return false
+    end
+    err = tostring(err)
+    for _, text in ipairs(FATAL_CONNECT_ERRORS) do
+        if err:find(text, 1, true) ~= nil then
+            return true
+        end
+    end
+    return false
 end
 
 -------------------------------------------------------------------------------
@@ -143,6 +197,53 @@ local bucket_common_methods = {
                   safe_uri(self.uri), self.failure)
         end
     end,
+    --- Wait for this bucket's connection, or raise saying why it never came.
+    --
+    -- The message carries net.box's own conn.error verbatim, because that is
+    -- the only place the difference between "nothing is listening there" and
+    -- "the credentials were refused" exists.
+    wait_connected = function(self, timeout)
+        local conn = self.connection
+        if conn == nil then
+            return
+        end
+        local deadline = clock.monotonic() + timeout
+        repeat
+            local left = deadline - clock.monotonic()
+            if conn:wait_connected(left < CONNECT_POLL and left or
+                                   CONNECT_POLL) then
+                return
+            end
+            if is_fatal_connect_error(conn.error) then
+                error(0, "mpool: cannot connect to '%s': %s",
+                      safe_uri(self.uri), tostring(conn.error))
+            end
+        until clock.monotonic() >= deadline
+        error(0, "mpool: cannot connect to '%s' within %s seconds: %s",
+              safe_uri(self.uri), tostring(timeout),
+              tostring(conn.error or 'no error reported'))
+    end,
+    --- Note whether this bucket is in fact this very instance.
+    --
+    -- The greeting carries the peer's uuid, so telling "this is me" apart from
+    -- "this is another instance" costs no RPC -- and box.info.server.uuid,
+    -- which the 1.6 version compared against, no longer exists. It needs a
+    -- live connection, which is why it happens here and not in bucket_new().
+    resolve_local = function(self)
+        local conn = self.connection
+        if conn == nil then
+            return
+        end
+        self.uuid = conn.peer_uuid
+        if self.uuid ~= box.info.uuid then
+            return
+        end
+        -- A local bucket calls the registry in this process; there is no
+        -- reason to pay for a loopback connection.
+        self.is_local = true
+        conn:close()
+        self.connection = nil
+    end,
     stop = function(self)
         self.stopped = true
         local worker = self.worker
@@ -170,9 +271,11 @@ local bucket_common_methods = {
 --- Background pusher for an instant bucket.
 local function pusher_handler(bucket)
     local function handler(self)
-        fiber.self():name(string.format('%6s_pusher_handler-%02d',
-                                        self.is_local and 'local' or 'remote',
-                                        self.id), {truncate = true})
+        -- Named for the bucket alone: whether it is the local one is not known
+        -- until the connections have been resolved, and the pusher starts
+        -- before that.
+        fiber.self():name(string.format('mpool_pusher_handler-%02d', self.id),
+                          {truncate = true})
         log.verbose('<mpool, %s> pusher fiber started', tostring(self.name))
         while not self.stopped do
             -- Nothing left to carry once a delivery has failed: the failure is
@@ -374,34 +477,27 @@ local function bucket_new(id, name, srv, options)
     local is_delayed = options.is_delayed
     if is_delayed == nil then is_delayed = false end
 
-    local conn = remote.new(srv, {
+    -- Never waits: whether the peer is up is the pool's business (see
+    -- mpool:wait_connected), and a role's apply() must be able to build the
+    -- whole pool without blocking the instance's config startup.
+    local conn = remote.new(srv.params ~= nil and
+                            {uri = srv.uri, params = srv.params} or srv.uri, {
         user            = options.user,
         password        = options.password,
-        reconnect_after = RECONNECT_AFTER,
+        reconnect_after = options.reconnect_after or RECONNECT_AFTER,
         wait_connected  = false
     })
-    local timeout = options.connect_timeout or CONNECT_TIMEOUT
-    if not conn:wait_connected(timeout) then
-        conn:close()
-        error("mpool: cannot connect to '%s' within %s seconds",
-              safe_uri(srv), tostring(timeout))
-    end
-
-    -- The greeting carries the peer's uuid, so telling "this is me" apart from
-    -- "this is another instance" costs no RPC -- and box.info.server.uuid,
-    -- which the 1.6 version compared against, no longer exists.
-    local uuid = conn.peer_uuid
-    local is_local = (uuid == box.info.uuid)
-    if is_local then
-        conn:close()
-        conn = nil
-    end
 
     local self = {
         id           = id,
-        uri          = srv,
+        uri          = srv.uri,
+        params       = srv.params,
         name         = name,
-        uuid         = uuid,
+        -- Both are answered by resolve_local() once the connection is up. A
+        -- bucket used before that is treated as remote, which is correct if
+        -- slower: it reaches this instance over its own listener.
+        uuid         = nil,
+        is_local     = false,
         count        = 0,
         connection   = conn,
         not_full     = fiber.cond(),
@@ -409,7 +505,6 @@ local function bucket_new(id, name, srv, options)
         -- drain(). The cond is broadcast when it clears.
         sending      = false,
         idle         = fiber.cond(),
-        is_local     = is_local,
         is_delayed   = is_delayed,
         max_count    = msg_count,
         stopped      = false,
@@ -574,6 +669,33 @@ local mpool_mt = {
                 bucket:put(message, args)
             end
         end,
+        --- Wait until every bucket's connection is up, then work out which
+        -- bucket is this instance.
+        --
+        -- Separate from mpool.new() because the caller that must not block is
+        -- the one that matters: a Tarantool 3 role's apply() holds up the
+        -- instance's whole config startup, so it builds the pool here and
+        -- waits in a fiber of its own. mpool.new() calls this itself unless
+        -- options.connect_async says otherwise.
+        --
+        -- Raises the first bucket that never came up, with net.box's own
+        -- reason in the message.
+        wait_connected = function(self, timeout)
+            timeout = timeout or CONNECT_TIMEOUT
+            local deadline = clock.monotonic() + timeout
+            for _, bucket in ipairs(self.buckets) do
+                local left = deadline - clock.monotonic()
+                bucket:wait_connected(left > 0 and left or 0)
+            end
+            for idx, bucket in ipairs(self.buckets) do
+                bucket:resolve_local()
+                if bucket.is_local then
+                    self.self_idx = idx
+                end
+            end
+            self.connected = true
+            return self
+        end,
         stop = function(self)
             self.waitpool:stop()
             for _, bucket in ipairs(self.buckets) do
@@ -587,13 +709,18 @@ local mpool_mt = {
 --
 -- servers is an array of net.box URIs; each may carry its own credentials as
 -- 'user:password@host:port', and options.user / options.password apply to the
--- ones that do not.
+-- ones that do not. An entry may also be a {uri = ..., params = ...} table,
+-- which is how a listener's transport parameters (`transport: ssl` and the
+-- client-side ssl_* files) reach net.box.
 --
 -- options.msg_count       -- messages per batch (default 1000)
 -- options.is_delayed      -- back the buckets with spaces (default false)
 -- options.user            -- net.box user for every connection
 -- options.password        -- net.box password for every connection
--- options.connect_timeout -- seconds to wait per worker (default 30)
+-- options.connect_timeout -- seconds to wait for all the peers (default 30)
+-- options.reconnect_after -- net.box retry interval (default 0.1)
+-- options.connect_async   -- return without waiting for any peer; the caller
+--                            is then the one that calls pool:wait_connected()
 local function mpool_new(name, servers, options)
     options = options or {}
     local msg_count = options.msg_count or 1000
@@ -610,30 +737,51 @@ local function mpool_new(name, servers, options)
         bucket_cnt = 0,
         is_delayed = is_delayed,
         self_idx   = 0,
+        connected  = false,
     }, mpool_mt)
 
-    for k, server in ipairs(servers) do
+    local sorted = {}
+    for _, server in ipairs(servers) do
+        table.insert(sorted, normalize_server(server))
+    end
+    -- Every instance orders the buckets the same way, so bucket N means the
+    -- same worker everywhere and guava_name() agrees across the cluster
+    -- regardless of the order the URIs were listed in. The key is the URI
+    -- string: the peer uuid the previous version sorted by is only known once
+    -- a connection has been made, and the order has to exist before that --
+    -- the whole point of connect_async is a pool that is complete before any
+    -- peer has answered. Every participant reads the same list out of the same
+    -- config, so the strings agree.
+    table.sort(sorted, function(a, b) return a.uri < b.uri end)
+
+    for k, server in ipairs(sorted) do
         table.insert(self.buckets, bucket_new(k, name, server, {
             is_delayed      = is_delayed,
             msg_count       = msg_count,
             user            = options.user,
             password        = options.password,
-            connect_timeout = options.connect_timeout,
+            reconnect_after = options.reconnect_after,
         }))
         self.bucket_cnt = self.bucket_cnt + 1
     end
 
-    -- Every instance orders the buckets by peer uuid, so bucket N means the
-    -- same worker everywhere and guava_name() agrees across the cluster
-    -- regardless of the order the URIs were listed in.
-    table.sort(self.buckets, function(b1, b2)
-        return b1.uuid < b2.uuid
-    end)
-    for idx, bucket in ipairs(self.buckets) do
-        if bucket.is_local then
-            self.self_idx = idx
+    if not options.connect_async then
+        local ok, err = pcall(self.wait_connected, self,
+                              options.connect_timeout or CONNECT_TIMEOUT)
+        if not ok then
+            -- Nothing has been started yet, so closing the connections is the
+            -- whole cleanup.
+            for _, bucket in ipairs(self.buckets) do
+                if bucket.connection ~= nil then
+                    bucket.connection:close()
+                    bucket.connection = nil
+                end
+            end
+            error(0, tostring(err))
         end
-        bucket.id = idx
+    end
+
+    for _, bucket in ipairs(self.buckets) do
         bucket:start()
     end
 
