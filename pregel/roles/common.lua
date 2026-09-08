@@ -16,7 +16,17 @@ local fiber = require('fiber')
 
 local utils       = require('pregel.utils')
 local is_callable = utils.is_callable
-local error       = utils.error
+
+--- Raise without a source position.
+--
+-- What the config framework does with these is show them to whoever wrote the
+-- YAML -- as a config alert, and in the log -- so a '/Users/.../roles/
+-- common.lua:96:' in front of the message is noise about a file that person
+-- did not write. Tarantool's own roles applier raises with level 0 for the
+-- same reason.
+local function error(...)
+    return utils.error(0, ...)
+end
 
 local M = {}
 
@@ -36,6 +46,20 @@ local CONNECT_RETRY   = 1
 -------------------------------------------------------------------------------
 -- roles_cfg checking
 -------------------------------------------------------------------------------
+
+--- A string that is used as an identifier or an address, so '' is not one.
+--
+-- Every option below was accepted empty: name gave spaces called 'data_' and a
+-- job logged as '', master got as far as a net.box URI error inside apply, and
+-- app reached package.searchpath, which answered 'bad argument #1 to
+-- searchpath (string expected, got nil)' -- naming neither the role nor the
+-- option.
+local function check_nonempty(value)
+    if value == '' then
+        return false, 'a non-empty string'
+    end
+    return true
+end
 
 --- An array of non-empty strings, e.g. a list of net.box URIs.
 local function check_uri_array(value)
@@ -64,8 +88,10 @@ end
 -- otherwise silent -- the config framework validates the shape of `roles_cfg`
 -- itself and knows nothing about the keys inside a role's own table.
 M.common_spec = {
-    name         = {types = {string = true}, required = true},
-    app          = {types = {string = true}, required = true},
+    name         = {types = {string = true}, required = true,
+                    check = check_nonempty},
+    app          = {types = {string = true}, required = true,
+                    check = check_nonempty},
     -- Opaque to the roles on purpose: only that it is a table is checked. It
     -- is the app module's own configuration -- data paths, thresholds, a
     -- source vertex -- and a role that knew what belonged in it would have to
@@ -81,7 +107,10 @@ M.common_spec = {
             return true
         end,
     },
-    user         = {types = {string = true}},
+    user         = {types = {string = true}, check = check_nonempty},
+    -- No non-empty check: an empty password is a real configuration, and the
+    -- one thing that is wrong with a password -- having no user to use it --
+    -- is checked below, where the whole table is in view.
     password     = {types = {string = true}},
     -- Seconds the role keeps trying to reach its peers. See M.connector.
     connect_timeout = {
@@ -150,6 +179,15 @@ function M.check_cfg(role, cfg, spec)
             error("%s: option '%s' is required", role, key)
         end
     end
+
+    -- A password with nobody to use it does not fail: net.box connects as
+    -- guest and the graph traffic runs with whatever guest has, which is the
+    -- opposite of what a config that bothered to set a password meant.
+    if cfg.password ~= nil and cfg.user == nil then
+        error("%s: option 'password' needs a 'user' to go with it; without " ..
+              'one the peers connect as guest and the password is unused',
+              role)
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -165,6 +203,14 @@ local function check_preload(role, app_name, key, value)
     error("%s: the app module '%s' exports '%s' of type %s, expected " ..
           "function, table or nil", role, app_name, key, type(value))
 end
+
+--- What an app module's aggregator declaration may say. Keep in step with
+-- aggregator.new, minus its `internal` flag.
+local AGGREGATOR_OPTIONS = {
+    default = true,
+    reduce  = true,
+    merge   = true,
+}
 
 local function check_aggregators(role, app_name, aggregators)
     if aggregators == nil then
@@ -195,6 +241,17 @@ local function check_aggregators(role, app_name, aggregators)
                 error("%s: the app module '%s' declares the aggregator " ..
                       "'%s' with a non-callable '%s'", role, app_name, name,
                       key)
+            end
+        end
+        -- A misspelt option was silently ignored, so an app that wrote
+        -- 'defalt' got an aggregator quietly starting from nil. 'internal' is
+        -- pregel's own flag for the two aggregators it keeps for itself and is
+        -- not an app's to set, so it is unknown here on purpose.
+        for key in pairs(opts) do
+            if not AGGREGATOR_OPTIONS[key] then
+                error("%s: the app module '%s' declares the aggregator '%s' " ..
+                      "with an unknown option '%s'", role, app_name, name,
+                      tostring(key))
             end
         end
     end

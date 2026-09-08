@@ -133,6 +133,56 @@ g.test_the_app_module_must_export_what_the_role_needs = function()
     package.loaded['test.roles_fake_app'] = nil
 end
 
+-- Every one of these was accepted. An empty name produced spaces called
+-- 'data_' and a job logged as ''; an empty master got as far as a net.box URI
+-- error inside apply; an empty app reached package.searchpath and came back
+-- with 'bad argument #1 to searchpath (string expected, got nil)', which names
+-- neither the role nor the option.
+g.test_the_identifier_options_must_not_be_empty = function()
+    assert_refused(worker_role, worker_cfg({name = ''}),
+                   "pregel.roles.worker: option 'name' must be a non-empty " ..
+                   'string')
+    assert_refused(worker_role, worker_cfg({app = ''}),
+                   "pregel.roles.worker: option 'app' must be a non-empty " ..
+                   'string')
+    assert_refused(worker_role, worker_cfg({master = ''}),
+                   "pregel.roles.worker: option 'master' must be a " ..
+                   'non-empty string')
+    assert_refused(worker_role, worker_cfg({user = ''}),
+                   "pregel.roles.worker: option 'user' must be a non-empty " ..
+                   'string')
+    assert_refused(master_role, {name = '', app = APP},
+                   "pregel.roles.master: option 'name' must be a non-empty " ..
+                   'string')
+end
+
+-- A password with nobody to use it is not a harmless extra: the peers then
+-- connect as guest, and the config says in as many words that they should not.
+g.test_a_password_without_a_user_is_refused = function()
+    assert_refused(worker_role, worker_cfg({password = 'secret'}),
+                   "pregel.roles.worker: option 'password' needs a 'user' " ..
+                   'to go with it')
+    -- The other way round is fine: a user with an empty password is a real
+    -- configuration.
+    worker_role.validate(worker_cfg({user = 'pregel'}))
+end
+
+-- The role's own messages are what config:info().alerts shows to whoever wrote
+-- the YAML, and they used to arrive as
+-- '/Users/.../pregel/roles/common.lua:96: pregel.roles.worker: ...'.
+-- Tarantool's own applier raises with level 0 for exactly this reason.
+g.test_the_messages_carry_no_source_position = function()
+    t.assert_error_msg_equals(
+        "pregel.roles.worker: option 'name' must be string, got number",
+        worker_role.validate, worker_cfg({name = 42}))
+    t.assert_error_msg_equals(
+        "pregel.roles.worker: unknown option 'poolsize'",
+        worker_role.validate, worker_cfg({poolsize = 10}))
+    t.assert_error_msg_equals(
+        "pregel.roles.master: option 'name' is required",
+        master_role.validate, {app = APP})
+end
+
 g.test_the_app_aggregators_are_checked = function()
     local function app(aggregators)
         package.loaded['test.roles_fake_app'] = {
@@ -153,6 +203,17 @@ g.test_the_app_aggregators_are_checked = function()
     -- add_aggregator() asserts on a duplicate rather than reporting it.
     assert_refused(worker_role, app({__messages = {default = 0}}),
                    "names starting with '__' are reserved for pregel")
+    -- A misspelt aggregator option was ignored, so an app that meant to give
+    -- its aggregator a starting value and wrote 'defalt' got the aggregator
+    -- silently starting from nil.
+    assert_refused(worker_role, app({bad = {default = 0, bogus = 1}}),
+                   "declares the aggregator 'bad' with an unknown option " ..
+                   "'bogus'")
+    -- 'internal' is pregel's own flag for the two aggregators it keeps; an app
+    -- has no business setting it.
+    assert_refused(worker_role, app({bad = {internal = true}}),
+                   "declares the aggregator 'bad' with an unknown option " ..
+                   "'internal'")
 
     package.loaded['test.roles_fake_app'] = nil
 end

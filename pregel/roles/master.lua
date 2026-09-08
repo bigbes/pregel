@@ -48,8 +48,13 @@ local master = require('pregel.master')
 local common = require('pregel.roles.common')
 
 local utils     = require('pregel.utils')
-local error     = utils.error
 local traceback = utils.traceback
+
+-- Level 0: the message is a config alert, not a Lua error, and the position of
+-- the raise is noise to whoever wrote the YAML. See pregel/roles/common.lua.
+local function error(...)
+    return utils.error(0, ...)
+end
 
 local ROLE = 'pregel.roles.master'
 

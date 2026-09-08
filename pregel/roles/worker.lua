@@ -69,12 +69,25 @@ local log = require('log')
 local worker = require('pregel.worker')
 local common = require('pregel.roles.common')
 
-local error = require('pregel.utils').error
+-- Level 0: the message is a config alert, not a Lua error, and the position of
+-- the raise is noise to whoever wrote the YAML. See pregel/roles/common.lua.
+local utils = require('pregel.utils')
+local function error(...)
+    return utils.error(0, ...)
+end
 
 local ROLE = 'pregel.roles.worker'
 
 local SPEC = common.spec({
-    master       = {types = {string = true}},
+    master       = {
+        types = {string = true},
+        check = function(v)
+            if v == '' then
+                return false, 'a non-empty string'
+            end
+            return true
+        end,
+    },
     delayed_push = {types = {boolean = true}},
     squash_only  = {types = {boolean = true}},
     queue_engine = {
