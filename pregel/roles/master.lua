@@ -15,6 +15,13 @@
 --       autostart: false               # run the job as soon as it can
 --       user: pregel                   # net.box user for outgoing calls
 --       password: secret
+--       app_cfg:                       # opaque, handed to the app module
+--         graph: '../../data/graph.txt'
+--
+-- `app_cfg` reaches the app module as the second argument of `master_preload`,
+-- which is how a loader learns where the graph is without the app module
+-- reading the cluster config itself. The worker role hands the same table to
+-- `worker_preload` and to `worker_context`; see pregel/roles/worker.lua.
 --
 -- The master owns no graph. It drives the superstep loop, so what it needs
 -- from the app module is `obtain_name` (to shard what a loader pushes), the
@@ -128,6 +135,7 @@ local function apply(cfg)
         workers        = workers,
         obtain_name    = app.obtain_name,
         master_preload = app.master_preload,
+        preload_args   = cfg.app_cfg,
         pool_size      = cfg.pool_size,
         user           = cfg.user,
         password       = cfg.password,

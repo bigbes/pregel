@@ -49,6 +49,11 @@ end
 M.common_spec = {
     name         = {types = {string = true}, required = true},
     app          = {types = {string = true}, required = true},
+    -- Opaque to the roles on purpose: only that it is a table is checked. It
+    -- is the app module's own configuration -- data paths, thresholds, a
+    -- source vertex -- and a role that knew what belonged in it would have to
+    -- be changed for every app.
+    app_cfg      = {types = {table = true}},
     workers      = {types = {table = true}, check = check_uri_array},
     pool_size    = {
         types = {number = true},
@@ -200,6 +205,28 @@ function M.load_app(role, app_name, required)
     check_preload(role, app_name, 'master_preload', app.master_preload)
     check_aggregators(role, app_name, app.aggregators)
     return app
+end
+
+--- What the app module wants vertex:get_worker_context() to answer.
+--
+-- A plain value is used as it is, which is what an app that needs no
+-- configuration exports. A callable is called with roles_cfg.app_cfg, which is
+-- the only way a compute function -- which is handed nothing but the vertex --
+-- can reach a threshold or a source vertex named in the cluster config.
+--
+-- The two forms are told apart by is_callable rather than by an extra option,
+-- so an app whose context genuinely is a function has to wrap it in a table.
+function M.worker_context(role, app_name, app, app_cfg)
+    local context = app.worker_context
+    if not is_callable(context) then
+        return context
+    end
+    local ok, rv = pcall(context, app_cfg)
+    if not ok then
+        error("%s: the app module '%s' failed to build its worker_context " ..
+              'from app_cfg: %s', role, app_name, tostring(rv))
+    end
+    return rv
 end
 
 --- Add the app's aggregators to a worker or a master.

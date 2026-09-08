@@ -1,0 +1,95 @@
+# A four-instance pregel cluster: one master and three workers, each the
+# read-write leader of a replicaset of its own. The workers are shards of one
+# graph, not copies of each other, so nothing here replicates.
+
+credentials:
+  users:
+    pregel:
+      password: 'secret'
+      # Everything pregel sends to pregel is a conn:call() on one of these four
+      # entry points -- there is no universe grant anywhere in the library. The
+      # other half of the privileges, read/write on the job's own spaces,
+      # cannot be spelled here (the spaces are named after the job and do not
+      # exist yet) and is granted by the worker role itself.
+      privileges:
+        - permissions: [execute]
+          lua_call:
+            - pregel.worker.deliver
+            - pregel.worker.deliver_batch
+            - pregel.worker.wait
+            - pregel.master.deliver
+
+# Nothing in an example outlives the cluster, and a graph load writes every
+# vertex once: keeping it out of the WAL is most of the load time.
+wal:
+  mode: none
+
+groups:
+  pregel:
+    replicasets:
+      master:
+        instances:
+          master:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3301'
+            roles: [pregel.roles.master]
+            roles_cfg:
+              pregel.roles.master:
+                name: maxvalue
+                app: app
+                # Run the job as soon as every worker has reported in. Without
+                # this the cluster comes up idle and waits for an operator --
+                # see the README.
+                autostart: true
+                user: pregel
+                password: 'secret'
+                workers:
+                  - '127.0.0.1:3302'
+                  - '127.0.0.1:3303'
+                  - '127.0.0.1:3304'
+                app_cfg:
+                  # Relative to examples/max-value/, resolved by the app
+                  # module: an instance's own working directory is under
+                  # var/lib and is no use as a base.
+                  #
+                  # The real thing: 75879 vertices and 508839 edges, which the
+                  # master loads in under a second and the cluster chews
+                  # through in twelve supersteps. Swap in
+                  # ../../test/fixtures/graphs/small/ring10.txt for a
+                  # ten-vertex graph whose answer can be read at a glance.
+                  graph: '../../test/fixtures/graphs/soc-Epinions-custom.txt'
+      worker1:
+        instances:
+          worker1:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3302'
+            roles: [pregel.roles.worker]
+            roles_cfg: &worker_cfg
+              pregel.roles.worker:
+                name: maxvalue
+                app: app
+                master: '127.0.0.1:3301'
+                workers:
+                  - '127.0.0.1:3302'
+                  - '127.0.0.1:3303'
+                  - '127.0.0.1:3304'
+                user: pregel
+                password: 'secret'
+      worker2:
+        instances:
+          worker2:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3303'
+            roles: [pregel.roles.worker]
+            roles_cfg: *worker_cfg
+      worker3:
+        instances:
+          worker3:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3304'
+            roles: [pregel.roles.worker]
+            roles_cfg: *worker_cfg

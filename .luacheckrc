@@ -15,6 +15,7 @@ include_files = {
     'pregel/**/*.lua',
     'test/**/*_test.lua',
     'test/apps/*.lua',
+    'test/examples/*.lua',
     'test/helpers/*.lua',
     'test/instances/*.lua',
     'examples/**/*.lua',

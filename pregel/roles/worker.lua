@@ -21,12 +21,24 @@
 --       queue_engine: space            # 'space' or 'table'
 --       user: pregel                   # net.box user for outgoing calls
 --       password: secret
+--       app_cfg:                       # opaque, handed to the app module
+--         graph: '../../data/graph.txt'
+--         threshold: 5
 --
 -- The app module returns a table:
 --
 --   {compute = fn(vertex), obtain_name = fn(value) -> string,
---    combiner = fn(a, b) -> c or nil, worker_preload = fn/table/nil,
---    worker_context = any, aggregators = {<name> = {default, reduce, merge}}}
+--    combiner = fn(a, b) -> c or nil, worker_preload = fn(self, app_cfg)/table/nil,
+--    worker_context = any or fn(app_cfg) -> any,
+--    aggregators = {<name> = {default, reduce, merge}}}
+--
+-- `app_cfg` is the one option this role does not interpret: it is checked for
+-- being a table and then handed to the app module twice over -- as the second
+-- argument of `worker_preload`, and (when `worker_context` is callable) as the
+-- argument that builds the context every compute function reads through
+-- vertex:get_worker_context(). Those two are the whole channel, because a
+-- compute function is handed nothing but its vertex, and an app module that
+-- read the config itself would be tied to one deployment.
 --
 -- Privileges. Everything that reaches a worker is a conn:call() on one of the
 -- entry points below, so the cluster config has to let the pregel user call
@@ -115,8 +127,10 @@ local function apply(cfg)
         compute        = app.compute,
         combiner       = app.combiner,
         obtain_name    = app.obtain_name,
-        worker_context = app.worker_context,
+        worker_context = common.worker_context(ROLE, cfg.app, app,
+                                               cfg.app_cfg),
         worker_preload = app.worker_preload,
+        preload_args   = cfg.app_cfg,
         squash_only    = cfg.squash_only,
         queue_engine   = cfg.queue_engine,
         pool_size      = cfg.pool_size,
