@@ -135,19 +135,42 @@ end
 
 g.test_deflate_force_pure_selects_the_lua_inflater = function()
     -- PREGEL_AVRO_PURE_LUA sets this at load; the flag is writable so that one
-    -- process can drive both paths over the same file, which is what the
-    -- container-file test below does.
-    local saved = deflate.force_pure
+    -- process can drive both readers over the same file, which is what the
+    -- container-file tests do.
+    --
+    -- Counting calls into inflate() rather than trusting backend(): with the
+    -- flag merely reported and not obeyed, every "both paths" test in this
+    -- suite still passed -- it was reading through zlib twice and the pure
+    -- inflater was never reached. Measured, by making force_pure a no-op:
+    -- 42 tests, 42 green. The counter is what makes the claim checkable.
+    local saved_flag = deflate.force_pure
+    local saved_inflate = deflate.inflate
+    local calls = 0
+    deflate.inflate = function(s)
+        calls = calls + 1
+        return saved_inflate(s)
+    end
     local ok, err = pcall(function()
-        local _, reader = deflate.backend()
-        t.assert_equals(reader, deflate.has_raw_inflate and 'ffi' or 'pure-lua')
-        deflate.force_pure = true
-        local _, forced = deflate.backend()
-        t.assert_equals(forced, 'pure-lua')
         local body = string.rep('forced through Lua ', 500)
-        t.assert_equals(deflate.decompress(deflate.deflate(body)), body)
+        local packed = deflate.deflate(body)
+
+        deflate.force_pure = false
+        t.assert_equals(select(2, deflate.backend()),
+                        deflate.has_raw_inflate and 'ffi' or 'pure-lua')
+        calls = 0
+        t.assert_equals(deflate.decompress(packed), body)
+        if deflate.has_raw_inflate then
+            t.assert_equals(calls, 0, 'the zlib reader must not fall through')
+        end
+
+        deflate.force_pure = true
+        t.assert_equals(select(2, deflate.backend()), 'pure-lua')
+        calls = 0
+        t.assert_equals(deflate.decompress(packed), body)
+        t.assert_equals(calls, 1, 'force_pure must reach the Lua inflater')
     end)
-    deflate.force_pure = saved
+    deflate.inflate = saved_inflate
+    deflate.force_pure = saved_flag
     if not ok then
         error(err, 0)
     end

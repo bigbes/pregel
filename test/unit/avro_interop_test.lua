@@ -266,6 +266,27 @@ g.test_read_fastavro_object_container_files = function()
     end
 end
 
+--- Count calls into the pure-Lua inflater for the duration of `body`.
+--
+-- Without this, "read it through both paths" is unfalsifiable: a `force_pure`
+-- that was reported but not obeyed left every such test green while the Lua
+-- inflater was never reached. Measured by making the flag a no-op -- 42 tests,
+-- 42 green. So the tests below assert the count, not the flag.
+local function counting_inflate(body)
+    local saved = deflate.inflate
+    local calls = 0
+    deflate.inflate = function(s)
+        calls = calls + 1
+        return saved(s)
+    end
+    local ok, err = pcall(body, function() return calls end,
+                          function() calls = 0 end)
+    deflate.inflate = saved
+    if not ok then
+        error(err, 0)
+    end
+end
+
 g.test_fastavro_deflate_files_read_the_same_through_both_paths = function()
     -- The deflate codec has two readers: zlib through pregel.compress, and the
     -- pure-Lua inflater that is the guarantee on a host with no library. Both
@@ -273,34 +294,44 @@ g.test_fastavro_deflate_files_read_the_same_through_both_paths = function()
     -- machine only the first would ever run -- so the second is forced here
     -- rather than left to a build that happens not to have zlib.
     local saved = deflate.force_pure
-    local ok, err = pcall(function()
-        for _, name in ipairs(CASES) do
-            local file = fio.pathjoin(FIXTURES, name .. '.deflate.avro')
-            local want = load_expectations(name)
+    counting_inflate(function(count, reset)
+        local ok, err = pcall(function()
+            for _, name in ipairs(CASES) do
+                local file = fio.pathjoin(FIXTURES, name .. '.deflate.avro')
+                local want = load_expectations(name)
 
-            deflate.force_pure = false
-            local _, fast_reader = deflate.backend()
-            local fast = ocf.read_all(file)
+                deflate.force_pure = false
+                local _, fast_reader = deflate.backend()
+                reset()
+                local fast = ocf.read_all(file)
+                if deflate.has_raw_inflate then
+                    t.assert_equals(count(), 0,
+                                    name .. ': the zlib reader did not run')
+                end
 
-            deflate.force_pure = true
-            t.assert_equals(select(2, deflate.backend()), 'pure-lua')
-            local pure = ocf.read_all(file)
+                deflate.force_pure = true
+                reset()
+                local pure = ocf.read_all(file)
+                t.assert_gt(count(), 0,
+                            name .. ': the Lua inflater did not run')
 
-            t.assert_equals(#fast, #want, name .. ': record count, zlib path')
-            t.assert_equals(#pure, #want, name .. ': record count, pure path')
-            for i = 1, #want do
-                assert_same(fast[i], want[i],
-                            string.format('%s via %s, record %d', name,
-                                          fast_reader, i))
-                assert_same(pure[i], want[i],
-                            string.format('%s via pure-lua, record %d', name, i))
+                t.assert_equals(#fast, #want, name .. ': record count, zlib path')
+                t.assert_equals(#pure, #want, name .. ': record count, pure path')
+                for i = 1, #want do
+                    assert_same(fast[i], want[i],
+                                string.format('%s via %s, record %d', name,
+                                              fast_reader, i))
+                    assert_same(pure[i], want[i],
+                                string.format('%s via pure-lua, record %d',
+                                              name, i))
+                end
             end
+        end)
+        deflate.force_pure = saved
+        if not ok then
+            error(err, 0)
         end
     end)
-    deflate.force_pure = saved
-    if not ok then
-        error(err, 0)
-    end
 end
 
 g.test_our_deflate_files_read_the_same_through_both_paths = function()
@@ -309,31 +340,41 @@ g.test_our_deflate_files_read_the_same_through_both_paths = function()
     -- dynamic Huffman blocks, which the stored-block fallback never produces,
     -- so without a zlib on the machine this pairing does not happen at all.
     t.skip_if(not deflate.has_zlib, 'no libz can be loaded in this build')
+    t.skip_if(not deflate.has_raw_inflate, 'only one reader in this build')
     local dir = fio.tempdir()
     local saved = deflate.force_pure
-    local ok, err = pcall(function()
-        for _, name in ipairs(CASES) do
-            local sc = schema.parse(slurp(name .. '.avsc'))
-            local want = load_expectations(name)
-            local file = fio.pathjoin(dir, name .. '.deflate.avro')
-            ocf.write_all(file, sc, want, {codec = 'deflate', block_size = 128})
-            for _, pure in ipairs({false, true}) do
-                deflate.force_pure = pure
-                local got = ocf.read_all(file)
-                t.assert_equals(#got, #want)
-                for i = 1, #want do
-                    assert_same(got[i], want[i],
-                                string.format('%s force_pure=%s record %d',
-                                              name, tostring(pure), i))
+    counting_inflate(function(count, reset)
+        local ok, err = pcall(function()
+            for _, name in ipairs(CASES) do
+                local sc = schema.parse(slurp(name .. '.avsc'))
+                local want = load_expectations(name)
+                local file = fio.pathjoin(dir, name .. '.deflate.avro')
+                ocf.write_all(file, sc, want,
+                              {codec = 'deflate', block_size = 128})
+                for _, pure in ipairs({false, true}) do
+                    deflate.force_pure = pure
+                    reset()
+                    local got = ocf.read_all(file)
+                    if pure then
+                        t.assert_gt(count(), 0, name .. ': the Lua inflater ran')
+                    else
+                        t.assert_equals(count(), 0, name .. ': zlib ran instead')
+                    end
+                    t.assert_equals(#got, #want)
+                    for i = 1, #want do
+                        assert_same(got[i], want[i],
+                                    string.format('%s force_pure=%s record %d',
+                                                  name, tostring(pure), i))
+                    end
                 end
             end
+        end)
+        deflate.force_pure = saved
+        if not ok then
+            error(err, 0)
         end
     end)
-    deflate.force_pure = saved
     fio.rmtree(dir)
-    if not ok then
-        error(err, 0)
-    end
 end
 
 g.test_zstandard_container_files_round_trip = function()
