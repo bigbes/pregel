@@ -120,6 +120,29 @@ g.test_option_types_are_checked = function()
                    "pregel.roles.master: option 'autostart' must be boolean")
 end
 
+-- A bound on the superstep loop, for an algorithm that might not converge. A
+-- zero or negative one is not a smaller bound but a job that cannot run a
+-- single superstep, and a fractional one is a typo.
+g.test_the_superstep_limit_must_be_a_positive_integer = function()
+    master_role.validate({name = 'job', app = APP, max_supersteps = 100})
+    assert_refused(master_role, {name = 'job', app = APP, max_supersteps = 0},
+                   "pregel.roles.master: option 'max_supersteps' must be a " ..
+                   'positive integer')
+    assert_refused(master_role, {name = 'job', app = APP, max_supersteps = -1},
+                   "pregel.roles.master: option 'max_supersteps' must be a " ..
+                   'positive integer')
+    assert_refused(master_role, {name = 'job', app = APP, max_supersteps = 1.5},
+                   "pregel.roles.master: option 'max_supersteps' must be a " ..
+                   'positive integer')
+    assert_refused(master_role,
+                   {name = 'job', app = APP, max_supersteps = '100'},
+                   "pregel.roles.master: option 'max_supersteps' must be " ..
+                   'number')
+    -- The worker runs no superstep loop, so it is not an option there.
+    assert_refused(worker_role, worker_cfg({max_supersteps = 100}),
+                   "pregel.roles.worker: unknown option 'max_supersteps'")
+end
+
 g.test_a_missing_app_module_is_reported_at_validation = function()
     assert_refused(worker_role, worker_cfg({app = 'no.such.app'}),
                    "pregel.roles.worker: cannot load the app module " ..

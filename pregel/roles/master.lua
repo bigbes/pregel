@@ -7,6 +7,7 @@
 --       app: myapp.pregel              # Lua module name, required
 --       pool_size: 1000
 --       autostart: false               # run the job as soon as it can
+--       max_supersteps: 100            # stop after this many; unset = no limit
 --       app_cfg:                       # opaque, handed to the app module
 --         graph: '../../data/graph.txt'
 --
@@ -21,11 +22,25 @@
 -- reading the cluster config itself. The worker role hands the same table to
 -- `worker_preload` and to `worker_context`; see pregel/roles/worker.lua.
 --
+-- The third argument is the job context both roles build -- {name, user,
+-- instance, dir}: what the role knows about the job and app_cfg would
+-- otherwise have to repeat. Same table, same fields, on both sides; see
+-- pregel/roles/worker.lua for what each is for.
+--
 -- The master owns no graph. It drives the superstep loop, so what it needs
 -- from the app module is `obtain_name` (to shard what a loader pushes), the
 -- optional `master_preload` (a loader run here) and the optional `aggregators`
 -- -- which must be the same set the workers declare, since a worker reports
 -- its copy to the master by name.
+--
+-- `max_supersteps` bounds the superstep loop. A graph algorithm that does not
+-- converge -- or converges only for the inputs it was tried on -- otherwise
+-- runs until an operator notices, and a job driven by `autostart` has nobody
+-- watching it. Reaching the limit is a failure rather than a finish: the run
+-- did not answer the question, and status() reports `failed` with the limit in
+-- the message rather than `done`. It is passed straight through to
+-- master.new; leave it out and the loop is unbounded, which is right for an
+-- algorithm that halts on its own.
 --
 -- With `autostart`, a background fiber waits for every worker, loads the graph
 -- and runs the supersteps; status() reports where it got to. Without it,
@@ -68,6 +83,18 @@ local ROLE = 'pregel.roles.master'
 
 local SPEC = common.spec({
     autostart = {types = {boolean = true}},
+    -- Handed to master.new, which stops the superstep loop when it is reached
+    -- and raises. Unbounded when unset, which is what a job whose algorithm
+    -- converges on its own wants; a bound is for the ones that might not.
+    max_supersteps = {
+        types = {number = true},
+        check = function(v)
+            if v <= 0 or v ~= math.floor(v) then
+                return false, 'a positive integer'
+            end
+            return true
+        end,
+    },
 })
 
 local state = {
@@ -247,12 +274,18 @@ local function apply(cfg)
     -- credentials, not a login repeated in every instance's roles_cfg.
     local user, password = common.pregel_user(ROLE)
 
+    -- What the app module is told about the job besides its own app_cfg; the
+    -- worker role builds the same table. See common.job_context.
+    local context = common.job_context({job = cfg.name, user = user,
+                                        app = cfg.app})
+
     local instance = master.new(cfg.name, {
         workers        = workers,
         obtain_name    = app.obtain_name,
-        master_preload = app.master_preload,
+        master_preload = common.with_job_context(app.master_preload, context),
         preload_args   = cfg.app_cfg,
         pool_size      = cfg.pool_size,
+        max_supersteps = cfg.max_supersteps,
         user           = user,
         password       = password,
         -- apply() must not wait for anyone: it runs inside the config

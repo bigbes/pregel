@@ -168,20 +168,23 @@ Creating that space is only possible **while the role is applying its config**,
 and that is worth knowing before writing an app module that wants storage of its
 own. A compute function and a loader both run inside the
 `pregel.worker.deliver` / `preload` RPC, and a `lua_call` executes with the
-*caller's* privileges — which are `roles_cfg.user`'s. That user has:
+*caller's* privileges — the pregel user's, the one the cluster config marks
+with the credentials role `pregel`. That user has:
 
 * no write access to `_space`, so `box.schema.space.create` from inside compute
-  raises `Write access to space '_space' is denied for user 'pregel'`;
-* no access to a space pregel did not create, because `pregel.worker.grant()`
-  covers pregel's own four and knows nothing about an app's;
+  raises `Write access to space '_space' is denied for user 'pregel_peer'`;
+* no access to a space `credentials.roles.pregel` does not name, and it cannot
+  name these: they are called after the tasks in `labels.avro`, which nobody
+  knows until the file is read;
 * no write access to `_truncate` either, so `space:truncate()` is out and the
   staging space is cleared row by row.
 
 So `worker_context()` — which the worker role calls from `apply()`, as admin —
-reads `labels.avro`, creates one space per task and grants it. The user to grant
-it to has to arrive through `app_cfg.grant_to`, because an app module cannot
-read `roles_cfg`; keep it equal to `roles_cfg.user`. A job whose peers connect
-as guest with a universe grant leaves it unset.
+reads `labels.avro`, creates one space per task and grants it. The user to
+grant it to is the second argument the roles hand it, the job context: `job.user`
+is the login every RPC into this instance runs as, which is the user the
+cluster config marks with the credentials role `pregel`. A job whose peers
+connect as guest with a universe grant gets a `nil` there and needs no grant.
 
 Every worker gets a space for every task, not only for the tasks whose vertices
 it owns: which those are is a hash against the worker list, and the mpool that
@@ -342,7 +345,6 @@ one place the two paths are written down.
 | --- | --- | --- |
 | `users` | — | `users.avro`, relative to this directory |
 | `labels` | — | `labels.avro`, relative to this directory |
-| `grant_to` | none | the user `roles_cfg.user` names; see the note on spaces |
 | `test_fraction` | 0.25 | held out of training, per class; must be in [0, 1) |
 | `min_labels` | 20 | fewer than this and the task reports `failed` |
 | `learning_rate` | 0.1 | `c` in `c / (1 + k * iteration)` |

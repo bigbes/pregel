@@ -107,6 +107,21 @@ g.test_the_accessor_hands_out_the_running_master = function()
     t.assert_equals(seen.status.superstep, seen.supersteps)
 end
 
+-- A bound on the superstep loop, passed through to master.new. What happens
+-- when the limit is *reached* belongs to pregel/master.lua and is tested with
+-- it; what belongs here is that a config carrying the option applies, reaches
+-- the master object, and does not disturb a job that converges well inside it.
+g.test_a_superstep_limit_reaches_the_master = function()
+    local c = Cluster:new(helper.config({autostart = true,
+                                         max_supersteps = 100}),
+                          helper.server_opts)
+    c:start()
+
+    local status = helper.wait_state(c, 'done')
+    t.assert_le(status.superstep, 100)
+    assert_max_value_everywhere(c)
+end
+
 -------------------------------------------------------------------------------
 -- (3): a changed config for a running job
 -------------------------------------------------------------------------------
@@ -406,6 +421,69 @@ g.test_a_config_that_marks_two_pregel_users_is_refused = function()
         "2 users in the cluster config have the credentials role 'pregel' " ..
         "('pregel_other', 'pregel_peer')",
         helper.reload, c, helper.worker_name(1))
+end
+
+-------------------------------------------------------------------------------
+-- What an app module is told about its job
+-------------------------------------------------------------------------------
+
+-- An app module gets app_cfg and nothing else, and cannot read roles_cfg -- so
+-- an app that creates a space of its own could not name the user that has to
+-- reach it, and had to be told its own login through app_cfg. The roles know
+-- it, so they hand it over, along with the rest of what only they know.
+g.test_the_app_module_is_told_about_its_job = function()
+    local c = Cluster:new(helper.config({
+        app       = 'test.apps.context',
+        app_cfg   = {threshold = 5},
+        autostart = true,
+    }), helper.server_opts)
+    c:start()
+    helper.wait_state(c, 'done')
+
+    local function seen(instance)
+        return c[instance]:exec(function()
+            return rawget(_G, 'pregel_test_job_context')
+        end)
+    end
+
+    -- The worker side: both call sites, on an instance that is not the master.
+    local worker1 = helper.worker_name(1)
+    local on_worker = seen(worker1)
+    for _, where in ipairs({'worker_context', 'worker_preload'}) do
+        local call = on_worker[where]
+        t.assert_not_equals(call, nil, where .. ' was never called')
+        t.assert_equals(call.type, 'table', where .. ' got a non-table job')
+        t.assert_equals(call.context.name, helper.JOB, where .. ': job name')
+        t.assert_equals(call.context.user, helper.USER, where .. ': user')
+        t.assert_equals(call.context.instance, worker1, where .. ': instance')
+        t.assert_str_contains(tostring(call.context.dir), '/test/apps',
+                              where .. ': the app module directory')
+        -- And app_cfg still arrives where it always did.
+        t.assert_equals(call.app_cfg, {threshold = 5}, where .. ': app_cfg')
+    end
+
+    -- The master side, which builds the same table for itself.
+    local on_master = seen(helper.MASTER_NAME)
+    local call = on_master.master_preload
+    t.assert_not_equals(call, nil, 'master_preload was never called')
+    t.assert_equals(call.context.name, helper.JOB)
+    t.assert_equals(call.context.user, helper.USER)
+    t.assert_equals(call.context.instance, helper.MASTER_NAME)
+    t.assert_equals(call.app_cfg, {threshold = 5})
+
+    -- The two sides agree on everything that is not per-instance, which is
+    -- what makes it safe for an app to grant a space to `user` on one side and
+    -- read it from the other.
+    t.assert_equals(on_master.master_preload.context.name,
+                    on_worker.worker_context.context.name)
+    t.assert_equals(on_master.master_preload.context.user,
+                    on_worker.worker_context.context.user)
+
+    -- The context a compute function sees through the vertex is the one
+    -- worker_context built from it.
+    t.assert_equals(c[worker1]:exec(function(role)
+        return require(role).get().worker_context
+    end, {helper.WORKER_ROLE}), {job = helper.JOB})
 end
 
 -------------------------------------------------------------------------------

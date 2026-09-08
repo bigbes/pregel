@@ -38,8 +38,6 @@
 -- Configured through roles_cfg.app_cfg:
 --
 --   users, labels       the two Avro files, relative to this directory
---   grant_to            the user roles_cfg.user names, so the job can reach
---                       the per-task staging spaces this module creates
 --   test_fraction       held out of training, per class          (0.25)
 --   min_labels          fewer than this and the task fails       (20)
 --   learning_rate       initial rate of the inverse-decay schedule (0.1)
@@ -192,14 +190,16 @@ end
 --
 --   * no write access to `_space`, so `box.schema.space.create` raises
 --     "Write access to space '_space' is denied for user 'pregel'"
---   * no access to a space it was not granted, and pregel.worker.grant() only
---     covers pregel's own four
+--   * no access to a space it was not granted, and `credentials.roles.pregel`
+--     can only name spaces whose names are known when the config is written --
+--     these are named after the tasks in labels.avro
 --
 -- Hence both halves here: the DDL, and a grant of the app's own space to the
--- same user roles_cfg names. The app module cannot read roles_cfg, so that
--- user's name has to arrive through app_cfg -- see `grant_to` in config.yaml.
--- A job whose peers connect as guest with a universe grant needs neither and
--- leaves it unset.
+-- user the job runs as. That login is the second argument the roles hand to
+-- worker_context (`job.user`); it used to have to be repeated into app_cfg,
+-- because an app module cannot read roles_cfg and nothing else told it. A job
+-- whose peers connect as guest with a universe grant needs neither and gets a
+-- nil there.
 --
 -- `temporary`, because the space is scratch: it is written once from the
 -- answers to a round of FETCH messages, read a few hundred times by the
@@ -304,7 +304,7 @@ end
 -- to: the task names are what the staging spaces are named after, and this is
 -- the only moment at which a space can be created. The loader then works from
 -- what is here, so the file is still read once per worker.
-function app.worker_context(app_cfg)
+function app.worker_context(app_cfg, job)
     local cfg = common.cfg(app_cfg, {'labels'})
     local resolved = {}
     for key, fallback in pairs(DEFAULTS) do
@@ -343,7 +343,12 @@ function app.worker_context(app_cfg)
         cfg      = resolved,
         labels   = labels,
         roster   = roster,
-        grant_to = cfg.grant_to,
+        -- Who to grant this module's own spaces to: the login the roles hand
+        -- over in the job context, which is the user every RPC into this
+        -- instance runs as. A job whose peers connect as guest with a universe
+        -- grant needs no grant of its own, and `job` is nil when the app is
+        -- driven programmatically rather than by the roles.
+        grant_to = job and job.user,
         -- Every user vertex this worker owns, filled by the loader. A task
         -- draws the part of its calibration sample the labels do not cover
         -- from here; see calibration_targets.

@@ -34,8 +34,9 @@
 -- The app module returns a table:
 --
 --   {compute = fn(vertex), obtain_name = fn(value) -> string,
---    combiner = fn(a, b) -> c or nil, worker_preload = fn(self, app_cfg)/table/nil,
---    worker_context = any or fn(app_cfg) -> any,
+--    combiner = fn(a, b) -> c or nil,
+--    worker_preload = fn(self, app_cfg, job)/table/nil,
+--    worker_context = any or fn(app_cfg, job) -> any,
 --    aggregators = {<name> = {default, reduce, merge}}}
 --
 -- `app_cfg` is the one option this role does not interpret: it is checked for
@@ -45,6 +46,19 @@
 -- vertex:get_worker_context(). Those two are the whole channel, because a
 -- compute function is handed nothing but its vertex, and an app module that
 -- read the config itself would be tied to one deployment.
+--
+-- `job` is what the role knows and app_cfg would otherwise have to repeat:
+--
+--   {name = <job name>, user = <the login pregel connects as>,
+--    instance = <this instance's name>, dir = <the app module's directory>}
+--
+-- `user` is there for an app module that creates a space of its own: whatever
+-- a compute function writes to is written inside a lua_call and therefore with
+-- the caller's privileges, so that space has to be granted to the same user,
+-- and the app cannot read roles_cfg to find out who that is. `dir` is where
+-- the module itself was found, which is the only stable base for a relative
+-- path in app_cfg -- an instance's working directory under tt is its own, and
+-- nowhere near the config.
 --
 -- Credentials. Who pregel connects to its peers as is not written in
 -- roles_cfg: it is the user the cluster config marks with the credentials role
@@ -215,6 +229,12 @@ local function apply(cfg)
     -- credentials, not a login repeated in every instance's roles_cfg.
     local user, password = common.pregel_user(ROLE)
 
+    -- What the app module is told about the job besides its own app_cfg: the
+    -- job name, the login the peers connect as, this instance's name and the
+    -- module's own directory. See common.job_context.
+    local context = common.job_context({job = cfg.name, user = user,
+                                        app = cfg.app})
+
     local instance = worker.new(cfg.name, {
         workers        = workers,
         master         = master_uri,
@@ -222,8 +242,8 @@ local function apply(cfg)
         combiner       = app.combiner,
         obtain_name    = app.obtain_name,
         worker_context = common.worker_context(ROLE, cfg.app, app,
-                                               cfg.app_cfg),
-        worker_preload = app.worker_preload,
+                                               cfg.app_cfg, context),
+        worker_preload = common.with_job_context(app.worker_preload, context),
         preload_args   = cfg.app_cfg,
         squash_only    = cfg.squash_only,
         queue_engine   = cfg.queue_engine,

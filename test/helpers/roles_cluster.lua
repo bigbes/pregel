@@ -205,7 +205,10 @@ helper.MASTER_NAME = 'master'
 --                      name it, so this is how a test says "nobody runs the
 --                      other half of this job"
 -- opts.worker_job   -- the same for the workers
+-- opts.app          -- roles_cfg.app for both roles, default helper.APP
+-- opts.app_cfg      -- roles_cfg.app_cfg for both roles
 -- opts.autostart    -- the master role runs the job by itself (default false)
+-- opts.max_supersteps -- roles_cfg.max_supersteps for the master
 -- opts.pool_size    -- roles_cfg.pool_size for the workers
 -- opts.drop_worker  -- index of a worker whose roles list is left empty, as if
 --                      the role had been taken off that instance
@@ -260,14 +263,16 @@ function helper.config(opts)
     local function base_cfg()
         return {
             name            = job,
-            app             = helper.APP,
+            app             = opts.app or helper.APP,
+            app_cfg         = opts.app_cfg,
             connect_timeout = opts.connect_timeout,
         }
     end
 
     local master_cfg = base_cfg()
-    master_cfg.autostart = opts.autostart or false
-    master_cfg.name      = opts.master_job or job
+    master_cfg.autostart      = opts.autostart or false
+    master_cfg.name           = opts.master_job or job
+    master_cfg.max_supersteps = opts.max_supersteps
 
     builder:use_group('pregel')
     builder:use_replicaset('r_master')

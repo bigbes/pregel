@@ -61,12 +61,11 @@ local function truth()
 end
 
 local function app_cfg(extra)
-    -- grant_to has to name the same user as roles_cfg.user, which
-    -- test/examples/cluster.lua sets from helper.USER: this example keeps
-    -- spaces of its own, and a compute function reaching them runs as that
-    -- user. See ensure_space() in the app module.
-    local cfg = {users = AVRO.users, labels = AVRO.labels,
-                 grant_to = helper.USER}
+    -- No grant_to: this example keeps spaces of its own and grants them to the
+    -- user the job runs as, which the roles hand to worker_context as the job
+    -- context rather than app_cfg having to repeat it. See ensure_space() in
+    -- the app module.
+    local cfg = {users = AVRO.users, labels = AVRO.labels}
     for key, value in pairs(extra or {}) do
         cfg[key] = value
     end

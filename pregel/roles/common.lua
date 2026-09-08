@@ -727,12 +727,87 @@ function M.load_app(role, app_name, required)
     return app
 end
 
+--- The directory the app module was loaded from, or nil.
+--
+-- The module has already been require()d by M.load_app, so this resolves the
+-- same file through the same package.path. A module that is not a file on disk
+-- -- one preloaded into package.loaded, which is what a test does -- has no
+-- directory, and nil says so rather than guessing at the process's working
+-- directory, which under tt is a per-instance one under var/lib.
+--
+-- @param app_name the module name from roles_cfg.app
+-- @return an absolute directory, or nil
+local function app_dir(app_name)
+    local path = package.searchpath(app_name, package.path)
+    if path == nil then
+        return nil
+    end
+    local fio = require('fio')
+    return fio.abspath(fio.dirname(path))
+end
+
+--- What the roles tell an app module about the job it is part of.
+--
+-- An app module is handed roles_cfg.app_cfg and nothing else, and cannot read
+-- roles_cfg itself -- so an app that creates a space of its own had no way to
+-- name the user that has to reach it, and no way to find its own directory
+-- without the trick in examples/common.lua. This is that missing half, and it
+-- is the roles' own knowledge rather than anything an app_cfg has to repeat:
+--
+--   name     -- the job name, which the job's spaces are named after
+--   user     -- the login pregel connects to its peers as, and therefore the
+--               one an app-created space has to be readable by
+--   instance -- this instance's name in the cluster config
+--   dir      -- the directory the app module was loaded from, or nil
+--
+-- Resolved once, by the apply that creates the job, and handed to every call
+-- site as one table -- so a reload, which does not re-apply an unchanged
+-- config, cannot change what an app was told.
+--
+-- @param opts {job = ..., user = ..., app = <module name>}
+-- @return the context table
+-- @function job_context
+function M.job_context(opts)
+    return {
+        name     = opts.job,
+        user     = opts.user,
+        instance = box.info.name,
+        dir      = app_dir(opts.app),
+    }
+end
+
+--- An app's preload wrapped so it is handed the job context as well.
+--
+-- worker.new / master.new call a preload as fn(instance, preload_args), and
+-- neither knows about the roles' job context; wrapping here keeps that
+-- knowledge in the roles, where it comes from.
+--
+-- Only a plain function is wrapped. A *table* -- including a callable one --
+-- is a loader object that worker.new uses as it is and never calls, so
+-- wrapping one would turn a loader into a function and change what happens to
+-- it.
+--
+-- @param preload the app's worker_preload or master_preload, or nil
+-- @param context as returned by M.job_context
+-- @return the preload, wrapped when it is a function
+-- @function with_job_context
+function M.with_job_context(preload, context)
+    if type(preload) ~= 'function' then
+        return preload
+    end
+    return function(instance, preload_args)
+        return preload(instance, preload_args, context)
+    end
+end
+
 --- What the app module wants vertex:get_worker_context() to answer.
 --
 -- A plain value is used as it is, which is what an app that needs no
--- configuration exports. A callable is called with roles_cfg.app_cfg, which is
--- the only way a compute function -- which is handed nothing but the vertex --
--- can reach a threshold or a source vertex named in the cluster config.
+-- configuration exports. A callable is called with roles_cfg.app_cfg and the
+-- job context, which is the only way a compute function -- which is handed
+-- nothing but the vertex -- can reach a threshold or a source vertex named in
+-- the cluster config, or the name of the user its own spaces have to be
+-- reachable by.
 --
 -- The two forms are told apart by is_callable rather than by an extra option,
 -- so an app whose context genuinely is a function has to wrap it in a table.
@@ -743,16 +818,17 @@ end
 -- @param role the role name
 -- @param app_name the app module's name
 -- @param app the app module
--- @param app_cfg roles_cfg.app_cfg, the builder's only argument
+-- @param app_cfg roles_cfg.app_cfg, the builder's first argument
+-- @param context as returned by M.job_context, the second
 -- @return the context, or nil when the app declares none
 -- @raise when a callable worker_context failed on app_cfg
 -- @function worker_context
-function M.worker_context(role, app_name, app, app_cfg)
-    local context = app.worker_context
-    if not is_callable(context) then
-        return context
+function M.worker_context(role, app_name, app, app_cfg, context)
+    local worker_context = app.worker_context
+    if not is_callable(worker_context) then
+        return worker_context
     end
-    local ok, rv = pcall(context, app_cfg)
+    local ok, rv = pcall(worker_context, app_cfg, context)
     if not ok then
         error("%s: the app module '%s' failed to build its worker_context " ..
               'from app_cfg: %s', role, app_name, tostring(rv))
