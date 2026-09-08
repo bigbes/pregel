@@ -21,6 +21,11 @@ than ported — the vendored C Avro binding and the tarantoolctl deployment.
 - `pregel.avro.codec`: binary encoding and decoding of every Avro type, plus `skip` for walking past a value without building it.
 - `pregel.avro.ocf`: object container file reader and writer with the `null`, `deflate` and `zstandard` codecs, and `read_all`/`write_all`/`schema_of` shorthands.
 - `pregel.avro.deflate`: a pure-Lua RFC 1951 inflater, so a `deflate` container file is readable under Community Edition, where `compress.zlib` does not exist.
+- `pregel.compress`: Tarantool Enterprise's `compress` module where there is one, and an FFI binding to the system libz, libzstd and liblz4 where there is not, with the same API and the same bytes. `implementation` names which side answers, `available(name)` says whether a codec works in this build, and `compress.ffi` reaches the FFI implementation under every build. Measured against the Enterprise 3.7 binary: its `compress.lz4` emits raw LZ4 blocks rather than the LZ4 frame format, and its `decompress_buffer_size` default of 1 MiB is a hard limit; both are matched here.
+- `pregel.compress.zlib` honours `window_bits` in both directions — 15 for zlib framing, -15 for raw RFC 1951, 31 for gzip. Enterprise's honours it when compressing only, which is what left raw deflate write-only there.
+- `pregel.compress.lib`: the run-time library lookup, preferring symbols the Tarantool binary already exports and otherwise trying sonames, the Homebrew and `/usr/local` prefixes, the Linux multiarch directories and `PREGEL_COMPRESS_LIBDIR`. The handle is cached and a failure names every path tried.
+- `PREGEL_AVRO_PURE_LUA=1`, and `avro.deflate.force_pure`, select the pure-Lua inflater whatever else is available, so the fallback keeps being exercised on machines that have zlib.
+- `avro.codec_available(name)` at the top level of `pregel.avro`, returning the implementation as a second value.
 - `pregel.avro.resolve`: schema resolution between a writer and a reader schema, with resolvers cached per pair.
 - `loader.avro_files`: a streaming loader over a pair of vertex/edge object container files, which splits itself by the pool's own hash so N workers reading the same two files cover the graph exactly once.
 - `tools/text2avro.lua`: converts the two-section text graph format into that pair of files.
@@ -39,6 +44,9 @@ than ported — the vendored C Avro binding and the tarantoolctl deployment.
 - The message queue's two engines (`space` and `table`) are behind one interface, and `squash()` is actually called from the end of a superstep.
 - Outgoing connections take `user`/`password` from the options table as well as from the URI, wait for a bounded time rather than forever, and are logged with any credentials stripped from the URI.
 - A local bucket is detected from the connection greeting's peer uuid against `box.info.uuid` — `box.info.server.uuid` is gone — and then calls the registry function in process instead of looping back through net.box.
+- The `deflate` and `zstandard` container-file codecs go through `pregel.compress`, so both compress for real on Community Edition rather than only under Enterprise: `deflate` writes real deflate instead of stored blocks, and `zstandard` exists at all. Two tests that used to skip themselves on Community Edition now run there, leaving the SSL transport test as the only skip.
+- Reading a `deflate` block goes through zlib rather than the pure-Lua inflater wherever a libz can be loaded, Enterprise included — Enterprise's own module cannot decompress raw deflate. The Lua inflater stays as the fallback and stays the guarantee that a `deflate` file is readable anywhere.
+- `avro.ocf.codec_available(name)` returns the implementation as a second value (`'ffi/ffi'`, `'enterprise/ffi'` or `'stored/pure-lua'` for `deflate`; `'enterprise'` or `'ffi'` for `zstandard`). Its first return value is still a plain boolean.
 - luacheck covers the whole tree, `pregel/` and `tools/` included; the core carried an exemption while it was still 1.6 code.
 - The Makefile gives luatest a `VARDIR` keyed by a checksum of the checkout path.
 

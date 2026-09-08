@@ -31,11 +31,13 @@ Tarantool 3.x, Community Edition. There is no C code and no external Lua
 dependency; luatest and luacheck are needed only to run the test suite, and
 `make deps` installs them.
 
-Tarantool Enterprise adds two things, both of them in the Avro module and
-neither of them required: `compress.zlib` turns the `deflate` container-file
-codec from valid-but-uncompressed stored blocks into real compression, and
-`compress.zstd` is what makes the `zstandard` codec available at all. Reading a
-`deflate` file never needs either — the inflater is pure Lua.
+Compression is optional and comes from whatever is at hand. `pregel.compress`
+is Tarantool Enterprise's `compress` module where there is one, and otherwise
+binds the system libz, libzstd and liblz4 through the FFI — so the `deflate`
+and `zstandard` container-file codecs compress for real on Community Edition
+too, on any host with the libraries installed. With neither, `deflate` still
+writes (uncompressed stored blocks) and still reads (a pure-Lua inflater), and
+`zstandard` is unavailable. See [pregel.compress](#pregelcompress).
 
 Install the rock into a `tt` environment's rocks tree:
 
@@ -790,20 +792,44 @@ every record plus the file's schema, `avro.ocf.write_all(path, sc, records)`
 writes an array in one call, and `avro.ocf.schema_of(path)` returns the schema
 and the metadata map without reading any records.
 
-Codecs, and what each Tarantool build supports:
+Codecs, and what each build does with them. What varies is not whether a file
+can be read — every row of the `deflate` column produces and consumes ordinary
+RFC 1951 — but whether it is compressed and by what.
 
-* `null` — always.
-* `deflate` — always. Reading is a pure-Lua inflater, so a deflate file is
-  readable anywhere. Writing uses `compress.zlib` where it exists and falls
-  back to RFC 1951 stored blocks where it does not: valid, uncompressed
-  deflate that any Avro implementation reads back.
-* `zstandard` — only where `compress.zstd` exists, which today means Tarantool
-  Enterprise.
+| | CE, system libraries present | CE, no libraries | Enterprise |
+| --- | --- | --- | --- |
+| `null` | yes | yes | yes |
+| `deflate`, writing | zlib through the FFI | stored blocks, uncompressed | Enterprise `compress.zlib` |
+| `deflate`, reading | zlib through the FFI | the pure-Lua inflater | zlib through the FFI |
+| `zstandard` | libzstd through the FFI | unavailable | Enterprise `compress.zstd` |
 
-`avro.ocf.codec_available(name)` answers this for the running build, and
-`avro.deflate.has_zlib` says whether `deflate` will actually compress. Under
-Community Edition the two report `false` for `zstandard` and `false` for
-`has_zlib`; under Enterprise, `true` and `true`.
+Reading `deflate` goes through the FFI binding under Enterprise as well, and
+not through Enterprise's own module. That module honours `window_bits` when
+compressing and ignores it when decompressing, so the raw deflate an Avro file
+stores is write-only there; the FFI binding honours it both ways. Where no
+libz can be loaded at all, the pure-Lua inflater takes over — which is what
+makes a `deflate` file readable on any build whatsoever.
+
+`avro.codec_available(name)` (also `avro.ocf.codec_available`) answers for the
+running build and names the implementation as a second value:
+
+```lua
+avro.codec_available('null')       --> true, 'none'
+avro.codec_available('deflate')    --> true, 'ffi/ffi'      -- writer/reader
+avro.codec_available('zstandard')  --> true, 'ffi'
+avro.codec_available('snappy')     --> false
+```
+
+The `deflate` value is `'<writer>/<reader>'`: `'enterprise/ffi'` under
+Enterprise, `'ffi/ffi'` on a Community build with a system libz,
+`'stored/pure-lua'` with neither. `avro.deflate.has_zlib` says whether writing
+actually compresses, and `avro.deflate.has_raw_inflate` whether reading uses
+zlib rather than Lua.
+
+Setting `PREGEL_AVRO_PURE_LUA=1` in the environment — or
+`avro.deflate.force_pure = true` at run time — selects the pure-Lua inflater
+whatever else is available. The test suite uses it to exercise both readers in
+one process; it is also the way to rule the FFI out when diagnosing something.
 
 ### Schema resolution
 
@@ -831,6 +857,84 @@ to pick a branch when only the reader is a union: matching kinds, matching
 names for the named types, and the promotions. It is not a full answer to
 whether the pair resolves — building the resolver is.
 
+## pregel.compress
+
+Tarantool Enterprise ships a `compress` module; Community Edition does not, and
+that was the only reason the Avro codecs behaved differently on the two.
+`pregel.compress` is that module where it exists and an FFI binding to the
+system libraries where it does not, with the same API either way.
+
+```lua
+local compress = require('pregel.compress')
+
+compress.implementation           --> 'enterprise' or 'ffi'
+compress.available('zstd')        --> true / false
+
+local z = compress.zlib.new({level = 6})
+z:decompress(z:compress(s)) == s
+```
+
+The three codecs and their options, matching Enterprise's:
+
+```lua
+compress.zlib.new({level = 6, mem_level = 8, strategy = 'default',
+                   window_bits = 15})
+compress.zstd.new({level = 3})
+compress.lz4.new({acceleration = 1, decompress_buffer_size = 1048576})
+```
+
+`strategy` is one of `default`, `filtered`, `huffman_only`, `rle`, `fixed`.
+`level` is 0..9 for zlib and, for zstd, whatever range the linked libzstd
+reports (-131072..22 on a current one). `decompress_buffer_size` is a real
+limit and not a hint: an LZ4 block records neither its decompressed size nor a
+checksum, so this is the largest output `lz4:decompress` will produce, and
+Enterprise enforces the same 1 MiB default.
+
+The output is Enterprise's byte for byte where the linked library versions
+agree, which the test suite checks in both directions on `make test-ee`. On
+this machine (zlib 1.2.12, zstd 1.5.7, lz4 1.9.4) all three match exactly.
+
+### window_bits, the one deliberate difference
+
+`window_bits` — 15 for zlib framing, -15 for raw RFC 1951 deflate, 31 for gzip
+— is a superset. Enterprise honours it when compressing and ignores it when
+decompressing: its `decompress` always expects the zlib frame and always
+verifies the trailing adler32, so raw deflate is write-only there. (Re-framing
+a raw block for it is not possible either: the adler32 is computed over the
+decompressed bytes, which is what is not known yet.) Here the option reaches
+`inflateInit2_` as well, which is what the Avro `deflate` codec needs.
+
+`compress.ffi.zlib` is the FFI binding under every build, Enterprise included,
+for exactly that reason. `compress.zlib` is the drop-in; reach for
+`compress.ffi` only when the difference is the point.
+
+### Finding the libraries
+
+`ffi.load` is tried against, in order:
+
+1. the running process, when it already exports the library's version symbol —
+   Community Edition links zlib and zstd statically and exports them, and
+   Enterprise 3.7 does the same for liblz4. Preferred because it needs no file
+   and cannot skew against what the binary itself compresses with;
+2. the plain soname (`z`, `zstd`, `lz4`) and the versioned ones (`libz.so.1`,
+   `libz.1.dylib`, …);
+3. `/opt/homebrew/lib`, `/opt/homebrew/opt/<name>/lib`, `/usr/local/lib`,
+   `/usr/local/opt/<name>/lib`, `/usr/lib` and the Linux multiarch directories;
+4. the directory named by `PREGEL_COMPRESS_LIBDIR`, as a last resort for a
+   library none of the above reaches.
+
+A candidate is accepted only once its version symbol resolves, so a file that
+merely has the right name fails the lookup rather than the first real call. The
+handle is cached per library. When nothing works the error names every path
+tried:
+
+```
+pregel.compress: cannot load libzstd (tried: ffi.C (the process exports no
+ZSTD_versionNumber), zstd, libzstd.so.1, /opt/homebrew/lib/libzstd.1.dylib, …)
+```
+
+`require('pregel.compress.lib').version('zstd')` reports what was bound.
+
 ## Testing and development
 
 ```
@@ -840,11 +944,12 @@ make test     # the suite, under the luatest wrapper's own tarantool
 make test-ee  # the suite, under $(TARANTOOL_EE)
 ```
 
-The suite covers both binaries because the Avro codecs differ between them.
-Under Community Edition the two Enterprise-only container-file tests are
-skipped; under Enterprise a test asserting that the `zstd` module is absent is
-skipped instead. Both runs are otherwise the same and both are expected to be
-green.
+The suite covers both binaries because `pregel.compress` binds a different
+implementation under each, and because the checks that the two agree can only
+run where both are present. Under Enterprise everything runs. Under Community
+Edition the seven tests that compare against the Enterprise module skip
+themselves, as does the SSL transport test; the codec tests themselves run on
+both, since the FFI bindings make `deflate` and `zstandard` work on either.
 
 `test-ee` is `test-under` with `TARANTOOL` pointed at `TARANTOOL_EE`, which
 defaults to a path that will not exist on another machine —
