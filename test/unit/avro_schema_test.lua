@@ -197,6 +197,26 @@ g.test_invalid_names_are_rejected = function()
                    'is not a valid symbol')
 end
 
+--- A leading dot used to split into namespace '' and name 'a', giving
+--  sc.namespace = '' (an empty string, where every other null-namespace type
+--  has nil) and a fullname of '.a' that no other implementation produces.
+--  Java normalises it to the name 'a' in the null namespace.
+g.test_a_leading_dot_names_the_null_namespace = function()
+    local sc = schema.parse('{"type":"fixed","name":".a","size":1}')
+    t.assert_equals(sc.fullname, 'a')
+    t.assert_equals(sc.namespace, nil)
+    t.assert_equals(sc.name, 'a')
+    t.assert_equals(sc:canonical(),
+                    schema.parse('{"type":"fixed","name":"a","size":1}'):canonical())
+    -- A dotted name in a real namespace is untouched.
+    local ns = schema.parse('{"type":"fixed","name":"x.y.a","size":1}')
+    t.assert_equals(ns.fullname, 'x.y.a')
+    t.assert_equals(ns.namespace, 'x.y')
+    -- The other malformed shapes stay rejected.
+    assert_rejects({type = 'fixed', name = 'a.', size = 1}, 'is not a valid fullname')
+    assert_rejects({type = 'fixed', name = 'a..b', size = 1}, 'is not a valid fullname')
+end
+
 g.test_duplicate_field_and_symbol_are_rejected = function()
     assert_rejects({type = 'record', name = 'R',
                     fields = {{name = 'a', type = 'int'}, {name = 'a', type = 'int'}}},
@@ -389,6 +409,61 @@ g.test_bad_default_is_rejected_on_use = function()
     local ok, err = pcall(schema.field_default, sc.field_map.i)
     t.assert_equals(ok, false)
     t.assert_str_contains(tostring(err), 'default for int must be a number')
+end
+
+--- The numeric kinds accepted any cdata so that int64 defaults would work,
+--  which also let box.NULL through: a JSON `null` default on an int field
+--  passed schema validation and surfaced much later as a codec error about the
+--  wrong thing.
+g.test_a_null_default_on_a_numeric_field_is_rejected = function()
+    for _, kind in ipairs({'int', 'long', 'float', 'double'}) do
+        local sc = schema.parse('{"type":"record","name":"R","fields":[' ..
+                                '{"name":"f","type":"' .. kind .. '","default":null}]}')
+        local ok, err = pcall(schema.field_default, sc.field_map.f)
+        t.assert_equals(ok, false, kind .. ' should reject a null default')
+        t.assert_str_contains(tostring(err), 'default for ' .. kind .. ' must be a number')
+    end
+end
+
+--- int64/uint64 cdata defaults are the reason cdata was accepted at all; they
+--  must keep working.
+g.test_an_int64_cdata_default_is_still_accepted = function()
+    local ffi = require('ffi')
+    local sc = schema.parse({type = 'record', name = 'R', fields = {
+        {name = 'a', type = 'long', default = 9223372036854775807LL},
+        {name = 'b', type = 'long', default = ffi.new('uint64_t', 7)},
+        {name = 'c', type = 'int',  default = 5},
+    }})
+    t.assert_equals(tostring(schema.field_default(sc.field_map.a)),
+                    '9223372036854775807LL')
+    -- field_default returns (value, present); parenthesise so tonumber sees one.
+    t.assert_equals(tonumber((schema.field_default(sc.field_map.b))), 7)
+    t.assert_equals(schema.field_default(sc.field_map.c), 5)
+end
+
+--- The specification says a union default is a value of the union's FIRST
+--  branch. That was only enforced when the first branch was null: ["int","null"]
+--  with default null slipped through and encoded the null branch.
+g.test_a_union_default_must_match_the_first_branch = function()
+    local sc = schema.parse('{"type":"record","name":"R","fields":[' ..
+                            '{"name":"f","type":["int","null"],"default":null}]}')
+    local ok, err = pcall(schema.field_default, sc.field_map.f)
+    t.assert_equals(ok, false)
+    t.assert_str_contains(tostring(err), 'default for int must be a number')
+
+    -- The direction that was already enforced must stay enforced.
+    local other = schema.parse('{"type":"record","name":"R","fields":[' ..
+                               '{"name":"f","type":["null","int"],"default":5}]}')
+    local ok2, err2 = pcall(schema.field_default, other.field_map.f)
+    t.assert_equals(ok2, false)
+    t.assert_str_contains(tostring(err2), 'default for null must be null')
+
+    -- And a default that does match the first branch still works, both ways.
+    local good = schema.parse('{"type":"record","name":"R","fields":[' ..
+                              '{"name":"a","type":["int","null"],"default":1},' ..
+                              '{"name":"b","type":["null","int"],"default":null}]}')
+    t.assert_equals(schema.field_default(good.field_map.a), 1)
+    t.assert_equals(schema.field_default(good.field_map.b), box.NULL)
 end
 
 --------------------------------------------------------------------------------

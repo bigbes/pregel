@@ -10,6 +10,7 @@
 -- in for JSON null wherever a Lua nil would vanish from a table.
 
 local bit  = require('bit')
+local ffi  = require('ffi')
 local json = require('json')
 
 local M = {}
@@ -106,6 +107,14 @@ local function resolve_name(name, namespace, enclosing)
         local ns, short = split_fullname(name)
         if not is_simple_name(short) or not is_namespace(ns) then
             fail('%q is not a valid fullname', name)
+        end
+        if ns == '' then
+            -- A leading dot, ".a". is_namespace('') is true, so this would
+            -- otherwise pass with namespace = '' -- an empty string where every
+            -- other null-namespace type has nil -- and a fullname of ".a" that
+            -- no other implementation produces. Java normalises it to the name
+            -- "a" in the null namespace.
+            return nil, short, short
         end
         return ns, short, name
     end
@@ -883,6 +892,20 @@ end
 
 M.json_string_to_bytes = json_string_to_bytes
 
+local ct_i64 = ffi.typeof('int64_t')
+local ct_u64 = ffi.typeof('uint64_t')
+
+--- A Lua number or 64-bit integer cdata -- the same test pregel.avro.codec
+--  makes, duplicated here because codec requires this module, not the reverse.
+--  It matters that this is not `type(v) == 'cdata'`: box.NULL is cdata too.
+local function is_number(v)
+    if type(v) == 'number' then
+        return true
+    end
+    return type(v) == 'cdata' and
+           (ffi.istype(ct_i64, v) or ffi.istype(ct_u64, v))
+end
+
 local default_to_lua
 
 --- Turn a JSON default (as it appears in the schema) into the Lua value the
@@ -900,7 +923,13 @@ default_to_lua = function(sc, value)
         end
         return value
     elseif kind == 'int' or kind == 'long' or kind == 'float' or kind == 'double' then
-        if type(value) ~= 'number' and type(value) ~= 'cdata' then
+        -- cdata was allowed so that int64 defaults work, but that also admitted
+        -- box.NULL: a JSON `null` default on an int field passed here and only
+        -- failed much later, in the codec, complaining about the wrong thing.
+        -- Under a union it was worse -- ["int","null"] with default null
+        -- reached the codec, which then encoded the *null* branch, while the
+        -- specification says a union default is a value of the first branch.
+        if not is_number(value) then
             fail('default for %s must be a number', kind)
         end
         return value
