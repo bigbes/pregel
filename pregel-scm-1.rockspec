@@ -37,5 +37,6 @@ build = {
         ['pregel.avro.resolve']      = 'pregel/avro/resolve.lua',
         ['pregel.math.vector']       = 'pregel/math/vector.lua',
         ['pregel.math.gd']           = 'pregel/math/gd.lua',
+        ['pregel.math.auc']          = 'pregel/math/auc.lua',
     },
 }
