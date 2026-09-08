@@ -14,17 +14,47 @@ each case was to make the ambiguity work rather than to remove it.
 This document is the design pass that was deferred. Section 2 states what the
 API is today; section 3 states what is wrong with it and how each claim was
 established; section 4 proposes replacements as signatures rather than as
-principles; sections 5 and 6 cover migration and the decisions that are not
-mine to make.
+principles; section 5 records a second, independent review and what this
+document did with it; section 6 is the prior art both reviews drew on; sections
+7 and 8 cover migration and the decisions that are not mine to make.
 
-Every claim about current behaviour in sections 2 and 3 was either read out of
-the code (cited as `file:line`), taken from a test that pins it (cited by test
-name), or measured. Measurements were made in this checkout at `8221da0`, on
-Tarantool 3.9.0-entrypoint, either in-process against `test/helpers/fake_pregel`
-or by running `examples/max-value` under `tt`.
+Every claim about current behaviour in sections 2, 3 and 5 was either read out
+of the code (cited as `file:line`), taken from a test that pins it (cited by
+test name), or measured. Measurements were made in this checkout at `8221da0`,
+on Tarantool 3.9.0-entrypoint, either in-process against
+`test/helpers/fake_pregel`, against a real in-process `worker.new`, or by
+running `examples/max-value` under `tt`.
 
-Work that is landing in parallel is described where it touches a problem below,
-marked as landing rather than as current state:
+### 1.1 The second round
+
+A second review of the same API and the same checkout was made independently by
+OpenAI Codex (`gpt-6-astra`, read-only). Its verdict on the first draft of this
+document was that it "understates how placement, timing, and previous runs can
+change an application's behavior", and it is right. Section 5 records every
+disagreement, the evidence I checked for it, and the verdict; section 3 has been
+re-ranked and extended with five problems it ranked above the ones here, each
+re-verified rather than taken on trust.
+
+Three of its findings changed this document's own conclusions, and they are
+worth naming up front because two of them were mistakes of mine:
+
+- An in-place change to a vertex value is *sometimes* persisted, not always
+  lost (§3.3). The first draft said it was always lost. Measured.
+- Making `get_value()` return a copy was rejected in the first draft as
+  "a deep copy per vertex per superstep on a path that runs millions of times".
+  The value handed to a compute function is **already** a fresh table — a tuple
+  field is decoded per unpack — so that objection was against a cost that does
+  not exist. Measured: the unpack costs 1514 ns and a deepcopy on top of it
+  would add 130 ns. This retires the first draft's `vertex:update(fn)`
+  proposal in favour of a returned value (§4.4).
+- A compute function that raises does not merely leak a pooled object: it
+  wedges the worker permanently (§3.13). Measured. Codex found the cause; the
+  consequence is worse than it said.
+
+### 1.2 Work landing in parallel
+
+Described where it touches a problem below, marked as landing rather than as
+current state:
 
 - `pregel-60o` — `roles_cfg` loses `workers`, `master`, `user` and `password`;
   topology and credentials come from the cluster config, the way vshard's do.
@@ -36,9 +66,11 @@ marked as landing rather than as current state:
 - `pregel-bkk.3` and `pregel-6p5.3` — the `lookalike` and `mf` examples, the
   first two apps in this repository with more than one kind of vertex.
 
-The v2 proposed here is not a rewrite. It is a change of surface over the same
-master, worker, queue and mpool; every problem in section 3 is in the argument
-lists and the contracts, not in the machinery.
+The v2 proposed here is not a rewrite of the machinery. It is a change of
+surface and of contract over the same master, worker, queue and mpool — but
+after the second round it is a larger change than the first draft proposed,
+because two of the promoted problems (§3.13, §3.14) are not in the argument
+lists at all.
 
 ## 2. The API today
 
@@ -69,8 +101,7 @@ The master object has exactly seven methods. Measured on the running
 and chain; `start()` blocks for the whole job and returns the superstep count
 (`pregel/master.lua:97`). The worker object is not driven by anyone: its only
 public method is `stop()` (`pregel/worker.lua:633`), and everything else that
-happens to it arrives as a protocol message through
-`pregel.worker.deliver`.
+happens to it arrives as a protocol message through `pregel.worker.deliver`.
 
 `master.grant(user)` and `worker.grant(user[, instance_name])`
 (`pregel/master.lua:220`, `pregel/worker.lua:772`) hand out `execute` on
@@ -82,8 +113,7 @@ space names do not.
 Lifecycle in full, from the README's own example: `pworker.grant`,
 `pmaster.grant`, `worker.new`, `master.new`, then
 `master:wait_up():preload():start()`. There is no `master:status()`, no
-`master:stop_after_this_superstep()`, and no callback of any kind during
-`start()`.
+cancellation, and no callback of any kind during `start()`.
 
 ### 2.2 The app-module contract, as the roles consume it
 
@@ -94,12 +124,16 @@ read out of it:
 - `compute(vertex)` — required by the worker role, not by the master
   (`pregel/roles/worker.lua:139` versus `pregel/roles/master.lua:103`).
 - `obtain_name(value) -> string` — required by both.
-- `combiner(a, b) -> c` — optional, read only by the worker role.
+- `combiner(a, b) -> c` — optional, read only by the worker role. One combiner
+  per instance, for every message the job sends (`pregel/worker.lua:864`,
+  and both queues get it at `:907-916`).
 - `worker_preload` / `master_preload` — a loader object, a
   `callable(instance, app_cfg)` returning one, or nil
   (`pregel/roles/common.lua:248`).
 - `worker_context` — any value, or a `callable(app_cfg)` returning one
-  (`pregel/roles/common.lua:386`).
+  (`pregel/roles/common.lua:386`). Note that this is a *role* behaviour:
+  `worker.new` stores whatever it is given, unchanged
+  (`pregel/worker.lua:852`, `:893`).
 - `aggregators = {[name] = {default, reduce, merge}}` — checked strictly, and
   a name beginning with `__` is refused (`pregel/roles/common.lua:275`).
 
@@ -159,7 +193,8 @@ Messaging:
 
 - `vertex:pairs_messages()` — yields `(key, message)`, where the key is the
   engine's own iteration state and is not meaningful
-  (`pregel/vertex.lua:161-168`, `pregel/queue.lua:50-59`).
+  (`pregel/vertex.lua:161-168`, `pregel/queue.lua:50-59`). There is no sender:
+  see §3.18, where the sender turns out to be transmitted and then dropped.
 - `vertex:pairs_edges()` — yields `(index, destination, value)`, walking the
   edge list as it stood at the start of the superstep.
 - `vertex:send_message(receiver_name, value)` — to any vertex by name, not only
@@ -200,7 +235,11 @@ previous superstep. `reduce` folds a vertex's contribution into `value`; `merge`
 folds a worker's `value` into the master's, and defaults to `reduce`.
 `get_aggregation` reads `global`. Keeping them apart is what stopped a summing
 aggregator from multiplying itself once per worker per superstep
-(`pregel-3e8`; regression `worker.test_aggregator_starts_each_superstep_from_the_default`).
+(`pregel-3e8`; regression
+`worker.test_aggregator_starts_each_superstep_from_the_default`).
+
+`reduce` itself defaults to last-write-wins —
+`opts.reduce or (function(_, v) return v end)` at `pregel/aggregator.lua:148`.
 
 The aggregator object is also callable (`pregel/aggregator.lua:122-127`):
 `agg(value)` contributes, `agg()` reads the local accumulator.
@@ -208,6 +247,8 @@ The aggregator object is also callable (`pregel/aggregator.lua:122-127`):
 A combiner is a different thing: `callable(a, b) -> c` folding two *messages*
 for one receiver into one. It runs on every put by default, or once per
 superstep under `squash_only` (`pregel/queue.lua:104-118`, `worker.lua:351`).
+There is one per worker instance and it is applied to every message regardless
+of what the message is.
 
 `__messages` and `__in_progress` are pregel's own aggregators and are what
 decide when a run is over (`pregel/master.lua:127-133`).
@@ -260,7 +301,7 @@ checked against the schema when the loader is built rather than per record
 (`pregel/loader.lua:274-297`). `vertex_value` defaults to the whole record, and
 the comment at `pregel/loader.lua:385-387` says why: the worker names a stored
 vertex by calling `obtain_name` on it, so a value stripped to one field would
-arrive somewhere it cannot be named.
+arrive somewhere it cannot be named. See §3.17 for what that costs.
 
 `pregel.math` does not touch the graph API at all — it is arrays and tables, so
 that a weight vector can be a message payload and a percentile counter can be a
@@ -271,6 +312,26 @@ because its objects have the shape section 4 proposes for aggregators:
 `:percentile(p)` (`pregel/math/percentile.lua:142-143`).
 
 ## 3. Problems
+
+The subsections are numbered in the order they were found, which is not the
+order they matter in. The merged ranking after the second round, worst first:
+
+1. **§3.13** — a run has no authoritative owner, and a compute exception wedges
+   the worker permanently. Measured.
+2. **§3.14** — job identity and partition identity are implicit; renaming one
+   worker's URI sends 100% of vertices to a different instance while every
+   tuple stays where it was. Measured.
+3. **§3.3 with §3.15** — who owns a value table, and when its contents are
+   captured. An in-place change is durable or lost depending on an unrelated
+   call in the same compute. Measured.
+4. **§3.18** — the sender of a message is transmitted and then discarded, so
+   `reply` is not expressible and a combiner cannot know who asked. Measured.
+5. **§3.16** — conflicting topology mutations are resolved by arrival order.
+6. **§3.17** — `loader.avro_files` has two naming authorities that can disagree.
+7. **§3.1, §3.2** — the overloads and the derived name.
+8. **§3.9, §3.4** — typed vertices by convention, on an object that leaks.
+9. **§3.5, §3.6, §3.7, §3.8, §3.10, §3.11, §3.12** — the contract and surface
+   problems the first draft led with.
 
 ### 3.1 Overloads told apart by argument type or by nil
 
@@ -322,11 +383,12 @@ A fourth instance of the same pattern is in the app contract:
 `common.worker_context` (`pregel/roles/common.lua:386`) decides whether the
 app's `worker_context` is a value or a builder by `is_callable`. Its own
 comment states the consequence — an app whose context genuinely is a function
-has to wrap it in a table.
+has to wrap it in a table. See §3.5 for the half of that which is worse.
 
 The cost is not that these are hard to use once learned. It is that a wrong
 call is silently a different, legal call. Type-dispatched overloads have no
-arity to check and no nil to catch.
+arity to check and no nil to catch. What they do **not** cover is the semantics
+of the operation itself, which §3.16 says is the larger problem.
 
 ### 3.2 `obtain_name` is required everywhere, and the name is never given
 
@@ -336,8 +398,7 @@ A vertex has no name of its own. Its name is computed from its value by
 - the loader, to route (`pregel/loader.lua:47`),
 - the worker, again, to store (`pregel/worker.lua:545`),
 - `vertex:add_vertex`, to route (`pregel/vertex.lua:265`),
-- the worker again, to key the topology mutation
-  (`pregel/worker.lua:578`).
+- the worker again, to key the topology mutation (`pregel/worker.lua:578`).
 
 Three consequences, all measured or cited:
 
@@ -358,25 +419,44 @@ Three consequences, all measured or cited:
 
 The name is the one piece of identity pregel actually uses — it routes, stores
 and addresses by exactly that string — and it is the one piece the caller is
-not allowed to state.
+not allowed to state. §3.17 is the sharp end of this: the Avro loader has to
+name a record twice, through two different options, and nothing checks that the
+two agree.
 
-### 3.3 `get_value` / `set_value` and the in-place trap
+### 3.3 A value is captured, or not, depending on an unrelated call
 
-`set_value` is what sets `__modified`, and `__modified` is what makes
-`compute()` write the tuple back (`pregel/vertex.lua:196-205`, `48-81`).
-Mutating the table returned by `get_value()` therefore changes nothing that
-survives the superstep. Measured: a compute function doing
-`local v = self:get_value(); v.n = v.n + 1` over a vertex whose value is
-`{n = 1}` leaves `compute()` returning false and zero `replace` calls on the
-data space.
+`set_value` is what sets `__modified`, and `__modified` is one of three things
+that make `compute()` write the tuple back (`pregel/vertex.lua:196-205`,
+`48-81`). The other two are a queued edge addition and a queued edge deletion —
+and the halt flag, which `vote_halt` also routes through `__modified`.
 
-The doc comment warns about this, which is the tell. Every example works around
-it by rebuilding the whole value: `examples/max-value/app.lua` writes
-`self:set_value({id = vertex.id, name = vertex.name, value = best})` — three
-fields copied to change one. `examples/wcc/app.lua` and `examples/sssp/app.lua`
-do the same. The 2016 code wrote a two-line helper for it
-(`node_common.set_status`, which reads, assigns and writes back) — which is
-§4.7's proposal, ten years early and in the app rather than the library.
+The first draft of this document said an in-place change to the value is lost.
+That is only true when nothing else about the vertex changed. Measured, three
+compute functions over a vertex whose value is `{n = 1}`:
+
+    in-place `get_value().n = 99`, then vote_halt(true)  -> 1 write, value {"n":99}
+    in-place `get_value().n = 99`, then add_edge('bob',1) -> 1 write, value {"n":99}
+    in-place `get_value().n = 99` alone                   -> 0 writes
+
+So the same line of application code is durable or lost depending on whether
+the compute function later votes or touches an edge. Every propagation example
+in this repository votes at the end of `compute`, which means an in-place change
+in any of them would in fact persist — silently, through a code path whose
+purpose is something else.
+
+The tell that this was already understood as a hazard is that every example
+works around it by rebuilding the whole value: `examples/max-value/app.lua:57`
+writes `self:set_value({id = vertex.id, name = vertex.name, value = best})` —
+three fields copied to change one. `examples/wcc/app.lua:69` and
+`examples/sssp/app.lua:62, 80` do the same. The 2016 code wrote a helper for it
+(`node_common.set_status`, which reads, assigns and writes back).
+
+There is no performance argument for the dirty bit. Measured: a tuple's value
+field is decoded fresh on every `tuple:unpack`, so the table a compute function
+is handed is **already** a detached copy — 1514 ns for the unpack the runtime
+already does, against 130 ns for a deepcopy that would not be needed anyway.
+The first draft rejected "make `get_value()` return a copy" on a cost that does
+not exist. §4.4's returned value is free.
 
 ### 3.4 Anything set on the vertex object leaks to the next vertex
 
@@ -388,22 +468,31 @@ function that reads `self.scratch` and then sets it:
     compute(alice) saw self.scratch = nil
     compute(bob)   saw self.scratch = alice
 
-This is not hypothetical. The 2016 look-alike app read `self.idType` at
-`node_data.lua:89` to build a config key. `idType` is assigned nowhere in that
-tree — `git grep idType 7fba5d4^ -- test-avro` returns that one line — so the
-key was always `'<task>:nil'`, the lookup always missed, and the
-prediction-threshold branch never fired. A vertex object that is an open table
-with a metatable makes that a silent nil rather than an error.
+This is not hypothetical, and it has bitten in both directions.
+
+Read side: the 2016 look-alike app read `self.idType` at
+`test-avro/node_data.lua:89` to build a config key. `idType` is assigned nowhere
+in that tree — `git grep idType 7fba5d4^ -- test-avro` returns that one line —
+so the key was always `'<task>:nil'`, the lookup always missed, and the
+prediction-threshold branch never fired.
+
+Write side: the same app's TASK vertex assigns `self.dataSetSpace =
+box.space[space_name]` (`test-avro/node_task.lua:58`). A space handle is a
+worker-local *resource*, and it was stashed on a pooled object because the API
+offered nowhere else to put it. Under pooling that handle is then visible to the
+next vertex the pool hands out, of any kind. §4.2's `worker.open/close` is the
+place that should have existed.
 
 The same openness is what the 2016 app used deliberately for typed dispatch:
 `computeGradientDescent` (`7fba5d4^:test-avro/common.lua`) saves the vertex's
 metatable on first call, `setmetatable`s the pooled object to one of three
-per-type tables built by copying `pregel.vertex.vertex_methods`, calls
-`compute_new`, and puts the original metatable back. That is what an app must
-do today to get typed vertices, and it depends on `vertex_methods` being
-exported (`pregel/vertex.lua:474`) and on the pool never noticing.
+per-type tables built by copying `pregel.vertex.vertex_methods`
+(`test-avro/node_task.lua:454-469` is one of them), calls `compute_new`, and
+puts the original metatable back. That is what an app must do today to get typed
+vertices, and it depends on `vertex_methods` being exported
+(`pregel/vertex.lua:474`) and on the pool never noticing.
 
-### 3.5 Two settings channels for one setting
+### 3.5 One configuration channel delivered twice, and a resource channel that is not one
 
 `roles_cfg.app_cfg` reaches the app module twice, in two different shapes:
 
@@ -414,18 +503,32 @@ exported (`pregel/vertex.lua:474`) and on the pool never noticing.
   `worker.new` is called (`pregel/roles/worker.lua:188`).
 
 So an app that needs the same value in both places reads it twice, through two
-different mechanisms, with two different error behaviours — the preload builder
-raises inside `worker.new`, the context builder raises inside
-`common.worker_context` with a message about failing to build a context.
+different mechanisms, with two different error behaviours.
 
-Worse, the master has no `worker_context` option at all: `master.new`'s option
-list (`pregel/master.lua:230-239`) does not include it, and the master role
-never calls `common.worker_context` (`pregel/roles/master.lua:242-253`). So
-`obtain_name` — which the master needs, and which must agree with the workers'
-— cannot be configured from `app_cfg` on the master side. Any app whose naming
+Two things are worse than that, and the second round is what brought them out.
+
+**The roles and the constructor disagree about what a callable
+`worker_context` means.** The role calls it and stores the result
+(`pregel/roles/common.lua:386-397`); `worker.new` stores it unchanged
+(`pregel/worker.lua:852`, `:893`), so a programmatic caller passing the same app
+module's `worker_context` gets a *function* out of
+`vertex:get_worker_context()` where the role's caller gets a table. Two entry
+points to one library, two meanings for one field.
+
+**`worker_context` is being asked to be two different things.** Immutable
+configuration (`examples/sssp/app.lua`'s `{source = ...}`) and worker-local
+resources (the 2016 TASK's dataset spaces, its trained models, its report
+tables) are not the same kind of thing and do not have the same lifetime. The
+first draft filed both under "settings", which was a wrong diagnosis; see §5.2.
+
+The master, meanwhile, has no `worker_context` option at all: `master.new`'s
+option list (`pregel/master.lua:230-239`) does not include it, and the master
+role never calls `common.worker_context` (`pregel/roles/master.lua:242-253`). So
+`obtain_name` — which the master needs, and which must agree with the workers' —
+cannot be configured from `app_cfg` on the master side. Any app whose naming
 depends on configuration has to smuggle it through a module-level upvalue read
-at `require` time, which is exactly what the 2016 app did with its
-`do ... end` worker-context block.
+at `require` time, which is exactly what the 2016 app did with its `do ... end`
+worker-context block.
 
 ### 3.6 `autostart` re-implements the master lifecycle
 
@@ -438,19 +541,18 @@ log a cancellation as an error — a defect that was filed and fixed
 (`pregel-dxl`).
 
 None of that belongs to the role. It is the master's own lifecycle, written
-outside the master because the master has no lifecycle API — no `run()` that
-can be driven from a fiber, no status, no way to be told to stop between
-supersteps. The proof that it is the master's business and not the role's:
-`master:start()` already publishes `superstep_count` as it goes
-(`pregel/master.lua:105`) precisely so something outside can watch, and the
-role's `status()` reads that field directly (`pregel/roles/master.lua:368`).
+outside the master because the master has no lifecycle API. The proof that it is
+the master's business and not the role's: `master:start()` already publishes
+`superstep_count` as it goes (`pregel/master.lua:105`) precisely so something
+outside can watch, and the role's `status()` reads that field directly
+(`pregel/roles/master.lua:368`).
 
-The same gap shows up as an operator-visible seam. A job driven by hand through
-`get()` moves `status().superstep` but leaves `status().state` at `idle`
-forever, because only the autostart fiber writes the other states — stated at
-`pregel/roles/master.lua:333-334` as a known limitation.
+A job driven by hand through `get()` moves `status().superstep` but leaves
+`status().state` at `idle` forever, because only the autostart fiber writes the
+other states — stated at `pregel/roles/master.lua:333-334` as a known
+limitation. §3.13 is why this is more than a cosmetic seam.
 
-### 3.7 The aggregator is three things behind one name
+### 3.7 The aggregator surface, and the three defects under it
 
 `agg(value)` contributes, `agg()` reads, and `agg:get_global()` reads a
 different value. Measured:
@@ -460,42 +562,76 @@ different value. Measured:
     agg:get_global()  -> 0  -- what a vertex would read
 
 An aggregator therefore cannot be given nil, and the doc comment says so
-(`pregel/aggregator.lua:117-118`). More to the point, `agg()` and
-`get_aggregation` answer different questions and the callable form is the one
-that looks like the obvious accessor. That confusion is exactly the second half
-of `pregel-3e8`: `vertex:get_aggregation` used to call `aggregators[name]()`,
-so a vertex read its own worker's partial accumulator — measured then as
-`[501, 2501, 10501]` where `[0, 2000, 2000]` was expected.
+(`pregel/aggregator.lua:117-118`).
 
-The trap is still live on the master. Measured on the finished `max-value`
-example:
+Two clarifications the second round forced, and one thing that stands.
+
+**The S−1 read is correct and stays.** A vertex reading what the whole graph
+produced in the *previous* superstep is BSP, not a workaround: every vertex of a
+superstep must observe the same completed state. §4.5 keeps it and names it.
+`pregel-3e8` was a bug precisely because a vertex was reading its own worker's
+partial accumulator instead — measured then as `[501, 2501, 10501]` where
+`[0, 2000, 2000]` was expected.
+
+**`agg()` versus `agg(value)` is an exposed internal, not a user-facing
+overload.** A compute function already has two separate methods
+(`get_aggregation`, `set_aggregation`), so the callable form is only reachable
+from library code and from a console. It should still go, but it is a smaller
+problem than the first draft implied.
+
+**What stands, and is not cosmetic:** the master has no public accessor at all.
+Measured on the finished `max-value` example:
 
     m.aggregators.max_seen.value        -> 999987   -- the answer
     m.aggregators.max_seen:get_global() -> 0        -- never informed
 
-`get_global()` is the documented accessor and it is wrong on the master,
-because `inform_workers` writes to the workers' copies and never to the
-master's own (`pregel/aggregator.lua:43-47`).
+`get_global()` is the documented accessor and it is wrong on the master, because
+`inform_workers` writes to the workers' copies and never to the master's own
+(`pregel/aggregator.lua:43-47`). Reading a finished job's answer means reaching
+into `m.aggregators.<name>.value` — a field of a field.
 
-And there is no public accessor at all. Reading a finished job's answer means
-reaching into `m.aggregators.<name>.value` — a field of a field. That is what I
-had to do above.
+And three real defects sit under the surface, all verified:
 
-### 3.8 `roles_cfg` duplicates the programmatic options
+- **The default reducer is last-write-wins.** `pregel/aggregator.lua:148`:
+  `opts.reduce or (function(_, v) return v end)`. An aggregator declared with
+  `{default = 0}` and nothing else silently keeps whichever contribution
+  happened to arrive last, per worker, and then whichever worker reported last.
+  That is not a reduction and there is no reason it should be the default.
+- **One combiner for every message.** `worker.new` takes a single `combiner`
+  (`pregel/worker.lua:864`) and hands it to both queues (`:907-916`). An app
+  with more than one kind of message cannot combine one kind and leave the other
+  alone. The 2016 look-alike app declared five message commands in an ffi struct
+  (`7fba5d4^:test-avro/constants.lua`: `NONE`, `FETCH`, `PREDICT_CALIBRATION`,
+  `PREDICT`, `TERMINATE`) and ran with `combiner = nil`
+  (`7fba5d4^:test-avro/common.lua:361`), because no single function could fold a
+  feature vector and a scalar prediction alike. The landing `pregel-bkk.3` has
+  the same shape.
+- **The sender is discarded.** See §3.18.
 
-Nine of the fourteen `roles_cfg` keys are a straight pass-through to
-`worker.new` or `master.new`: `pool_size`, `user`, `password`, `workers`,
-`master`, `delayed_push`, `squash_only`, `queue_engine`, and — via the
-app module — `app_cfg` as `preload_args`. Each one is written three times: in
-`common_spec` or the role's `SPEC` with its checker, in the `apply()` call, and
-in the README's roles_cfg reference. `pregel-ilf` is what an incomplete third
-copy costs: `validate()` accepted an empty `name`, `app`, `master` or `user`
-until someone went through them one at a time.
+### 3.8 One contract, two validators
 
-Four of the nine are going away in `pregel-60o` — `workers`, `master`, `user`,
-`password` — which is the right direction and does not address the shape. The
-five that remain are still tuning knobs of a message pool and a queue,
-spelled once in YAML and once in Lua.
+The first draft complained that nine of the fourteen `roles_cfg` keys are a
+pass-through to `worker.new` or `master.new`. The second round is right that
+this is the wrong complaint: exposing deployment tuning through both YAML and a
+constructor is normal, and vshard does exactly that.
+
+What is actually wrong is that the *contract* is written twice and the two
+copies are not the same. `common_spec` (`pregel/roles/common.lua:110-145`) has
+the types, the ranges and the emptiness checks; `worker_new`
+(`pregel/worker.lua:846-873`) has the defaults and a different set of asserts.
+Neither is derived from the other. `pregel-ilf` is what that costs: `validate()`
+accepted an empty `name`, `app`, `master` or `user`, and a `password` with no
+`user`, until someone went through them one at a time — while `worker.new`'s own
+asserts had never covered them at all.
+
+Four of the nine keys are going away in `pregel-60o` — `workers`, `master`,
+`user`, `password` — which is right for a different reason: they are topology
+and identity, and those belong to the cluster config. The five that remain are
+genuine tuning and should stay in both places, behind **one** validator.
+
+`pool_size` is also the wrong name for what it is: it is the number of messages
+in an outgoing batch (`pregel/mpool.lua`'s `msg_count`), not the size of a pool
+of anything.
 
 ### 3.9 Typed vertices exist and the library does not know it
 
@@ -527,10 +663,7 @@ by hand, worse, and each one differently.
 - there is no way to ask a worker how far it is except by reading its `status()`
   through the role.
 
-Two consequences already visible. The `max_supersteps` feature (`pregel-3wg`)
-has to go into `master.new`'s options and into the loop itself, because there is
-no other place to put a decision that is taken once per superstep. And the
-worker role's `status()` cannot tell a finished job from a running one:
+The worker role's `status()` cannot tell a finished job from a running one:
 measured on `max-value` after the master reported `state: done, superstep: 12`,
 `require('pregel.roles.worker').status()` on worker1 still answered
 `state: running, in_progress: 0, messages: 0`. The worker has no notion of the
@@ -539,19 +672,22 @@ job being over, because nothing ever tells it.
 ### 3.11 `HERE`
 
 `examples/common.lua:25` reads `debug.getinfo(level, 'S')` to find out where the
-app module lives, so that a relative path in `app_cfg` has a base. It is
-correct, it is well documented, and it is in the wrong repository layer: every
-app that reads a file needs it, and it is a helper of the examples.
+app module lives, so that a relative path in `app_cfg` has a base. It solves a
+real packaging problem, and it is in the wrong repository layer: every app that
+reads a file needs it, and it is a helper of the examples.
 
 Its own guard shows the fragility — an app module loaded from a string rather
 than a file has no directory, and `here()` raises telling the caller to use an
-absolute path instead. The `level` argument makes it a positional-stack-frame
-API: correct only when called directly from the app module's own chunk, silently
-wrong from a helper.
+absolute path instead. A module reached through `package.preload` has no
+filesystem directory at all, so no amount of stack inspection can answer for it.
+The `level` argument makes it a positional-stack-frame API: correct only when
+called directly from the app module's own chunk, silently wrong from a helper.
 
-The role knows the answer already. It called `require(cfg.app)`, so
-`package.searchpath(cfg.app, package.path)` in the role gives the same
-directory without a stack walk.
+The role knows a better answer already — it called `require(cfg.app)`, so
+`package.searchpath` gives the same directory without a stack walk — but the
+right answer is neither: a deployment base directory stated in the config
+(§4.7), because where the *code* lives and where the *data* lives are not the
+same question.
 
 ### 3.12 Smaller things found while reading
 
@@ -580,161 +716,328 @@ directory without a stack walk.
 - `master:start()` has no upper bound on supersteps and a compute function that
   never votes leaves its vertex active forever
   (`pregel/worker.lua:297` sets `vote_halt(false)` before every compute). Both
-  halves are being fixed — `pregel-3v3` and `pregel-3wg` — and both are
-  symptoms of the same thing: termination is a property of the app with no
-  guard in the library.
+  halves are being fixed — `pregel-3v3` and `pregel-3wg`.
+
+### 3.13 A run has no authoritative owner, and a failed compute wedges the worker
+
+Promoted from the second round, which ranked this first. Its diagnosis: "A
+`run()` convenience wrapper alone won't establish whether retrying, cancelling,
+or reading results is valid."
+
+There is no object that represents one execution. §3.6 and §3.10 are two views
+of that: the state lives in the role's autostart wrapper, the superstep counter
+lives on the master, the message and vertex counts live on each worker, and
+nothing ties them to an execution that can be asked whether it succeeded.
+
+The second round pointed at `pregel/worker.lua:295` — a compute exception skips
+the message cleanup and the return of the pooled vertex object. The consequence
+is worse than a leak. `tuple_process` (`pregel/worker.lua:295-301`) is:
+
+    local vertex_object = self.vertex_pool:pop(tuple)   -- count = count + 1
+    ...
+    vertex_compute(vertex_object)                        -- raises here
+    self.mqueue:delete(vertex_object.__id)               -- skipped
+    self.vertex_pool:push(vertex_object)                 -- skipped, count stays up
+
+and `run_superstep` ends with `while self.vertex_pool.count > 0 do
+fiber.yield() end` (`pregel/worker.lua:310-312`), a loop nothing else can
+satisfy. Measured against a real in-process worker with two vertices and a
+compute that raises:
+
+    superstep 1 with a raising compute: ok=false pool.count=1
+    superstep 2 with a benign compute finished within 3s: false (pool.count=1)
+
+The worker is wedged for the life of the process, and nothing upstream converts
+that into a failure. A bucket calls with `self.connection:call(path, args)` and
+no timeout (`pregel/mpool.lua:274`), and the waitpool's liveness check only
+notices a handler fiber that has *died* (`pregel/mpool.lua:846-853`) — a handler
+blocked in a call to a wedged worker is alive. So `master:start()` stops at the
+next `send_wait('superstep')` and stays there. The job hangs rather than fails,
+which is the one outcome an operator cannot act on.
+
+That is a live defect and should be filed regardless of what v2 looks like: the
+fix is a `pcall` around the compute with the cleanup on the failure path, so the
+superstep raises and the existing error plumbing does the rest.
+
+Two more facts about the same area, both from the code:
+
+- The failed vertex's messages stay in the queue, so they are re-read in the
+  next superstep and re-counted into `__messages`.
+- `deliver_batch` is explicitly not atomic (`pregel/worker.lua:201-203`): the
+  first failing message abandons the rest and leaves what came before it
+  applied. So a failure mid-run leaves the graph in a state no contract
+  describes.
+
+### 3.14 Job identity and partition identity are implicit
+
+Promoted from the second round, which ranked this second. Three separate facts:
+
+**One master per process, chosen by whoever ran last.**
+`pregel/master.lua:24` is `local master = nil` and `:300` is `master = self`,
+with no check. A second `master.new` in the same process silently displaces the
+first, and the module's doc comment says so as if it were a design note.
+
+**Aggregator RPCs carry no job identity.** The worker's entry point is
+`deliver_msg(name, msg, args)` — the instance name first
+(`pregel/worker.lua:177`). The master's is `deliver_msg(msg, args)`
+(`pregel/master.lua:59`): no name, no job, no run, no superstep. A late report
+from a previous run, or from a different job in the same process, is
+indistinguishable from a current one and is merged.
+
+**A worker's identity is its position in a sorted list of URI strings.**
+`mpool.new` sorts the normalized server list (`pregel/mpool.lua:1129-1140`) and
+`mpool:id(name)` is jump consistent hashing over the *count*
+(`pregel/mpool.lua:949`). So the bucket number for a name is stable for any
+list of the same length, and the mapping from bucket number to instance is
+positional.
+
+Measured, three workers, renaming one URI so that it sorts differently
+(`127.0.0.1:3304` → `127.0.0.1:3300`):
+
+    before buckets: 127.0.0.1:3302, 127.0.0.1:3303, 127.0.0.1:3304
+    after  buckets: 127.0.0.1:3300, 127.0.0.1:3302, 127.0.0.1:3303
+      v1: bucket 3 (:3304) -> bucket 3 (:3303)
+      v2: bucket 2 (:3303) -> bucket 2 (:3302)
+    renaming :3304 -> :3300 sends 10000/10000 names (100.0%) to a different
+    instance while every tuple stays where it was
+
+100%, not "some". Every vertex is now looked for on an instance that does not
+have it, and every instance is serving a shard that nobody addresses. Nothing
+detects it: the spaces are named after the *job*, not after the partition, so a
+worker adopts whatever `data_<job>` it finds (`pregel/worker.lua:670`,
+`if_not_exists` throughout).
+
+The same mechanism, benignly: adding a fourth worker moves 2469/10000 names
+(24.7%), which is what jump hashing promises and is the whole reason it was
+chosen — but those 2469 vertices are equally orphaned, because nothing
+relocates tuples.
+
+Explicit vertex IDs (§4.3) do not help with any of this. What is missing is a
+partition manifest that the shard on disk can be checked against.
+
+### 3.15 Who owns a table, and when its contents are captured
+
+Promoted from the second round. §3.3 is the vertex-value half. The other half
+is the message payload.
+
+`bucket:put(msg, args)` stores the arguments **by reference** in a reusable
+slot: `slot[1] = msg; slot[2] = args` (`pregel/mpool.lua:518-526`). The batch is
+sent later, by a background pusher or by a flush. So a compute function that
+does
+
+    local payload = self.scratch or {}
+    payload.rank = r
+    self:send_message(dest, payload)
+
+sends a table it still holds, and any later mutation of it — including the next
+vertex's, if the table came from somewhere shared — changes what is
+transmitted. Nothing copies, and nothing documents a capture point.
+
+The contract that is missing is one sentence long: *the runtime captures a
+payload before `send` returns, and the caller may reuse the table afterwards.*
+Whether that is implemented by copying or by forbidding reuse is an
+implementation choice; not stating it is not.
+
+### 3.16 Conflicting topology mutations are resolved by arrival order
+
+Promoted from the second round, which is right that this matters more than the
+overload syntax of §3.1.
+
+`apply_topology_mutations` applies the four kinds in a fixed order — delete
+edges, delete vertices, add vertices, add edges (`pregel/worker.lua:403-490`) —
+and that ordering is documented and tested. What it does *not* fix is a conflict
+within one kind. Two vertices adding a vertex of the same name in the same
+superstep hit `self.data_space:replace{name, false, group[1].value, {}}`
+(`pregel/worker.lua:464`): `group[1]` is whichever request `collect_mutations`
+read first, which is primary-key order in the mutation space, which is the
+sequence number, which is arrival order. The loser is dropped with a log line at
+most.
+
+Edge deletion has the mirror problem, and the topology-mutation example admits
+it in a comment (`examples/topology-mutation/app.lua:62-65`): deletion is
+matched by destination name, so "two edges to the same destination stand or fall
+together however different their weights are". There is no way to delete one of
+two parallel edges, because an edge has no identity.
+
+Fixed operation ordering is not deterministic conflict resolution. A rerun of
+the same job over the same graph can produce a different result, and nothing
+says so.
+
+### 3.17 `loader.avro_files` has two naming authorities
+
+Promoted from the second round. In the Avro loader's per-record path
+(`pregel/loader.lua:447-453`):
+
+    local name = vertex_name(record)          -- decides partition ownership
+    if name == nil then error(...) end
+    if owns(name) then
+        self:store_vertex(vertex_value(record))   -- names it AGAIN, via obtain_name
+    end
+
+`owns(name)` is `instance.mpool:id(name) == worker_idx`
+(`pregel/loader.lua:439-444`), so `options.vertex_name` decides *which worker
+keeps the record*. `store_vertex` then calls `instance.obtain_name(value)`
+(`pregel/loader.lua:47`) to decide *what the vertex is called*. These are two
+different functions supplied by the app, and nothing checks that they agree.
+
+When they disagree — a `vertex_name` reading the `name` field while
+`obtain_name` returns `tostring(value.id)`, which is exactly the split
+`examples/max-value/app.lua:29-33` documents as necessary because the input has
+4684 duplicate names — a partitioned worker-side load stores each vertex under a
+name that hashes to a *different* worker than the one that kept it. Every
+message for it is then routed away from the shard that holds it.
+
+The examples do not hit this only because the ones using `avro_files` on the
+workers (`sssp`) happen to pass the same field to both.
+
+### 3.18 The sender is transmitted and then discarded
+
+Promoted from the second round, and the sharpest single finding of it: this is a
+live bug and a half-finished fix.
+
+`pregel-2qk.4` fixed `vertex:send_message` to include the sender, and the
+CHANGELOG says so: "`vertex:send_message()` omitted the sender, which
+`message.deliver` documents and a combiner has no other way to learn". The
+sending side does carry it (`pregel/vertex.lua:183-186` puts
+`{receiver, msg, self.__id}`). The receiving side throws it away
+(`pregel/worker.lua:88-90`):
+
+    ['message.deliver'] = function(instance, args)
+        -- args[1] - receiver, args[2] - message, args[3] - sender
+        return instance.mqueue_next:put(args[1], args[2])
+    end,
+
+`queue:put(receiver, message)` has nowhere to put a third value. Measured
+against a real in-process worker:
+
+    delivered {receiver='bob', msg='hello', sender='alice'}
+    -> queue holds: ["hello"]
+
+So the comment names a field that is dropped one line below it, the combiner
+still cannot learn who asked, and `pairs_messages` cannot yield a sender. Any
+request/response protocol — which is what the 2016 look-alike app is, and what
+`pregel-bkk.3` will be — has to put the sender inside the payload by hand, which
+is precisely what `node_data.lua` does (`sender = self:get_name()` in every
+message it constructs).
+
+This should be filed as a bug against v1 independently of v2.
 
 ## 4. Proposal for v2
 
-Eight changes and a list of small ones. Each is stated as a signature, with
-what it replaces, why, what it costs, and a before/after taken from an example
-in this repository.
+Ten changes and a list of small ones. Each is stated as a signature, with what
+it replaces, why, what it costs, and — where one exists — a before/after taken
+from a real file in this repository.
 
-### 4.0 The two references these signatures are taken from
+The shape below is close to what the second round proposed, because on most
+points it argued better than the first draft did. Where this document differs
+from it, §5 says so and why.
 
-None of the shapes below is invented. Two bodies of prior art apply, and the
-README already names one of them.
+### 4.1 One app definition, validated at load
 
-**Giraph**, which `README.md:9-10` and `README.md:872-873` cite as the API this
-one grew from. From memory rather than from a checkout, so treat it as a
-direction and not as a specification:
+Replaces: the loose bag of exports of §2.2, and the roles' bespoke checking of
+it.
 
-- `Computation.compute(Vertex vertex, Iterable<M> messages)` — the vertex and
-  its messages are two arguments, not one object with an iterator method. That
-  is §4.3.
-- A vertex has an id given to it at input time by the `VertexInputFormat`; it
-  is not derived from the value by a hash function the app supplies. That is
-  §4.2, and it is the single largest divergence between this library and the
-  API it claims to follow.
-- `Vertex.getNumEdges()` exists, which is §3.12's out-degree loop.
-- Aggregators are reached through the Computation — `aggregate(name, value)`
-  and `getAggregatedValue(name)` — and registered by a `MasterCompute`.
-- `MasterCompute.compute()` runs on the master once per superstep and may call
-  `haltComputation()`. That is exactly §4.5's `on_superstep`, and it is the
-  piece this library has never had.
+    local p = require('pregel')
 
-**vshard**, as the closest Tarantool library in shape and the one Tarantool 3
-integrates most deliberately. Read at `/Users/blikh/data/workspace/vshard`:
-
-- `vshard.router.new(name, cfg)` returns an object whose methods live in one
-  metatable (`vshard/router/init.lua:1712-1741`), and the module-level
-  functions are generated from that same table and bypass to a static instance
-  (`:1747-1752`). `pregel.master`'s object is the same shape already; what it
-  lacks is `info()`, which vshard has on both the router and the storage
-  (`vshard/storage/init.lua:4270`). §4.5's `master:status()` is that method.
-- The Tarantool 3 config drives vshard without a role-specific topology
-  section: `sharding.roles` says what an instance is,
-  `iproto.advertise.sharding` says where it is reached, and a **credentials
-  role named `sharding`** carries the privileges — verified against the
-  Tarantool 3.9 binary, which contains the strings `iproto.advertise.sharding`,
-  `sharding.roles` and the check "Check that the vshard storage user has the
-  credential sharding role." That is precisely the arrangement `pregel-60o`
-  proposes to copy, and it is why §3.8's remaining five keys are a different
-  case from the four that are leaving.
-
-### 4.1 An `app` object, handed to the app module
-
-Replaces: `HERE`, `common.resolve`, `common.cfg`, and the twice-passed
-`app_cfg`.
-
-The role builds one object and hands it to every app entry point that needs
-configuration. It knows the module's directory because it resolved the module.
-
-    -- what the role builds, once per apply
-    app_ctx = {
-        cfg  = <roles_cfg.app_cfg, never nil>,
-        dir  = <absolute directory the app module was loaded from>,
-        path = function(self, rel)  -- rel joined onto dir, absolute passed through
-        log  = <a log table prefixed with the job name and the role>,
-        name = <job name>,
-        role = 'worker' | 'master',
+    return p.define {
+        api_version = 2,
+        configure   = function(raw) ... end,   -- -> normalized, serializable cfg
+        load        = {on = 'master' | 'workers', run = function(sink, ctx) end},
+        messages    = {<type> = {combine = fn}, ...},
+        aggregators = {<name> = <reducer>, ...},
+        worker      = {open = fn(ctx), close = fn(services, outcome)},
+        compute     = fn | p.dispatch{<KIND> = fn, ...},
+        master      = {after_step = function(control) end},
     }
 
-    -- what an app module then exports
-    function app.setup(ctx)        -- optional; returns the worker context
-    function app.load(ctx)         -- optional; returns a loader
-    function app.load_on_worker(ctx, idx, count)   -- optional
-    function app.obtain_name(value, ctx)           -- ctx available on both sides
+`p.define` validates the declaration once, where the app is written, and returns
+something both `master.new`/`worker.new` and the roles consume unchanged. That
+is what makes §3.8's second validator unnecessary: there is one contract object
+and one checker for it.
 
-Why: it collapses two channels into one (§3.5), it gives the master a
-configuration channel it does not have (§3.5), it removes the stack walk
-(§3.11), and `ctx.cfg` being never-nil removes `common.cfg`'s reason to exist.
-`ctx:path()` is where `common.resolve` goes.
+`configure(raw)` is pure and must return something serializable. It is where
+defaults and semantic validation live — the thing `examples/*/app.lua` currently
+does three different ways with `common.cfg`.
 
-Cost: every app module changes shape. There are six in the tree today (five
-examples plus `test/apps/maxvalue.lua`) and two landing. The roles gain
-one small builder; `master.new` and `worker.new` gain nothing — the object is
-built above them and captured by the closures they are handed.
+Why: §3.5's two channels, §3.8's two validators, and §2.2's "everything else in
+the module is invisible" all come from there being no declaration at all, only a
+set of names the roles happen to look up.
 
-Before (`examples/sssp/app.lua`):
+Cost: every app module changes shape. Six in the tree, two landing.
 
-    local common = require('examples.common')
+### 4.2 Explicit lifetimes for worker-local resources
+
+Replaces: `worker_context`, in both of its current meanings.
+
+    app.worker.open(ctx)                -- -> services; once per run, after readiness
+    app.worker.close(services, outcome) -- on completion or failure
+    -- in compute:  ctx.cfg      -- the normalized configuration (immutable)
+    --              ctx.services -- what open() returned
+
+Why: configuration and resources are different things with different lifetimes
+(§3.5), and the current API has one slot for both. The evidence is the 2016 TASK
+vertex, which opened a space in `__init` and stashed the handle on a *pooled
+vertex object* (`test-avro/node_task.lua:58`) because there was nowhere else —
+§3.4's leak, used as a feature. `open`/`close` is also what makes a failed run
+releasable: `close(services, outcome)` runs on the failure path too, which
+nothing does today.
+
+`open` runs after the pool is ready, so it may talk to peers; `configure` runs
+before anything, so it may not. That split is the point.
+
+Cost: one new pair of callbacks; `get_worker_context()` goes.
+
+Before (`examples/sssp/app.lua:45-48`, plus `HERE` at `:25`):
+
     local HERE = common.here()
-
     function app.worker_context(app_cfg)
         local cfg = common.cfg(app_cfg, {'source'})
         return {source = cfg.source}
     end
 
-    function app.worker_preload(instance, app_cfg)
-        local cfg = common.cfg(app_cfg, {'vertices', 'edges'})
-        return loader.avro_files(instance, {
-            vertices = common.resolve(HERE, cfg.vertices, 'vertices'),
-            edges    = common.resolve(HERE, cfg.edges, 'edges'),
-            ...
-        })
-    end
-
 After:
 
-    function app.setup(ctx)
-        return {source = assert(ctx.cfg.source, 'app_cfg.source is required')}
-    end
+    configure = function(raw)
+        checks({source = 'string', vertices = 'string', edges = 'string'})
+        return {source = raw.source, vertices = raw.vertices,
+                edges = raw.edges}
+    end,
+    -- no worker.open at all: sssp needs configuration, not resources
+    -- compute reads ctx.cfg.source
 
-    function app.load_on_worker(ctx)
-        return loader.avro_files(ctx, {
-            vertices = ctx:path(ctx.cfg.vertices),
-            edges    = ctx:path(ctx.cfg.edges),
-            ...
-        })
-    end
+`examples/common.lua` disappears with `here`, `resolve` and `cfg`.
 
-`examples/common.lua` disappears, and with it the three helpers every example
-requires today.
+### 4.3 Explicit vertex identity, and one naming authority
 
-### 4.2 Explicit vertex names
+Replaces: `obtain_name`, and the double naming of §3.17.
 
-Replaces: `obtain_name` as a required option.
+    sink:vertex{id = '42', kind = 'DATA', value = record}
+    sink:edge{src = '42', id = 'e7', dst = '81', value = weight}
 
-    loader:store_vertex(name, value)
-    loader:store_edge(src_name, dst_name, value)
-    loader:store_edges_batch(src_name, list)
-    loader:store_vertex_edges(name, value, list)
+    ctx.graph:add_vertex{id = 'TASK:x', kind = 'TASK', value = state}
 
-    vertex:add_vertex(name, value)
+    v.id      -- immutable
+    v.kind    -- immutable
+    v.value   -- the detached value
 
-    -- loader.avro_files keeps `vertex_name`, which becomes the only place a
-    -- name is derived from a record, and it already exists.
+`obtain_name` goes entirely rather than becoming optional. A record's id is
+computed once, at the point of storage, by the app — which is where the 2016
+twenty-line dispatcher reduces to a prefix. Display names stay in the value,
+where `examples/max-value/app.lua:29-33` already explains they belong.
 
-`obtain_name` becomes optional and is used for exactly one thing: naming a
-value that arrives without a name, which after this change is nothing in the
-core. Apps that want a derived name write the derivation at the call site, where
-it is one expression.
+Why: §3.2 (four hidden call sites, a value that cannot be reduced, a
+type dispatcher in disguise) and §3.17 (two authorities that can silently
+disagree and misroute a whole partitioned load). One `id` makes the second
+impossible by construction, because there is nothing to disagree with.
 
-Why: the name is what pregel routes, stores and addresses by (§3.2). Making it
-an argument removes the four hidden call sites, removes the coupling between
-naming and value layout (`pregel/loader.lua:385-387`), removes the requirement
-from a master that only coordinates, and turns the 2016 twenty-line
-`obtain_name` into a prefix at the point of storage.
+Cost: one `store_vertex` call in the tree (`test/apps/maxvalue.lua:74`), one
+`add_vertex` (`examples/topology-mutation/app.lua:80`), six `obtain_name`
+definitions deleted, and the two library loaders. `store_edge` already takes
+names.
 
-Cost: this is the largest breaking change on paper and a small one in this
-tree, because the five examples load through `loader.graph_edges_f` and
-`loader.avro_files`, which are library code. Measured app-level scope: one
-`store_vertex` call (`test/apps/maxvalue.lua:74`), one `add_vertex` call
-(`examples/topology-mutation/app.lua:80`), and six `obtain_name` definitions
-that go away — one in each of the five examples and one in the test app.
-`store_edge` and `store_edges_batch` already take names and do not change.
-Inside the library, the two loaders and the four call sites of §3.2.
+Duplicate ids fail by default rather than silently resetting the vertex's value
+and edges, which is what `vertex_store`'s `replace` does today
+(`pregel/worker.lua:544-547`).
 
 Before (`test/apps/maxvalue.lua:31-33, 74`):
 
@@ -744,74 +1047,60 @@ Before (`test/apps/maxvalue.lua:31-33, 74`):
 
 After:
 
-    -- no obtain_name at all
     local v = app.vertex(i)
-    self:store_vertex(v.name, v)
+    sink:vertex{id = v.name, value = v}
 
-Before (`examples/topology-mutation/app.lua:80`):
+### 4.4 `compute(v, inbox, ctx)` returning value and schedule
 
-    self:add_vertex({name = self:get_name() .. ':orphan',
-                     orphan_of = self:get_name()})
+Replaces: `compute(self)`, `get_value`/`set_value` and the dirty bit,
+`vote_halt`, the value-carried type discriminator, and the metatable swapping of
+§3.4/§3.9.
 
-After:
+    app.compute = function(v, inbox, ctx)
+        ...
+        return value | p.KEEP, p.ACTIVE | p.HALT
+    end
 
-    self:add_vertex(self:get_name() .. ':orphan',
-                    {orphan_of = self:get_name()})
-
-Note the second gain: the value no longer has to carry its own name, so
-`orphan_of` is the whole vertex.
-
-### 4.3 `compute(vertex, messages, ctx)` with typed dispatch
-
-Replaces: `compute(self)`, the value-carried type discriminator, and the
-metatable swapping of §3.4/§3.9.
-
-    -- single-type app, unchanged in spirit
-    app.compute = function(vertex, messages, ctx) end
-
-    -- typed app: a table of compute functions
-    app.compute = {
-        data = function(vertex, messages, ctx) end,
-        task = function(vertex, messages, ctx) end,
-        master = function(vertex, messages, ctx) end,
+    app.compute = p.dispatch{
+        MASTER = master_compute, TASK = task_compute, DATA = data_compute,
     }
-    app.vertex_type = function(vertex) return vertex:get_type() end  -- optional
 
-A vertex gains a type: `store_vertex(name, value, {type = 'data'})` and
-`vertex:get_type()`. The default type is `nil`, and an app with a plain function
-`compute` never sees any of this. With a table `compute`, the worker looks the
-function up by type and raises naming the vertex and the type when there is no
-handler — instead of `assert(false)` in the app
-(`7fba5d4^:test-avro/node_common.lua`).
+Both return values are mandatory. Falling through raises
+`INVALID_COMPUTE_RESULT` rather than defaulting to anything. `p.KEEP` says "do
+not write the value"; returning the value — including the same table, mutated in
+place — persists it.
 
-`messages` is a plain array, not an iterator, and `ctx` is the worker context
-(§4.1) rather than a method call. Two reasons beyond convenience: an iterator
-whose first value is always discarded is not an interface (§3.12), and passing
-the context explicitly makes it visible in the signature that it is per-worker
-and shared.
+Why the returned value: §3.3. The dirty bit makes an in-place change durable or
+lost depending on whether the compute later votes or touches an edge, which is
+not a rule anyone can hold. A returned value has no such coupling and catches
+nested table changes, which no dirty bit can. And it is free: measured, the
+value handed to compute is already a fresh decode of the tuple field
+(1514 ns), so there is nothing extra to copy. This supersedes the first draft's
+`vertex:update(fn)`, which was proposed only because copying was believed
+expensive.
 
-Why: every app with more than one kind of vertex has invented this (§3.9), and
-the mechanism they invented reaches into `pregel.vertex.vertex_methods` and
-mutates a pooled object's metatable. A table of functions keyed by type is what
-the worker's own `info_functions` already is.
+Why the mandatory schedule: see §5.1. Briefly — halt-by-default (`pregel-3v3`)
+is the right v1 fix and the wrong v2 contract. In v1 the runtime must guess,
+and halting is the safer guess; in v2 the signature already returns a tuple, so
+requiring the second element costs one word and removes the guess. A vertex that
+forgets is a bug, and it should say so rather than either hanging the cluster
+(today) or quietly reporting a converged answer to an unconverged algorithm
+(halt-by-default).
 
-Once typed dispatch exists, the vertex object stops being a place to keep
-things, and §3.4's leak should be closed at the same time: `apply()` clears
-every key it did not put there, rather than the fixed seven it clears today
-(`pregel/vertex.lua:28-37`). That turns the measured `self.scratch = alice` of
-§3.4 into a nil, and it turns the 2016 `self.idType` read into a nil that was
-already nil — no behaviour lost, because nothing may legitimately survive an
-`apply()`. Per-vertex state that must survive belongs in the value; per-worker
-state belongs in `ctx`.
+New vertices start `ACTIVE`. A message reactivates a halted vertex, as today.
 
-Cost: `compute` signatures change in all six app modules in the tree and in the
-two landing ones. The change is mechanical: `function app.compute(self)`
-becomes `function app.compute(self, messages, ctx)`, `self:pairs_messages()`
-becomes `ipairs(messages)`, and `self:get_worker_context()` becomes `ctx`. The
-type field costs one column in the data space or one reserved key in the value;
-see open question 6.2.
+Why `inbox` and `ctx` as arguments: §3.12's discarded iterator values, and
+making it visible in the signature that the context is per-worker and shared
+rather than something reached through the vertex.
 
-Before (`examples/topology-mutation/app.lua`):
+Why `p.dispatch`: §3.9. It is a table lookup by `v.kind` with a named error for
+an unhandled kind, replacing three metatables built by copying
+`pregel.vertex.vertex_methods`.
+
+Cost: the compute signature changes in all eight app modules. Mechanical for the
+six single-kind ones.
+
+Before (`examples/topology-mutation/app.lua:50-87`):
 
     function app.compute(self)
         local value = self:get_value()
@@ -821,114 +1110,83 @@ Before (`examples/topology-mutation/app.lua`):
         end
         local threshold = self:get_worker_context().threshold
         ...
+        self:vote_halt(true)
     end
 
 After:
 
-    app.compute = {
-        marker = function(vertex)
-            vertex:vote_halt(true)
-        end,
-        vertex = function(vertex, messages, ctx)
-            local threshold = ctx.threshold
-            ...
+    compute = p.dispatch{
+        MARKER = function() return p.KEEP, p.HALT end,
+        VERTEX = function(v, inbox, ctx)
+            local kept = 0
+            for _, e in ipairs(v:edges()) do
+                if e.value < ctx.cfg.threshold then
+                    ctx.graph:delete_edge{src = v.id, id = e.id}
+                else
+                    kept = kept + 1
+                end
+            end
+            if kept == 0 then
+                ctx.graph:add_vertex{id = v.id .. ':orphan', kind = 'MARKER',
+                                     value = {orphan_of = v.id}}
+            end
+            return p.KEEP, p.HALT
         end,
     }
 
-### 4.4 Unambiguous mutation methods
+### 4.5 Typed messages, real reducers, and a master broadcast
 
-Replaces: the four overloaded methods of §3.1.
+Replaces: one combiner for everything, the last-write-wins reducer, the
+aggregator's callable form, and the aggregator-as-broadcast-channel of the 2016
+app.
 
-    vertex:add_edge(dst, value)                 -- this vertex's own edge
-    vertex:add_edge_from(src, dst, value)       -- another vertex's
-    vertex:delete_edge(dst)                     -- this vertex's own
-    vertex:delete_edge_from(src, dst)           -- another vertex's
-    vertex:delete_self()                        -- this vertex
-    vertex:delete_vertex(name)                  -- another one, name required
-    vertex:add_vertex(name, value)              -- as in §4.2
+    app.messages = {rank = {combine = function(a, b) return a + b end},
+                    fetch = {}, sample = {}, calibrate = {}}
 
-Every one has a fixed arity. `nil` in any position is an error rather than a
-different call. `add_edge(dst)` with no value stores `json.NULL`, which is what
-the current code does anyway — that is arity 1 versus arity 2 on the same
-method, which is checkable, not a type test.
+    ctx:send(dst_id, type, payload)
+    ctx:reply(message, type, payload)
+    ctx:send_edges(v, type, payload)
+    inbox:messages(type)             -- iterator of {from = ..., value = ...}
+    inbox:fold(type, initial, reduce)
 
-The `edges` flag of `delete_vertex` goes away entirely. Today it must be
-`false` and asserts otherwise (`pregel/vertex.lua:334`); an argument with one
-legal value is not an argument. When inbound-edge deletion is implemented it
-comes back as `delete_vertex(name, {inbound = true})`.
+    app.aggregators = {dangling = p.reducers.sum(),
+                       models   = p.reducers.unique_map()}
+    ctx:aggregate(name, contribution)
+    ctx:previous(name)               -- the completed S-1; the identity in S=1
+    control:reduced(name)            -- the just-completed S, on the master
+    control:broadcast(name, value, {activate = 'DATA'})
+    control:finish{reason = 'iterations'}
 
-Why: three closed bugs (§3.1), and a measured silent misroute in the current
-code.
+Six decisions in that, each answering a verified problem:
 
-Cost: small. Measured call sites in the repository: `delete_edge(destination)`
-once (`examples/topology-mutation/app.lua:69`) and `add_vertex` once
-(`:80`) — both already use the short form, so both are unchanged apart from
-§4.2's name argument. The `_from` variants have no call site outside the unit
-tests, which is itself worth noticing: the overload that caused three bugs is
-used by nothing.
+- **Per-type combiners** (§3.7): combining is scoped to
+  `(run, superstep, destination, type)`. A combiner must tolerate arbitrary
+  grouping and order, and a combined message has no single sender, so `reply`
+  refuses one.
+- **`from` on every message** (§3.18): the sender already travels and is
+  dropped at `pregel/worker.lua:90`. Carrying it through to the inbox is what
+  makes `reply` expressible and stops every request/response app from
+  hand-rolling `sender = self:get_name()` in each payload.
+- **Reducers are `{init, accumulate, merge}`, with no implicit default**
+  (§3.7): `p.reducers.sum()` and friends are the common ones. An aggregator
+  declared with no reduction is an error, not last-write-wins.
+- **S−1 reads stay, and get a name** (§3.7, §5.4): `ctx:previous(name)` says in
+  the call what the current `get_aggregation` says only in a doc comment. The
+  master's own view of the step that just finished is a different method on a
+  different object (`control:reduced`), because it is a different value.
+- **Broadcast is not an aggregator.** The 2016 app used a per-task aggregator
+  with a max-by-command merge to push a model out to every DATA vertex
+  (`test-avro/common.lua`, `addAggregators`). A master publication that becomes
+  visible next step and can activate a whole kind expresses that directly,
+  without manufacturing one identical message per vertex.
+- **Unknown types and nil payloads fail.** `box.NULL` is the way to send
+  nothing, as it already is for edge values.
 
-Before:
+Cost: six `get_aggregation`/`set_aggregation` call sites, in
+`examples/max-value`, `examples/pagerank` and `test/apps/maxvalue.lua`; the
+`combiner` option becomes a per-type declaration in three examples.
 
-    -- legal today, and silently not what it says
-    self:add_edge('bob', 'carol', nil)
-
-After:
-
-    self:add_edge_from('bob', 'carol')   -- arity 2 on _from: value defaults to NULL
-    -- self:add_edge_from('bob', 'carol', nil) raises: value is nil
-
-### 4.5 Aggregator objects, and `run` with progress
-
-Replaces: `agg(value)` / `agg()`, `get_aggregation` / `set_aggregation`,
-`master:start()`, and the autostart fiber's re-implementation of the lifecycle.
-
-Aggregators:
-
-    local a = vertex:aggregator('count')
-    a:add(1)          -- contribute; nil raises
-    a:get()           -- the merged value from the previous superstep
-                      -- (what get_aggregation answers today)
-
-    master:aggregator('count'):get()   -- the merged value on the master,
-                                       -- which today has to be read as
-                                       -- m.aggregators.count.value
-
-The callable form goes. `:add` and `:get` are the shape `pregel.math` already
-uses for the same kind of object (`auc.new():add(...)`, `:result()`), so an app
-that uses both is not learning two conventions. The master gains a public
-accessor, which it does not have at all today (§3.7).
-
-The master:
-
-    master:run{
-        max_supersteps = 100,          -- pregel-3wg, as an option of run
-        on_superstep = function(status)
-            -- status = {superstep, messages, in_progress, aggregators = {...}}
-            -- return false to stop after this superstep
-        end,
-    }  -- returns {supersteps, stopped_by = 'quiet'|'limit'|'callback'}
-
-    master:status()  -- the same table, readable while run() blocks in a fiber
-
-`master:start()` stays, as `run{}` with no options. That is not the shim §5
-argues against: `start()` is unambiguous and means exactly one thing, so
-keeping it costs a two-line method and no lasting confusion, unlike keeping an
-overload that has two readings.
-
-Why: `on_superstep` is the missing seam. `max_supersteps` needs it, a
-checkpoint needs it, a convergence test needs it, and the autostart fiber needs
-it — today that fiber maintains its own five-state table outside the object that
-knows the state (§3.6). With `master:status()` the role's `status()` becomes a
-projection of the master's, and a hand-driven job stops reporting `idle` while
-it runs.
-
-Cost: `master:run` and `master:status` are new methods, roughly forty lines
-between them plus the option checking; `autostart_body` loses about half its
-body. `master:start()` keeps working. Aggregator objects break every
-`get_aggregation` / `set_aggregation` call site — six of them, in
-`examples/max-value`, `examples/pagerank` and `test/apps/maxvalue.lua`.
-
-Before (`examples/pagerank/app.lua`):
+Before (`examples/pagerank/app.lua:66, 76, 93`):
 
     self:set_aggregation('count', 1)
     local n = self:get_aggregation('count')
@@ -936,262 +1194,647 @@ Before (`examples/pagerank/app.lua`):
 
 After:
 
-    local count = vertex:aggregator('count')
-    count:add(1)
-    local n = count:get()
-    local leaked = vertex:aggregator('dangling'):get() / n
+    -- `count` disappears entirely: the graph knows how many vertices it has
+    local n = ctx.graph.vertex_count
+    local leaked = ctx:previous('dangling') / n
 
-Before (reading the answer of a finished job, measured in §3.7):
+That deletion is worth stating on its own: PageRank spends its whole first
+superstep discovering N by having every vertex contribute 1 and reading the
+total back, and re-contributing it forever because the aggregate resets. A
+vertex count maintained by the runtime and refreshed at topology barriers
+removes a superstep and an aggregator from the example.
 
-    m.aggregators.max_seen.value   -- 999987
+Before (reading a finished job's answer, measured in §3.7):
+
+    m.aggregators.max_seen.value          -- 999987
     m.aggregators.max_seen:get_global()   -- 0, and it is the documented accessor
 
 After:
 
-    m:aggregator('max_seen'):get()   -- 999987
+    run:aggregate('max_seen')             -- 999987
 
-### 4.6 Loaders as plain functions
+### 4.6 Topology with edge identity and an explicit conflict policy
 
-Replaces: `loader.new(instance, fn)` and the callable-object-with-`__index`
-construction (`pregel/loader.lua:111-117`).
+Replaces: the four overloaded mutation methods of §3.1, the arrival-order
+resolution of §3.16, and the destination-only edge deletion the
+topology-mutation example complains about.
 
-    -- an app returns a plain function
-    function app.load(ctx)
-        return function(sink)
-            for i = 1, n do sink:store_vertex(name(i), value(i)) end
-            sink:flush()
-        end
-    end
+    ctx.graph:add_vertex{id = ..., kind = ..., value = ...}
+    ctx.graph:add_edge{src = v.id, id = 'e1', dst = ..., value = ...}
+    ctx.graph:delete_edge{src = v.id, id = 'e1'}
+    ctx.graph:delete_edges{src = v.id, dst = ...}
+    ctx.graph:delete_vertex{id = v.id, if_missing = 'ignore'}
 
-    -- a partitioned worker-side loader takes the split as an argument
-    function app.load_on_worker(ctx)
-        return function(sink, part)
-            -- part = {index = <1-based>, count = <workers>,
-            --         owns = function(name) -> boolean}
-        end
-    end
+Named fields, so there is no argument to shift and no nil to reinterpret. An
+edge is identified by `(src, edge_id)`, which is what makes it possible to
+delete one of two parallel edges — the thing
+`examples/topology-mutation/app.lua:62-65` says cannot be done.
 
-`sink` is the object carrying `store_vertex`, `store_edge`,
-`store_edges_batch`, `store_vertex_edges` and `flush` — the same five methods,
-built by the library rather than glued onto a metatable whose `__call` is the
-user's function.
+**Every mutation takes effect at the barrier, including one to the current
+vertex's own edges.** Today the local path is applied when the vertex is written
+back and the remote path between supersteps (`pregel/vertex.lua:299-309`), which
+is two timings for one operation and is exactly the divergence `pregel-iv7` was.
+One timing means `pairs_edges` during a superstep always shows the same list,
+which is the property the example's "counted, not read back" comment works
+around.
 
-Why: the current loader is a callable object whose `__call` is the loader and
-whose `__index` is the sink, so `self` inside a loader function is both the
-graph writer and the loader. That is why `loader_new` needs an `instance` it
-closes over before the caller has anything to call. A function taking a sink has
-no such knot, and the split arguments stop being two trailing positionals whose
-meaning is documented three files away (`pregel/loader.lua:429`,
-`pregel/worker.lua:530`).
+The four-phase ordering stays (delete edges, delete vertices, add vertices, add
+edges) because it is what lets one superstep add a vertex and an edge out of it.
+What changes is that a conflict *within* a phase is refused rather than resolved
+by `group[1]` (§3.16). A second creation of the same id fails the run with a
+named error; an app that wants last-writer-wins says so.
 
-Cost: `loader.graph_edges_f` and `loader.avro_files` change their internal
-shape and keep their signatures. One app-level loader in the repository
-(`test/apps/maxvalue.lua:72`) changes from `loader.new(instance, function(self)`
-to a plain function.
+Vertex deletion removes the vertex's outgoing edges; inbound edges stay, as
+today, because only a full scan could find them. That is now stated as a
+contract rather than as an unimplemented argument.
 
-### 4.7 Writing a vertex value
+Cost: two call sites in the examples, plus the internal `_delayed` handlers.
+The first draft answered §3.1 by splitting each overload into two methods
+(`add_edge` / `add_edge_from` and so on); named fields make that unnecessary,
+which is a better answer than four more names — and it is the local Tarantool
+idiom (`box.schema.space.create(name, opts)`, see §6).
 
-Replaces: nothing, and that is the point — §3.3 has no API answer today, only
-a warning in a doc comment.
+Before:
 
-    vertex:update(function(value)
-        value.dist = best
-        return value            -- returning nothing keeps the same table
-    end)
-
-`update` reads the value, hands it to the function, takes what comes back (or
-the same table when the function returns nothing), stores it and marks the
-vertex modified. `get_value` and `set_value` stay exactly as they are; this is
-the shorthand for the read-modify-write that every example writes by hand.
-
-Why: the trap in §3.3 is that the natural spelling silently does nothing. An
-explicit mutator makes the natural spelling correct without making
-`get_value()` return a copy — which would be the other fix, and would cost a
-deep copy per vertex per superstep on a path that runs millions of times.
-
-Cost: about ten lines on the vertex object, and no call site has to move.
-`examples/max-value`, `examples/wcc` and `examples/sssp` each lose one
-whole-value rebuild.
-
-Before (`examples/max-value/app.lua:57`):
-
-    self:set_value({id = vertex.id, name = vertex.name, value = best})
+    self:add_edge('bob', 'carol', nil)   -- silently an edge alice -> bob = 'carol'
 
 After:
 
-    self:update(function(v) v.value = best end)
+    ctx.graph:add_edge{src = 'bob', dst = 'carol', id = 'e1'}
+    -- no value field means no value; a nil in a named field is not a shift
 
-### 4.8 The settled defaults
+### 4.7 Loaders as `(sink, ctx)`, with an explicit base directory
 
-Two decisions the landing work should make once and state in the API rather
-than leaving to each app:
+Replaces: `loader.new(instance, fn)`, the callable-object-with-`__index`
+construction (`pregel/loader.lua:111-117`), the trailing
+`worker_idx, workers_count` positionals, and `HERE`.
 
-- A vertex that does not call `vote_halt` during `compute` is halted
-  afterwards (`pregel-3v3`). Staying active requires saying so. Every example
-  votes explicitly today, so none of them changes; what changes is that an app
-  that forgets cannot hang the cluster.
-- `max_supersteps` is an option of `master:run` (§4.5), unbounded by default,
-  with a warning logged every 100 supersteps when unbounded. A limit that is
-  reached stops the loop and reports `stopped_by = 'limit'` rather than raising:
-  the vertices' state is intact and worth reading either way.
+    load = {
+        on  = 'master',                      -- or 'workers'; stated, not inferred
+        run = function(sink, ctx)
+            p.loaders.avro(sink, ctx, {vertices = ctx:path(ctx.cfg.vertices),
+                                       edges    = ctx:path(ctx.cfg.edges), ...})
+        end,
+    }
 
-### 4.9 The small items of §3.12
+    ctx.partition:owns(vertex_id)   -- for a hand-written partitioned loader
+    ctx:path(relative)             -- resolved against the deployment base_dir
 
-None of these is worth a subsection of its own, and leaving them undisposed is
-how `write_solution` survived ten years.
+Three changes:
+
+- **The load location is declared, not inferred.** Today the master role picks
+  between `preload()` and `preload_on_workers()` by looking at which export the
+  app happens to have (`pregel/roles/master.lua:169-178`), and an app with both
+  silently gets the master-side one.
+- **`ctx:path` resolves against an explicit `base_dir`** given to
+  `master.new`/`worker.new` or the cluster config — never the current directory
+  and never a stack walk. §3.11: a module reached through `package.preload` has
+  no directory, so no amount of inspection can answer for it. Where the *code*
+  lives and where the *data* lives are separate questions, and a separate
+  `asset_dir` answers the first when an app really does ship data.
+- **The sink is an argument, not `self`.** Today a loader object is both the
+  callable and the sink, which is why `loader_new` needs the instance before the
+  caller has anything to call.
+
+Cost: one app-level loader in the tree (`test/apps/maxvalue.lua:72`), and the
+two library loaders keep their options and change their plumbing.
+
+### 4.8 Run handles, fencing, and structured errors
+
+Replaces: `master:start()`, `master:wait_up()`, the role's autostart wrapper,
+and the absence of §3.13.
+
+    local m = p.master.new{name = 'rank', app = app, cfg = cfg,
+                           base_dir = '/srv/graphs',
+                           cluster = topology, runtime = tuning}
+
+    local run = m:run{max_supersteps = 100, timeout = 300,
+                      on_progress = fn}    -- returns immediately
+    run:status()                            -- a snapshot, any time
+    run:wait{timeout = 10}                  -- -> result, err
+    run:cancel{reason = 'operator'}
+    run:vertices{batch_size = 1000}         -- result iterator, on success
+    run:aggregate(name)
+    m:close()                               -- refuses while a run is active
+
+`status()` distinguishes `connecting`, `loading`, `running`, `cancelling`,
+`completed`, `failed` and `cancelled`, and carries the current and completed
+superstep, per-worker progress, active vertices, queued and in-flight messages,
+elapsed time, and a structured error. That is a superset of what the role's
+`status()` assembles today (`pregel/roles/master.lua:359-371`), which is why
+§4.10 makes the role a projection of it.
+
+A failure is an object, not a string:
+
+    {code = 'COMPUTE_FAILED', run_id = ..., worker = 'worker-b',
+     vertex = 'TASK:x', superstep = 7, message = ..., traceback = ...,
+     cause = {...}}
+
+**Fencing.** Every RPC carries `(job, run, step)`. §3.14: the master's entry
+point carries no identity at all today (`pregel/master.lua:59`), so a late
+aggregator report from a previous run is merged into the current one and nothing
+can tell. A second master in a process is refused rather than silently replacing
+the first.
+
+**Failure containment.** §3.13's wedge is the reason this is not just
+ergonomics. A compute exception must unwind the pooled object and the message
+cleanup, abort further barriers, and invalidate the run's results. No rollback
+and no automatic resume is promised: the queues are spaces, vertex writes have
+already landed, and `deliver_batch` is explicitly non-atomic
+(`pregel/worker.lua:201-203`). Diagnostics are retained and the next run gets a
+fresh namespace.
+
+**Cancellation** is cooperative and idempotent, reported as `cancelled` only
+once workers acknowledge. `wait()` timing out does not cancel. A compute that
+never yields cannot be interrupted by this API, and that is stated rather than
+implied.
+
+Cost: this is the largest new surface in the proposal, and the only one that
+adds machinery rather than moving it. It is also the one that pays for §3.13,
+§3.14, §3.6 and §3.10 together.
+
+`master:start()` does **not** survive as an alias. The first draft kept it; §5.5
+says why that reversed.
+
+### 4.9 The settled defaults
+
+- **The scheduling result is mandatory** (§4.4). `pregel-3v3`'s halt-by-default
+  lands in v1 and is right there; v2 has no default to fall through to because
+  the signature changed. See §5.1.
+- **`max_supersteps` is a safety limit that fails the run**, not an outcome. A
+  bounded algorithm says so with `control:finish{reason = ...}` or by returning
+  `HALT`; reaching the cap means the app did not terminate, which is a failure
+  and should be reported as `SUPERSTEP_LIMIT`. This reverses the first draft,
+  which proposed `stopped_by = 'limit'` as an ordinary result. Natural
+  completion and explicit `finish()` are evaluated before the cap.
+- **A message to a missing recipient fails**, unless the app explicitly asks for
+  counted drops. Today it is queued for a vertex that does not exist, is never
+  read (a superstep walks the data space, so only existing vertices read), keeps
+  the job alive for one extra superstep because `__messages` counts it
+  (`pregel/worker.lua:356`), and is then dropped with a warn at the next queue
+  swap (`pregel/worker.lua:338-346`). A typo in a receiver name is currently
+  worth two log lines and one wasted superstep.
+
+### 4.10 What stays programmatic, and what belongs to the cluster config
+
+The split the second round proposed, which this document adopts:
+
+- **Lua**: algorithms, dispatch, message schemas, reducers, master hooks, and
+  everything `p.define` validates. An app is a Lua value, testable without a
+  cluster.
+- **Cluster config**: participant discovery, stable replicaset identities,
+  credential *references*, transport, queue storage engine, batch sizes, the
+  path base, and autostart policy.
+
+Both entry points — the constructors and the roles — use the same validator
+(§3.8). `pool_size` is renamed `batch_messages`, which is what it is.
+
+Tarantool derives vshard's deployment from `sharding.roles`, the topology,
+`iproto.advertise.sharding` and `credentials`, and the separation is worth
+copying — including referencing a credentials role rather than repeating a
+password, which is what `pregel-60o` proposes. What is *not* available is the
+mechanism: pregel cannot invent a built-in config section, so it stays in
+`roles_cfg` and does not inherit vshard's migration guarantees.
+
+### 4.11 The small items of §3.12
+
+None of these is worth a subsection, and leaving them undisposed is how
+`write_solution` survived ten years.
 
 - Delete `write_solution` — the private method, the `pool_new` option and the
-  field on the vertex object. It has never had a call site.
-- `vertex:edges()` returns the array of `{destination, value}` pairs, and
-  `vertex:out_degree()` returns `#` of it. The edge list already *is* an array
-  on the object (`pregel/vertex.lua:30`), so both are accessors over what is
-  there; `pairs_edges()` goes with §4.3's `pairs_messages()`. This retires
-  `examples/pagerank/app.lua`'s counting loop.
-- `master:store_vertex(name, value)`, `master:store_edge(src, dst, value)` and
-  `master:flush()` — the loader sink's methods, on the master, for the case the
-  2016 app had to write as `master.mpool:by_id(...):put('vertex.store', ...)`.
-  They are three lines each and the routing already exists.
-- The result API stays out of scope; see open question 6.8.
+  field. It has never had a call site.
+- `v:edges()` returns an array of `{id, dst, value}`, and `v:out_degree()` its
+  length. This retires `examples/pagerank/app.lua`'s counting loop and gives
+  §4.6's edge ids somewhere to be read.
+- The master gains the sink's methods for one-off insertion, so an app never has
+  to write `master.mpool:by_id(id):put('vertex.store', ...)` as the 2016 one
+  did.
+- The result API is `run:vertices{}` (§4.8). The space layout stays documented;
+  see open question 8.8.
 
-## 5. Compatibility and migration
+## 5. Second opinion
 
-**The library has no external users.** It is `pregel-scm-1.rockspec`, unreleased,
-on a branch, with every consumer inside this repository: five examples, one
-test app, and the test suite. There is no reason to carry a compatibility shim,
-and a shim would cost more than it saves — the whole point of §4.1, §4.2 and
-§4.4 is that the old shapes are ambiguous, and a shim that accepts both keeps
-the ambiguity in the code forever while pretending it is gone.
+The second review's ranked list, in its order:
 
-Recommendation: **no shim, no deprecation cycle.** Change the API, change the
-six app modules and the tests in the same commit series, and record the shape
-change in the CHANGELOG's `Changed` section as one entry per numbered proposal.
+1. A run has no authoritative owner (its #5 and #9 are one problem).
+2. Job identity and partition identity are unsafe.
+3. The document's #3 understates the ownership bug.
+4. #1 is real, but topology semantics matter more than overload syntax.
+5. #2 is an identity contradiction, not merely boilerplate.
+6. #6 partly diagnoses correct behavior as a defect.
+7. #4 and #7 are wrong diagnoses.
+8. #8 is justified; #10 is minor.
+
+Plus a challenge to default halting, three refusals, and a full v2 sketch.
+
+Items 1, 2, 3 (second half), 4 (second half) and 5 were promoted to §3.13–§3.18
+after re-verification; they are not repeated here. What follows is the four
+disagreements the coordinator asked to be settled explicitly, plus the ones
+where this document's verdict is not a straight acceptance.
+
+### 5.1 Halt by default versus an explicit scheduling result
+
+**Its claim, verbatim:** "I also challenge default halting: omission shouldn't
+silently make an unfinished algorithm appear complete. Require an explicit
+scheduling result. Keep `max_supersteps` as an error-producing safety limit,
+separate from intentional bounded algorithms. Neither decision is implemented
+here: workers explicitly activate vertices, and the master loop is unbounded
+(`worker.lua:297`, `master.lua:97`)."
+
+**Evidence.** Both pointers check out. `pregel/worker.lua:297` is
+`vertex_object:vote_halt(false)` immediately before `vertex_compute`, so every
+vertex the filter admits is activated by the runtime, and a compute that never
+votes leaves it active. `pregel/master.lua:97-138` is `while true do` with the
+only exit being `msg_count == 0 and inp_count == 0`.
+
+**Verdict: accepted for v2; v1 is unaffected.**
+
+The two are not in conflict. In v1 the compute function returns nothing, so the
+runtime must guess what a silent compute meant, and halting is the better guess:
+the failure mode of halt-by-default is a job that ends early with a readable
+wrong answer, and the failure mode of the status quo is a cluster that never
+stops. `pregel-3v3` is the right v1 fix and lands as decided.
+
+In v2 there is nothing to guess, because §4.4's compute returns a tuple and the
+schedule is its second element. Requiring it costs one word per return and
+removes the choice entirely: `INVALID_COMPUTE_RESULT` names the bug instead of
+either behaviour papering over it. The objection to halt-by-default — that an
+unfinished algorithm silently looks converged — is real and is exactly the
+class of defect this document is otherwise about.
+
+`max_supersteps` as an error is accepted too, and it reverses the first draft.
+The first draft proposed `stopped_by = 'limit'` as an ordinary outcome; that is
+wrong for the same reason. A cap is reached only when the app failed to
+terminate, and reporting that as a normal completion is how a wrong answer gets
+believed. §4.9 states it as `SUPERSTEP_LIMIT`. An intentional bound is a
+different thing and has a different spelling (`control:finish`, or `HALT`).
+
+### 5.2 "Two settings channels" is a wrong diagnosis
+
+**Its claim, verbatim:** "#4 and #7 are wrong diagnoses. Configuration and
+worker-local resources are different things. The historical TASK owns training
+spaces; folding those into immutable settings would damage the API. The actual
+inconsistency is that roles *call* a callable context, while programmatic
+construction stores it unchanged (`roles/common.lua:386`, `worker.lua:893`)."
+
+**Evidence.** Verified, and it is worse than stated. `pregel/roles/common.lua:386-397`
+calls a callable `worker_context` with `app_cfg` and stores the result;
+`pregel/worker.lua:852` is `local wrk_context = options.worker_context` and
+`:893` is `worker_context = wrk_context`, with no call and no check. So the same
+app module produces a table from `vertex:get_worker_context()` under the roles
+and a *function* under `worker.new`. The resource half is verified too: the 2016
+TASK vertex assigns `self.dataSetSpace = box.space[space_name]`
+(`test-avro/node_task.lua:58`) — a space handle, on a pooled vertex object,
+because `worker_context` was the only slot on offer and it is built before the
+instance exists.
+
+**Verdict: accepted.** §3.5 was rewritten. The corrected diagnosis has three
+parts rather than one: there is a single configuration channel delivered in two
+shapes; there is a conflation of configuration with worker-local resources; and
+there is a roles-versus-constructor disagreement about what a callable context
+means. §4.1's `configure` and §4.2's `worker.open/close` split the first two;
+one validated declaration (§4.1) removes the third.
+
+One part of the original §3.5 the second round did not address and which stands:
+the master has no `worker_context` at all (`pregel/master.lua:230-239`), so
+`obtain_name` cannot be configured on the side that must agree with the workers.
+§4.3 removes `obtain_name`, which removes the need.
+
+### 5.3 roles_cfg duplication is appropriate
+
+**Its claim, verbatim:** "Likewise, exposing deployment tuning through YAML and
+constructors is appropriate; duplicating validation and defaults isn't." And:
+"Both constructors and roles use one validator; renaming `pool_size` to
+`batch_messages` would finally describe its meaning."
+
+**Evidence.** `pregel/roles/common.lua:110-145` holds types, ranges and
+emptiness checks; `pregel/worker.lua:846-873` holds the defaults and a different
+set of asserts; neither derives from the other. `pregel-ilf` is the recorded
+cost — `validate()` accepted an empty `name`, `app`, `master` or `user` and a
+`password` with no `user`, while `worker.new`'s asserts never covered any of
+them. `pool_size` is passed to the pool as `msg_count`, an outgoing batch size.
+
+**Verdict: accepted.** §3.8 was rewritten from "the options are duplicated" to
+"the contract is written twice and the two copies differ". The first draft's
+recommendation (keep five keys, tolerate the duplication) survives with a
+different reason: duplication of *exposure* is normal, duplication of
+*validation and defaults* is the defect. Open question 8.7 changed accordingly,
+and the rename is in §4.10.
+
+### 5.4 S−1 aggregate reads are correct BSP
+
+**Its claim, verbatim:** "#6 partly diagnoses correct behavior as a defect.
+Reading S−1 is essential BSP semantics. Keep it. `agg()` versus `agg(value)` is
+mainly an exposed implementation problem; vertices already have separate
+methods. More concerning are last-write-wins reducer defaults
+(`aggregator.lua:145`), one combiner for every payload, and the worker
+discarding the transmitted sender (`worker.lua:88`)."
+
+**Evidence.** All three of its "more concerning" items verified; the line
+numbers are approximate but land in the right functions.
+
+- Last-write-wins default: `pregel/aggregator.lua:148`,
+  `opts.reduce or (function(_, v) return v end)`.
+- One combiner: `pregel/worker.lua:864` reads a single `options.combiner` and
+  `:907-916` hands the same one to both queues. The landing `lookalike` example
+  has six message kinds (`pregel-bkk.3`).
+- Dropped sender: `pregel/worker.lua:88-90`. Measured — delivering
+  `{'bob', 'hello', 'alice'}` leaves the queue holding `["hello"]`. §3.18.
+
+**Verdict: accepted.** The S−1 read was never actually proposed for change — the
+first draft's §4.5 said `:get()` returns "the merged value from the previous
+superstep" — but the section title "the aggregator is three things behind one
+name" invited the reading, and lumping a correct semantic in with two defects is
+how a correct semantic gets removed by someone reading quickly. §3.7 now says
+plainly that S−1 stays and why, and §4.5 gives it a name (`ctx:previous`) that
+says it in the call. The three real defects are in §3.7 and §3.18 and are
+answered by §4.5.
+
+The `agg()`/`agg(value)` demotion is accepted as well: it is reachable only from
+library code and a console, so it is an exposed internal. What is not a demotion
+is the master having no public accessor and `get_global()` being wrong there —
+measured, and §3.7 keeps it.
+
+### 5.5 Where this document changed its own mind
+
+Not disagreements, but reversals the second round caused:
+
+- **`vertex:update(fn)` is withdrawn.** The first draft proposed it and rejected
+  a returned/copied value as too expensive. Measured: a tuple's value field is
+  decoded fresh per unpack, so the value is already detached and the cost that
+  objection rested on does not exist. §4.4's returned value is strictly better
+  and free.
+- **`master:start()` is not kept as an alias.** The first draft kept it "because
+  it is unambiguous". With `run` returning a handle that owns status,
+  cancellation and results, a `start()` that returns a number is a second
+  lifecycle with none of that, and §3.13 is what a second lifecycle costs. The
+  second round's own refusal — "compatibility overloads would preserve precisely
+  the ambiguity being removed" — applies.
+- **The migration order changed.** See §6.
+
+### 5.6 The three refusals
+
+The second round names three things it would not change. All three are accepted,
+and two of them constrain §4 in ways worth stating rather than leaving implicit.
+
+**"BSP visibility and S−1 aggregates, because every vertex must observe the same
+completed step."** Accepted; §5.4. §4.5 keeps it and names it `ctx:previous`.
+
+**"Arbitrary-ID messaging and topology mutation, because they make the
+classifier expressible without artificial edges."** Accepted, and this is the
+constraint that rules out the neighbour-only messaging of GraphX and the
+edge-centric decomposition of GAS as a *replacement* (§6). The evidence is in
+the 2016 app: a TASK vertex sends `FETCH` to a set of DATA vertices chosen from
+a dataset space, not from its edges (`7fba5d4^:test-avro/node_task.lua:60-70`),
+and a DATA vertex replies to whoever asked. Those are not graph edges and
+inventing edges for them would mean rewriting the graph per task.
+`ctx:send(dst_id, ...)` in §4.5 keeps the current freedom.
+
+**"The pure-Lua programmatic core and independently usable Avro/math modules,
+because deployment integration shouldn't become an algorithm dependency."**
+Accepted, and it is why §4.10 draws the line where it does: an app is a Lua
+value that `p.define` validates, and nothing in §4.1–§4.7 requires a cluster
+config to exist. It is also the argument against making the roles the source of
+the shared validator (open question 8.7).
+
+### 5.7 What the second review got wrong or imprecise
+
+Nothing in it was refuted. Six corrections, all minor, plus one place where it
+understated its own case:
+
+- **Understated:** "Changing addresses can therefore reroute names without
+  relocating existing tuples." Measured, it is not "can reroute" but *does
+  reroute everything*: renaming one of three worker URIs so that it sorts
+  differently sends 10000/10000 names to a different instance (§3.14). The
+  bucket number is stable — jump hashing is over the count — and it is the
+  bucket-to-instance mapping that is positional.
+- **Incomplete:** "Compute errors already propagate, but an exception skips
+  message cleanup and returning the pooled vertex." True, and the consequence is
+  a permanent wedge, not a leak: `pool.count` never returns to zero and the next
+  superstep spins forever in `while self.vertex_pool.count > 0`. Measured
+  (§3.13).
+- Line numbers, all landing in the right function but not on the cited line:
+  `aggregator.lua:145` is the constructor head, the default reducer is `:148`;
+  `worker.lua:457` is the loop head, `group[1].value` is `:464`;
+  `roles/master.lua:332` is inside the doc comment, the sentence is `:333-334`;
+  `loader.lua:446` is `local stored_vertices = 0`, the two-authority pair is
+  `:448` and `:453`; `pagerank/app.lua:63` is a comment, the call is `:66`.
+- Its links point into `.claude/worktrees/tarantool3` rather than this worktree.
+  Same commit, so every line number still resolves.
+
+Its `checks` proposal costs nothing: `require('checks')` succeeds on the stock
+Tarantool 3.9 binary, and the rockspec's only dependency today is
+`lua ~> 5.1`.
+
+## 6. Prior art
+
+The README already claims one lineage (`README.md:9-10`, `:872-873`); the second
+round supplied six more. One line each on what to take and what not to.
+
+- **Giraph** — take `compute(vertex, messages)` as two arguments, the separation
+  of vertex data from computation services, and `MasterCompute` running between
+  worker steps with the ability to broadcast control state. That is §4.4 and
+  §4.5's `control`. Do not take Java inheritance or the `Writable` type
+  machinery. Its `Vertex` also has an id given at input time and a
+  `getNumEdges()`, which are §4.3 and §4.11.
+- **Pregel+** — take the separation of partial (worker) and final (master)
+  aggregation, which is what this library already does and does not name. Its
+  request–respond extension is worth a later specialised read protocol; do not
+  fold it into `send`, whose temporal meaning must stay "arrives next
+  superstep".
+- **PowerGraph / GraphLab** — GAS separates gather, apply and scatter, and can
+  distribute work over adjacent edges. Worth offering as a helper. Do not
+  replace arbitrary-id messaging with it: the look-alike TASK's requests are not
+  graph edges, and that is the whole reason §5.6's refusal list keeps arbitrary-id
+  messaging.
+- **Flink Gelly** — `ComputeFunction`/`MessageCombiner` is the closest existing
+  match to this library's shape, and scatter-gather is worth offering as an
+  optional adapter for pure propagation algorithms. Do not make every app
+  implement two callbacks; a phased classifier gains nothing and pays ceremony.
+- **GraphX** — take the explicitly returned vertex value from
+  `vprog(id, value, message)`, which is §4.4 and the direct answer to §3.3. Do
+  not take the restriction of messaging to neighbours, RDD lineage, or treating
+  an iteration bound as indistinguishable from convergence — that last one is
+  §4.9.
+- **Ligra** — take frontier-based execution as an implementation option:
+  enumerating active vertices and message receivers instead of scanning every
+  tuple, which is what `run_superstep`'s full `data_space:pairs()` does today
+  (`pregel/worker.lua:306`). Do not promise its shared-memory atomics or dense
+  inbound traversal through this API.
+- **Tarantool idioms** — take `checks` plus semantic validation, explicit names
+  followed by an options table, and stable error objects.
+  `box.schema.space.create(name, opts)` and
+  `vshard.router.callrw(bucket, fn, args, opts)` are the local precedent, and
+  they are the argument against §3.1's shifting. `checks` is in the stock binary.
+- **vshard**, read at `/Users/blikh/data/workspace/vshard` — `router.new(name,
+  cfg)` returns an object whose methods live in one metatable
+  (`vshard/router/init.lua:1712-1741`), with module-level functions generated
+  from that table and bypassing to a static instance (`:1747-1752`), and `info()`
+  on both router and storage (`vshard/storage/init.lua:4270`). Take the object
+  shape and `info()`. Take also the config separation — `sharding.roles`,
+  `iproto.advertise.sharding` and a credentials role named `sharding`, all three
+  verified present in the Tarantool 3.9 binary, which contains the check
+  "Check that the vshard storage user has the credential sharding role." Do not
+  expect the mechanism: that section is built into the config schema and pregel
+  cannot add one (§4.10).
+
+## 7. Compatibility and migration
+
+**The library has no external users.** It is `pregel-scm-1.rockspec`,
+unreleased, on a branch, with every consumer inside this repository: five
+examples, one test app, and the test suite. There is no reason to carry a
+compatibility shim, and a shim would cost more than it saves — most of §4 exists
+because the old shapes are ambiguous, and a shim that accepts both keeps the
+ambiguity forever while pretending it is gone. The second round reached the same
+conclusion independently.
+
+Recommendation: **no shim, no deprecation cycle**, and no `master:start()` alias
+(§5.5).
 
 Which changes are breaking:
 
-- Breaking, for every app module: §4.1 (app object), §4.2 (explicit names),
-  §4.3 (compute signature), §4.5 (aggregator objects).
-- Breaking, but with no call site outside tests: §4.4's `_from` variants.
-- Breaking for one caller: §4.6 (`loader.new`).
-- Not breaking: §4.5's `master:run` and `master:status`, which are additive;
-  `master:start()` stays.
-- Additive, breaking nothing: §4.7's `vertex:update`, and §4.9's
-  `vertex:edges`, `vertex:out_degree` and the master's store methods.
-- Breaking, with no caller at all: §4.9's deletion of `write_solution`.
-- Behaviour change with no signature change: §4.8's halt default.
+- Breaking, for every app module: §4.1 (declaration), §4.2 (lifetimes), §4.3
+  (explicit ids), §4.4 (compute signature), §4.5 (messages and reducers), §4.6
+  (topology), §4.7 (loaders).
+- Breaking for the programmatic caller: §4.8 (`start()` replaced by `run`).
+- Breaking, with no caller at all: §4.11's deletion of `write_solution`.
+- Additive: §4.11's accessors and the master's sink methods.
+- Behaviour changes with no signature change: §4.9's three defaults, and §4.6's
+  single mutation timing.
 
-Order of implementation, chosen so that each step is separately testable and
-none of them leaves the tree half-migrated:
+**Order of implementation.** This adopts the second round's order, which differs
+from the first draft's and is better. The first draft ordered by blast radius —
+additive things first, the compute signature last — which optimises for keeping
+the tree green. The second round orders by risk: specify the semantics, then fix
+identity and failure containment, then port the hardest consumer, then
+consolidate the lifecycle. Two measurements settle it. §3.13's wedge and
+§3.14's 100% reroute are not ergonomics, and putting them behind a batch of
+renames means shipping a v2 whose worst defects are the ones v1 already had.
 
-1. §4.5's `master:run`/`master:status` and the aggregator object — additive,
-   nothing breaks, and `max_supersteps` (`pregel-3wg`) lands on top of it
-   instead of inside the loop.
-2. §4.8's halt default (`pregel-3v3`) — already specified, and independent —
-   together with §4.7's `vertex:update`, which is additive and touches nothing
-   else.
-3. §4.1's app object. The roles build it; `worker_context` becomes `setup`;
-   `common.here`/`resolve`/`cfg` are deleted and `examples/common.lua` with
-   them.
-4. §4.4's mutation methods. Small, self-contained, and it retires three closed
-   bugs' worth of shape.
-5. §4.2's explicit names, with §4.6's loader shape in the same series — they
-   touch the same five methods.
-6. §4.3's typed dispatch, last, because it is the one that wants the two
-   landing examples as its acceptance test rather than as its migration cost.
-   §4.9's accessors go with it, since `pairs_edges` and `pairs_messages` are
-   retired together.
+1. **Specify the semantics first, as contract tests.** Turn the CHANGELOG's
+   delivery, mutation, aggregation and cancellation traps into tests that hold
+   for both queue engines and for local as well as remote delivery. The
+   CHANGELOG's `Fixed` section is already a catalogue of them; what it is not is
+   a specification. Two of them were found by an agent reading doc comments
+   rather than by a test going red (`pregel-iv7`, `pregel-3e8`), and two whole
+   beads exist because six *other* fixes had no test that went red when the
+   defect was reintroduced (`pregel-hr3`, `pregel-9vt`).
+2. **Fix identity and failure containment.** Run fencing by `(job, run, step)`,
+   a stable partition manifest checked against the shard on disk, refusal of a
+   duplicate master, and unwinding on a compute exception (§3.13). File §3.13
+   and §3.18 as v1 bugs and fix them there — neither needs to wait for a new
+   API, and both are live.
+3. **Port the difficult consumer first.** Implement explicit ids, returned
+   values, typed messages and dispatch, then port the look-alike TASK
+   (`pregel-bkk.3`) *before* simplifying PageRank. It is the only app in the
+   history of this repository that uses more than a third of the API, and every
+   design decision in §4.4 and §4.5 was made from reading it. Simplifying
+   PageRank first would validate the easy half.
+4. **Consolidate lifecycle and configuration.** Move state into run handles,
+   reduce the roles to adapters over `p.define` and `m:run`, add result
+   iteration, then hard-cut the obsolete APIs and the space format.
 
-How each example migrates:
+How each example migrates, once the order above reaches it:
 
-- `max-value`, `wcc` — steps 3, 5, 6 are mechanical: `HERE`/`common.*` out,
-  `store_vertex` gains a name (through `loader.graph_edges_f`, which is library
-  code, so the app changes only its `obtain_name` deletion), `compute` gains two
-  parameters, `set_aggregation('max_seen', best)` becomes
-  `vertex:aggregator('max_seen'):add(best)`, and the whole-value rebuild becomes
-  a `vertex:update`.
-- `sssp` — the same, plus `worker_context` becomes `setup(ctx)` and
-  `worker_preload` becomes `load_on_worker(ctx)`.
-- `pagerank` — the same, and it is the example that gains most from §4.5: its
-  four `get_aggregation`/`set_aggregation` calls become two aggregator objects
-  fetched once per compute.
-- `topology-mutation` — the only one touched by §4.4 and by `add_vertex`'s new
-  name argument; its `orphan_of` marker also becomes the first natural user of
-  §4.3's typed compute, and its README's two-superstep explanation stays true.
+- `max-value`, `wcc` — mechanical. `HERE`/`common.*` out, `obtain_name` deleted,
+  ids passed at load, `compute` returns `(value, HALT)`, the aggregation call
+  becomes `ctx:aggregate`. Both also lose their whole-value rebuild (§3.3).
+- `sssp` — the same, plus `worker_context` becomes `configure` (it is
+  configuration, not a resource) and `worker_preload` becomes
+  `load = {on = 'workers', run = ...}`.
+- `pagerank` — the same, and it loses a superstep and an aggregator to
+  `ctx.graph.vertex_count` (§4.5).
+- `topology-mutation` — the one touched by §4.6: edge ids, one mutation timing,
+  and its `orphan_of` marker becomes the first real user of `p.dispatch`. Its
+  README's two-superstep explanation still holds, because a vertex added at the
+  barrier still appears in the next superstep.
 - `test/apps/maxvalue.lua` — the only app-level `loader.new` in the tree, so it
-  is the acceptance test for §4.6.
-- `lookalike` and `mf` (landing) — migrate with the rest, and are the one place
-  where that is a genuine question rather than a mechanical step, because
-  `lookalike` is the app §4.3 was designed from. See open question 6.1.
+  is the acceptance test for §4.7.
+- `lookalike` and `mf` (landing) — see open question 8.1.
 
-## 6. Open questions
+## 8. Open questions
 
-**6.1 — Do `lookalike` and `mf` wait for v2, or land on v1 and migrate?**
+**8.1 — Do `lookalike` and `mf` wait for v2, or land on v1 and migrate?**
 
-Recommended: land them on v1 as they are specified now, and migrate them with
-everything else. They are the best evidence available about whether §4.3 is the
-right shape, and evidence written against a design is not evidence. Their cost
-of migration is the same as the other examples'; the cost of blocking them is
-that the v2 design has no multi-type app to check itself against.
+Recommended: land them on v1 as specified, and port `lookalike` first in step 3
+above. They are the best evidence available about whether §4.4 and §4.5 are the
+right shapes, and evidence written against a design is not evidence. This is
+unchanged from the first draft and is reinforced by the second round, which
+built its entire TASK sketch out of the 2016 code for the same reason.
 
-**6.2 — Where does a vertex type live: a tuple field or a key in the value?**
+**8.2 — Where does a vertex kind live: a tuple field or a key in the value?**
 
-Recommended: a fifth field in the `data_<name>` tuple, nullable, defaulting to
-nil. The value stays entirely the app's, which is the current contract and worth
-keeping; and the type becomes indexable, which makes "count the TASK vertices"
-a `count()` rather than a full scan through Lua. The cost is a schema change
-that a worker restarted over an existing shard must survive —
-`create_spaces` uses `if_not_exists` throughout (`pregel/worker.lua:670`), so
-adding a field to the format of an existing space needs care.
+Recommended: a fifth field in the `data_<name>` tuple, nullable. The value stays
+entirely the app's, and the kind becomes indexable, which makes "count the TASK
+vertices" a `count()` and makes §4.5's `broadcast{activate = 'DATA'}`
+implementable without a full scan. The cost is a schema change a worker
+restarted over an existing shard must survive — `create_spaces` uses
+`if_not_exists` throughout (`pregel/worker.lua:670`) — which §3.14's partition
+manifest has to handle anyway.
 
-**6.3 — Does `obtain_name` survive at all after §4.2?**
+**8.3 — Is `obtain_name` deleted or kept optional?**
 
-Recommended: no, and deleted in the same release rather than kept. Keep it
-through the migration as an optional `worker.new` option so the series can be
-landed one step at a time; then check whether any caller is left. My
-expectation is that none is — the six definitions in the tree all reduce to
-one expression at the call site — and a hook with no caller is what
-`write_solution` has been since 2016 (§3.12). If a real caller does turn up,
-that is the answer instead, and it should be written down next to the option.
+Recommended: deleted, in the same release. The first draft said "keep it through
+the migration and check". §3.17 changes that: a second naming authority is not a
+convenience that goes unused, it is a way for a partitioned load to silently
+misroute an entire shard. One authority, enforced by there being only one.
 
-**6.4 — Should `messages` be an array or stay an iterator?**
+**8.4 — Should `inbox` materialise messages or stream them?**
 
-Recommended: an array. A superstep's messages for one vertex are already
-materialised by the combiner in the common case (one message per receiver,
-`pregel/queue.lua:104-118`), the array is what every call site builds anyway,
-and `#messages` answers "did anyone talk to me" without a loop. The risk is a
-vertex with an unbounded in-degree and no combiner: a hub in a graph like
-`soc-Epinions` receives thousands of messages, and today they are streamed. If
-that risk is judged real, the answer is `vertex:messages()` returning an array
-and `vertex:each_message()` returning an iterator, not an iterator alone.
+Recommended: both, and neither as the default shape. `inbox:fold(type, init,
+fn)` is what an algorithm actually wants and never materialises;
+`inbox:messages(type)` is an iterator of `{from, value}`. A `#`-able array is
+not offered, because the case that makes it attractive — "did anyone talk to
+me" — is `inbox:empty(type)`. This replaces the first draft's recommendation of
+a plain array, which would have materialised a hub's thousands of messages in a
+graph like `soc-Epinions` with no combiner.
 
-**6.5 — Does `master:run`'s `on_superstep` run on the master's fiber?**
+**8.5 — Does `on_progress` run on the master's fiber?**
 
-Recommended: yes, synchronously between supersteps, with the same contract as
-a compute function — it may yield, and it must not block forever. Anything else
-needs a second fiber and a queue, and the one thing the callback is for is
-deciding whether the next superstep happens.
+Recommended: yes, synchronously between supersteps, and a raise from it fails
+the run. It exists to decide whether the next superstep happens, and anything
+asynchronous cannot. `run:status()` is the non-blocking read for everyone else.
 
-**6.6 — Does §4.5's `master:status()` supersede the roles' `status()`?**
+**8.6 — Does `run:status()` supersede the roles' `status()`?**
 
-Recommended: no; the role's `status()` keeps its own states (`read_only`,
-`connecting`, `failed`) because those are facts about the role and not about
-the job, and it composes the master's `status()` into the rest. What goes away
-is the role's duplicate `superstep`/`state` bookkeeping (§3.6).
+Recommended: no. The role keeps `read_only`, `connecting` and `failed`, because
+those are facts about the *role*, and composes `run:status()` for everything
+about the job. What goes away is the role's duplicate bookkeeping (§3.6) and the
+autostart fiber's five-state table.
 
-**6.7 — Do the five remaining pass-through `roles_cfg` keys survive
-`pregel-60o`?**
+**8.7 — One validator for `roles_cfg` and the constructors: which direction?**
 
-Recommended: keep `pool_size`, `delayed_push`, `squash_only`, `queue_engine`
-and `connect_timeout` as they are, and revisit only if `pregel-60o` shows that
-the cluster config can express them. They are genuine per-deployment tuning,
-unlike `workers`/`master`/`user`/`password`, which are topology and identity
-and belong to the cluster config. The duplication complained about in §3.8 is
-worth accepting for five knobs; it was not worth accepting for nine.
+Recommended: the constructor's option table is the contract, `p.define` and the
+role's spec are both derived from it, and the role adds only what is genuinely
+YAML-only (`autostart`, `app`, `app_cfg`). The alternative — the role's spec as
+the source — puts the cluster config in charge of a programmatic API that must
+work without one. Rename `pool_size` to `batch_messages` in the same change
+(§4.10).
 
-**6.8 — Is the `data_<name>` space layout public interface?**
+**8.8 — Is the `data_<name>` space layout public interface?**
 
-Recommended: say yes, explicitly, and document the tuple format in the README
-rather than only in `pregel/worker.lua:8-13`. Every example README already reads
-results that way (§3.12) and there is no other way to read them. The
-alternative — a result API on the master that fans out to the workers — is a
-larger design than this document covers, and it would still need the space
-layout underneath it.
+Recommended: yes for reading, explicitly, and documented in the README rather
+than only in `pregel/worker.lua:8-13`. `run:vertices{}` (§4.8) is the supported
+path and does not remove the need: an operator inspecting a *failed* run has no
+run handle. What the layout must not be is stable across a partition change —
+§3.14's manifest lives beside it, and a shard whose manifest does not match its
+job must refuse to serve rather than answer for vertices it no longer owns.
+
+**8.9 — Is `p.KEEP` worth having, or should compute always return a value?**
+
+Recommended: keep it. A vertex that only reads its inbox and forwards is common
+(`examples/wcc`, `examples/max-value` on a superstep where nothing improved),
+and today the runtime already skips the write for it — `compute()` writes only
+when something changed (`pregel/vertex.lua:50-79`). Making every compute return
+a value would turn every read-only superstep into a full rewrite of the shard.
+`p.KEEP` is how the caller says what the dirty bit used to guess.
+
+**8.10 — Should §3.13 and §3.18 be fixed in v1 first?**
+
+Recommended: yes, both, as their own beads, before any v2 work starts. §3.13
+hangs a worker for the life of the process on any compute exception, and every
+app under development will hit it. §3.18 makes the CHANGELOG's own claim about
+`pregel-2qk.4` untrue. Neither fix depends on anything in §4, and leaving them
+until v2 means the landing `lookalike` example — which is a request/response
+protocol and will raise from compute during development — meets both on its
+first day.
