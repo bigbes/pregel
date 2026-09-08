@@ -29,5 +29,6 @@ build = {
         ['pregel.utils.elog']        = 'pregel/utils/elog.lua',
         ['pregel.utils.fiber_pool']  = 'pregel/utils/fiber_pool.lua',
         ['pregel.utils.strict']      = 'pregel/utils/strict.lua',
+        ['pregel.avro.schema']       = 'pregel/avro/schema.lua',
     },
 }
