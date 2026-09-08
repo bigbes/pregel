@@ -1,30 +1,21 @@
 local strict = require('pregel.utils.strict')
 
-local function shallow(orig)
-    local orig_type = type(orig)
-    local copy = orig
-    if orig_type == 'table' then
-        copy = {}
-        for orig_key, orig_value in pairs(orig) do
-            copy[orig_key] = orig_value
-        end
-    end
-    return copy
-end
-
+--- Recursively copy a value.
+--
+-- Non-table values are returned as they are. Metatables are not copied and
+-- cycles are not detected: the values this is used for (aggregator defaults)
+-- are plain trees.
 local function deep(orig)
-    local orig_type = type(orig)
-    local copy = orig
-    if orig_type == 'table' then
-        copy = {}
-        for orig_key, orig_value in pairs(orig) do
-            copy[orig_key] = deep(orig_value)
-        end
+    if type(orig) ~= 'table' then
+        return orig
+    end
+    local copy = {}
+    for key, value in pairs(orig) do
+        copy[key] = deep(value)
     end
     return copy
 end
 
 return strict.strictify({
-    shallow = shallow,
-    deep = deep
+    deep = deep,
 })

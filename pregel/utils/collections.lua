@@ -1,33 +1,27 @@
 local strict = require('pregel.utils.strict')
 
-local function defaultdict_index(factory)
-    return function(self, key)
-        if type(factory) == 'function' then
-            self[key] = factory(key)
-        else
-            self[key] = factory
-        end
-        return self[key]
-    end
-end
-
+--- A table that fills a missing key in on first read.
+--
+-- `factory` is either a value copied into every missing key, or a function
+-- called with the key. Reading a key always materialises it, so `pairs()` over
+-- a defaultdict only sees keys that were read or written.
 local function defaultdict(factory)
-    return setmetatable({}, {
-        __index = defaultdict_index(factory)
-    })
-end
-
-local function readonly_table(table)
-    return setmetatable({}, {
-        __index = table,
-        __newindex = function(table, key, value)
-            error("Attempt to modify read-only table")
-        end,
-        __metatable = false
-    });
+    local index
+    if type(factory) == 'function' then
+        index = function(self, key)
+            local value = factory(key)
+            rawset(self, key, value)
+            return value
+        end
+    else
+        index = function(self, key)
+            rawset(self, key, factory)
+            return factory
+        end
+    end
+    return setmetatable({}, { __index = index })
 end
 
 return strict.strictify({
     defaultdict = defaultdict,
-    rotable = readonly_table
 })
