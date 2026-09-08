@@ -439,14 +439,13 @@ end
 
 --- Union of two maps, the right-hand one winning.
 --
--- Deliberately not in place. An aggregator's accumulator *is* its `default`
--- until the first make_default() runs, so a reduce that mutated what it was
--- handed would rewrite the default for the rest of the job.
+-- Folds into the accumulator: an aggregator builds its accumulator from the
+-- `default` rather than aliasing it, so what arrives here is this
+-- aggregator's own table and mutating it costs nothing. It used to be a copy
+-- per contribution because that was not yet true, and one task's report is a
+-- copy of every other task's report per worker per superstep.
 local function merge_maps(acc, contribution)
-    local rv = {}
-    for key, value in pairs(acc or {}) do
-        rv[key] = value
-    end
+    local rv = acc or {}
     for key, value in pairs(contribution or {}) do
         rv[key] = value
     end
@@ -504,10 +503,7 @@ local function compute_master(self)
 
     if self:get_superstep() == 1 then
         for _, task in ipairs(value.roster) do
-            self:send_message(task_name(task), {
-                command = START,
-                from    = self:get_name(),
-            })
+            self:send_message(task_name(task), {command = START})
         end
     end
 
@@ -824,7 +820,6 @@ local function compute_task(self)
             for _, row in ipairs(value.labelled) do
                 self:send_message(data_name(row.vid), {
                     command = FETCH,
-                    from    = self:get_name(),
                     task    = value.task,
                     target  = row.target,
                 })
@@ -907,7 +902,6 @@ local function compute_task(self)
             for _, name in ipairs(targets) do
                 self:send_message(name, {
                     command = PREDICT_CALIBRATE,
-                    from    = self:get_name(),
                     task    = value.task,
                     weights = weights,
                 })
@@ -969,20 +963,21 @@ end
 local function compute_data(self)
     local value = self:get_value()
 
-    for _, message in self:pairs_messages() do
+    -- The sender comes off the queue rather than out of the payload: both of
+    -- these messages are questions, and answering the vertex that asked is
+    -- what `pairs_messages()`'s first value is for.
+    for from, message in self:pairs_messages() do
         if message.command == FETCH then
-            self:send_message(message.from, {
+            self:send_message(from, {
                 command  = FEATURES,
-                from     = self:get_name(),
                 task     = message.task,
                 vid      = value.vid,
                 target   = message.target,
                 features = value.features,
             })
         elseif message.command == PREDICT_CALIBRATE then
-            self:send_message(message.from, {
+            self:send_message(from, {
                 command = SCORE,
-                from    = self:get_name(),
                 task    = message.task,
                 score   = gd.score(value.features, message.weights),
             })

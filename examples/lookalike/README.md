@@ -50,6 +50,14 @@ first thing it does is ask what it is looking at.
 Eight supersteps, whatever the size of the input: the fixture below and a
 2000-user run both take exactly eight. What grows is the work inside them.
 
+Both of the user's steps above are *answers*, and the address they go back to
+comes off the queue rather than out of the payload: `pairs_messages()` yields
+`(sender, message)`, so a user replies with `self:send_message(from, ...)` and
+neither FETCH nor PREDICT_CALIBRATION has to carry a `from` field for it. That
+is a recent core fix — the sender used to be transmitted and then dropped on
+delivery, and every request/response protocol had to put it in the message by
+hand.
+
 A question asked in superstep S is read in S+1 and answered into S+2, so each of
 the two round trips costs the task a superstep of waiting. `value.await` is the
 superstep the answers are due in. Without it the TRAINING branch runs on an
@@ -102,9 +110,12 @@ there is one `model` aggregator whose value is a map from task name to
 `{state, weights, cuts, bucket, report}`, each task writing its own key and
 reading nobody's.
 
-The union used to merge it does not modify what it is handed. An aggregator's
-accumulator *is* its `default` until the first `make_default()` runs, so a
-reduce that appended in place would rewrite the default for the rest of the job.
+The union used to merge it folds into the accumulator it is handed. It used to
+copy instead — a table per contribution, which is one copy of every task's
+report per worker per superstep — because an aggregator's accumulator *was* its
+`default` until the first `make_default()` ran, and a reduce that appended in
+place rewrote the default for the rest of the job. The core builds the
+accumulator from the default now, so the copy bought nothing.
 
 ## Score and percentile
 
