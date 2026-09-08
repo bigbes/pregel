@@ -14,9 +14,10 @@ local t    = require('luatest')
 local fio  = require('fio')
 local json = require('json')
 
-local schema = require('pregel.avro.schema')
-local codec  = require('pregel.avro.codec')
-local ocf    = require('pregel.avro.ocf')
+local schema  = require('pregel.avro.schema')
+local codec   = require('pregel.avro.codec')
+local ocf     = require('pregel.avro.ocf')
+local deflate = require('pregel.avro.deflate')
 
 local g = t.group('avro_interop')
 
@@ -287,6 +288,36 @@ g.test_deflate_fixtures_are_really_deflate = function()
         end
     end
     t.assert_gt(smaller, 0, 'no deflate fixture is smaller than its null twin')
+end
+
+--------------------------------------------------------------------------------
+-- The pure-Lua inflater, against zlib's own output
+--
+-- Every Avro fixture above is a few hundred bytes and a container file this
+-- repository writes on a build without compress.zlib uses stored blocks, so
+-- between them they never emit a length code above the first few -- the
+-- LENGTH_BASE / LENGTH_EXTRA tables of deflate.lua went essentially untested.
+-- deflate_corpus.raw is built by gen.py to make the compressor use every one
+-- of the 29 length codes; see deflate_corpus() there.
+--------------------------------------------------------------------------------
+
+g.test_inflate_matches_zlib_over_a_corpus_using_every_length_code = function()
+    local meta  = json.decode(slurp('deflate_corpus.meta.json'))
+    local plain = slurp('deflate_corpus.raw')
+    t.assert_equals(#plain, meta.plain_bytes, 'the corpus is the size gen.py wrote')
+    -- Big enough to reach the long matches; the check is worthless otherwise.
+    t.assert_gt(#plain, 65536)
+
+    for _, level in ipairs({'1', '6', '9'}) do
+        local entry  = meta.levels[level]
+        local packed = slurp(entry.file)
+        t.assert_equals(#packed, entry.packed, entry.file .. ' is intact')
+        local got = deflate.inflate(packed)
+        -- Byte-for-byte, not a length or a checksum: a wrong LENGTH_BASE entry
+        -- copies the right number of bytes from the wrong place as often as not.
+        t.assert_equals(#got, #plain, 'inflated length at level ' .. level)
+        t.assert_equals(got, plain, 'inflated bytes at level ' .. level)
+    end
 end
 
 --------------------------------------------------------------------------------

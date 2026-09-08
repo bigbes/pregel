@@ -437,6 +437,59 @@ g.test_overlong_varint_is_rejected = function()
                                 string.rep('\255', 10) .. '\1')
 end
 
+--- An `int` on the wire is a varint of any width, so a writer that put a value
+--  outside the int32 range there is producing something the reader must not
+--  quietly widen. Nothing pinned get_int's range check: removing it left the
+--  whole suite green.
+g.test_decoding_an_int_outside_the_int32_range_is_rejected = function()
+    local sc = schema.parse('"int"')
+    -- 80 80 80 80 10 is zigzag 2^32, i.e. 2^31 -- one past INT_MAX.
+    t.assert_error_msg_contains('out of the int range',
+                                codec.decode, sc, unhex('80 80 80 80 10'))
+    -- And one past INT_MIN.
+    t.assert_error_msg_contains('out of the int range',
+                                codec.decode, sc, unhex('81 80 80 80 10'))
+    -- The boundaries themselves decode.
+    t.assert_equals(codec.decode(sc, unhex('fe ff ff ff 0f')), 2147483647)
+    t.assert_equals(codec.decode(sc, unhex('ff ff ff ff 0f')), -2147483648)
+end
+
+--- A block count larger than a double holds exactly cannot be used as a loop
+--  bound. Without the check tonumber() rounds it and the reader walks off into
+--  the buffer, reporting whatever it trips over next instead of the count.
+g.test_a_block_count_beyond_the_exact_double_range_is_rejected = function()
+    local out = {}
+    codec.put_long(out, 2^60)
+    local header = table.concat(out)
+    -- The offset named is the one just past the count's varint.
+    local at = #header + 1
+    for _, spec in ipairs({'{"type":"map","values":"int"}',
+                           '{"type":"array","items":"int"}'}) do
+        t.assert_error_msg_contains(
+            'block count at offset ' .. at .. ' is out of range',
+            codec.decode, schema.parse(spec), header .. string.rep('\0', 16))
+    end
+end
+
+--- skip_blocks jumps over a sized block in one step, so the declared size has
+--  to be bounded by the buffer before it is added to the position. Without
+--  need() the jump lands past the end and the failure surfaces far away, as a
+--  varint error at an offset that is not in the file, instead of naming the
+--  block that is too big.
+g.test_skipping_a_sized_block_that_overshoots_the_buffer_is_reported = function()
+    local sc = schema.parse('{"type":"array","items":"int"}')
+    -- Count -1 in the negative form, then a block byte size of 200, then far
+    -- fewer than 200 bytes.
+    local out = {}
+    codec.put_long(out, -1)
+    codec.put_long(out, 200)
+    local data = table.concat(out) .. string.rep('\0', 32)
+    local err = select(2, pcall(codec.skip, sc, data, 1))
+    t.assert_str_contains(tostring(err), 'bytes wanted at offset',
+                          false, 'the block size, not a stray varint, is blamed')
+    t.assert_str_contains(tostring(err), '200 bytes wanted')
+end
+
 --------------------------------------------------------------------------------
 -- validate()
 --------------------------------------------------------------------------------

@@ -312,6 +312,29 @@ g.test_non_union_writer_into_a_union_reader = function()
     t.assert_equals(through('"int"', 5, '["null","long"]'), 5)
 end
 
+--- "if the reader's is a union, the FIRST schema in the reader's union that
+--  matches the writer's schema is recursively resolved against it."
+--
+-- The existing coverage only used reader unions with a single compatible
+-- branch, so reversing the search loop -- taking the last match instead of the
+-- first -- changed nothing. A long past 2^53 tells the two apart: read as a
+-- long it stays int64 cdata, read as a double it comes back a Lua number.
+g.test_a_reader_union_takes_the_first_compatible_branch_not_the_last = function()
+    local big = 9007199254740993LL  -- 2^53 + 1, not exact as a double
+    local as_long = through('"long"', big, '["long","double"]')
+    t.assert_equals(type(as_long), 'cdata', 'the long branch comes first')
+    t.assert_equals(tostring(as_long), tostring(big))
+
+    local as_double = through('"long"', big, '["double","long"]')
+    t.assert_equals(type(as_double), 'number', 'the double branch comes first')
+    t.assert_equals(as_double, 9007199254740992)
+
+    -- Both branches really are compatible, so the order is what decided it.
+    t.assert_equals(type(resolve.resolver(schema.parse('"long"'),
+                                          schema.parse('["long","double"]'))),
+                    'function')
+end
+
 g.test_union_writer_into_a_non_union_reader = function()
     t.assert_equals(through('["int"]', 5, '"long"'), 5)
 end

@@ -20,8 +20,19 @@ compare bytes with the .bin.
 The .json files spell bytes and fixed values as {"$bytes": "<hex>"} so that a
 byte string survives the JSON round trip on both sides -- JSON has no byte
 type, and fastavro hands these back as Python bytes.
+
+Alongside the Avro cases this also writes a raw-deflate corpus, which has
+nothing to do with Avro's data model and everything to do with the pure-Lua
+inflater that reads a deflate block on a build without compress.zlib:
+
+    deflate_corpus.raw        the plaintext
+    deflate_corpus.l{1,6,9}.z the same bytes as raw deflate (zlib, wbits=-15)
+    deflate_corpus.meta.json  sizes and the plaintext's SHA-256
+
+See deflate_corpus() for why it is shaped the way it is.
 """
 
+import hashlib
 import io
 import json
 import os
@@ -339,6 +350,67 @@ def write(path, data):
     print("  %-28s %7d bytes" % (os.path.basename(path), len(data)))
 
 
+def deflate_corpus():
+    """A plaintext that makes a compressor emit every RFC 1951 length code.
+
+    The pure-Lua inflater in pregel/avro/deflate.lua is what reads a deflate
+    block on a build without compress.zlib, and its LENGTH_BASE / LENGTH_EXTRA
+    tables are only exercised by the length codes a stream actually uses. The
+    Avro fixtures above are a few hundred bytes each and never reach the higher
+    codes, so a wrong entry in those tables changed nothing anywhere in the
+    suite.
+
+    Matches of every length from 3 to 258 cover all 29 length codes, so the
+    corpus is, for each length L, a pseudo-random block of L bytes followed
+    immediately by a copy of itself -- which is exactly a back-reference of
+    length L. A tail of unrepeated bytes keeps the literal path in the picture
+    and stops the whole thing being one long run.
+
+    The PRNG is a plain LCG written out here rather than `random`, so the bytes
+    do not depend on the Python version.
+    """
+    state = 0x2545F491
+    def nxt():
+        nonlocal state
+        state = (state * 1103515245 + 12345) & 0x7FFFFFFF
+        return (state >> 16) & 0xFF
+
+    out = bytearray()
+    for length in range(3, 259):
+        # A small alphabet: enough variety to be worth compressing, small
+        # enough that the matcher finds the repeat rather than a longer one.
+        block = bytes((nxt() % 24) + 0x61 for _ in range(length))
+        out += block
+        out += block
+    out += bytes(nxt() for _ in range(4096))
+    return bytes(out)
+
+
+def write_deflate_fixtures():
+    """Raw deflate streams (wbits=-15, the framing Avro's deflate codec uses)."""
+    import zlib
+
+    print("deflate_corpus")
+    plain = deflate_corpus()
+    write(os.path.join(HERE, "deflate_corpus.raw"), plain)
+    levels = {}
+    for level in (1, 6, 9):
+        c = zlib.compressobj(level, zlib.DEFLATED, -15)
+        packed = c.compress(plain) + c.flush()
+        assert zlib.decompress(packed, -15) == plain
+        name = "deflate_corpus.l%d.z" % level
+        write(os.path.join(HERE, name), packed)
+        levels[str(level)] = {"file": name, "packed": len(packed)}
+    write(os.path.join(HERE, "deflate_corpus.meta.json"),
+          json.dumps({
+              "plain": "deflate_corpus.raw",
+              "plain_bytes": len(plain),
+              "sha256": hashlib.sha256(plain).hexdigest(),
+              "levels": levels,
+              "wbits": -15,
+          }, indent=2, sort_keys=True) + "\n")
+
+
 def main():
     print("fastavro", fastavro.__version__)
     index = []
@@ -386,6 +458,8 @@ def main():
                   out.getvalue())
 
         index.append(name)
+
+    write_deflate_fixtures()
 
     write(os.path.join(HERE, "index.json"),
           json.dumps({"cases": index, "fastavro": fastavro.__version__},

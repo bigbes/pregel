@@ -1,0 +1,20 @@
+{
+  "levels": {
+    "1": {
+      "file": "deflate_corpus.l1.z",
+      "packed": 27853
+    },
+    "6": {
+      "file": "deflate_corpus.l6.z",
+      "packed": 27058
+    },
+    "9": {
+      "file": "deflate_corpus.l9.z",
+      "packed": 27058
+    }
+  },
+  "plain": "deflate_corpus.raw",
+  "plain_bytes": 70912,
+  "sha256": "bb713fe91e94677b28627b8d78568b04af49862ab62ebefdd8e15d1458eece91",
+  "wbits": -15
+}
