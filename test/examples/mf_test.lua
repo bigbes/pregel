@@ -205,6 +205,50 @@ g.test_every_vertex_carries_a_latent_vector_of_the_configured_rank = function()
     t.assert_equals(edges, 2 * TRAIN_RATINGS)
 end
 
+--- Feed one run's worth of epochs through the master's own merge hook.
+--
+-- `train_sse`'s merge is the only code that runs on the master per superstep,
+-- and it is where the history is built -- so driving it directly is running a
+-- job's worth of master-side bookkeeping without a cluster, and two of them in
+-- one process is the case this is about. `default` is what a worker holding no
+-- user vertex contributes, superstep 0 and all.
+local function drive_epochs(merge, first_superstep, count, workers)
+    local default = {sse = 0.0, n = 0, superstep = 0}
+    for s = first_superstep, first_superstep + count - 1 do
+        for w = 1, workers do
+            merge(default, {sse = 1.0 * w, n = 2, superstep = s})
+        end
+    end
+end
+
+g.test_a_second_job_does_not_report_the_first_one_s_epochs = function()
+    -- `history` is a module-level upvalue on the master, and nothing used to
+    -- clear it: a 30-epoch run followed by a 10-epoch one on the same instance
+    -- answered with 30 entries, of which epochs 11..30 belonged to the run
+    -- before and were indistinguishable from the current one's.
+    local app = require('examples.mf.app')
+    local merge = app.aggregators.train_sse.merge
+    t.assert_type(merge, 'function', 'train_sse has no merge')
+
+    -- Epoch k is superstep k + 1; the seeding superstep contributes the
+    -- default and is not recorded.
+    drive_epochs(merge, 2, 30, helper.WORKER_COUNT)
+    local first = app.train_history()
+    t.assert_equals(#first, 30, 'the first run did not record 30 epochs')
+    t.assert_equals(first[#first].epoch, 30)
+
+    drive_epochs(merge, 2, 10, helper.WORKER_COUNT)
+    local second = app.train_history()
+    t.assert_equals(#second, 10,
+                    'the second run reported ' .. #second ..
+                    ' epochs, so it is still carrying the first run\'s')
+    t.assert_equals(second[#second].epoch, 10)
+    for i, entry in ipairs(second) do
+        t.assert_equals(entry.epoch, i)
+        t.assert_equals(entry.superstep, i + 1)
+    end
+end
+
 g.test_the_rank_comes_from_app_cfg = function()
     -- Two epochs, because what is under test is the shape of the vectors and
     -- not what is in them -- and a rank the app_cfg did not ask for would be

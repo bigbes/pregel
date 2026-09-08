@@ -164,7 +164,19 @@ end
 -- has to travel inside it.
 --
 -- Empty on a worker, which never calls `merge`.
+--
+-- It belongs to a *run*, and an upvalue does not end when one does: a master
+-- instance outlives the job it ran, so a second run -- a restart, or another
+-- job through `pregel.roles.master` on that instance -- used to read back the
+-- previous run's epochs alongside its own, with nothing to tell them apart.
+-- `history_high` is what makes the boundary visible; see merge_sse.
 local history = {}
+local history_high = 0
+
+local function reset_history()
+    history = {}
+    history_high = 0
+end
 
 --- Sum two {sse, n, superstep} accumulators.
 --
@@ -187,7 +199,19 @@ end
 local function merge_sse(old, new)
     local rv = add_sse(old, new)
     if rv.superstep > 0 then
+        -- A superstep *below* the highest already recorded is a new run on a
+        -- master still holding the last one's epochs, and this is the only
+        -- place that can see it: supersteps only rise within a run, and the
+        -- several merges of one superstep report it unchanged rather than
+        -- higher -- so `<` rather than `<=`, or every worker after the first
+        -- would wipe the run so far.
+        if rv.superstep < history_high then
+            reset_history()
+        end
         history[rv.superstep] = {sse = rv.sse, n = rv.n}
+        if rv.superstep > history_high then
+            history_high = rv.superstep
+        end
     end
     return rv
 end
@@ -372,6 +396,12 @@ function app.master_preload(instance, app_cfg)
     local path = common.resolve(HERE, cfg.train, 'train')
 
     return loader.new(instance, function(self)
+        -- The other half of scoping the history to a run, and the one that
+        -- covers a job loaded and then not run: merge_sse can only notice a
+        -- new run once that run has produced an epoch, so without this a
+        -- master between `preload()` and the first superstep still answers
+        -- with the previous run's history.
+        reset_history()
         log.info('mf: loading ratings from "%s"', path)
 
         local users, items = 0, 0

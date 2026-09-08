@@ -105,6 +105,23 @@ handed two accumulators and nothing else. That is why `train_sse` is a table
 rather than a number: the superstep an accumulator belongs to has to travel
 inside it. `app.train_history()` reads the result back.
 
+The history is a module-level table, and that is the part worth watching: an
+upvalue does not end when a run does, but a master instance outlives the job it
+ran. So a second run — a restart, or another job through
+`pregel.roles.master` on the same instance — used to answer with its own
+epochs *and* whatever the previous run had recorded beyond them, with nothing
+in the shape of the data to tell the two apart. Two things scope it to a run
+now: `master_preload` clears it as the graph is loaded, and `merge` clears it
+when the superstep it is handed is below the highest one recorded — supersteps
+only rise within a run, so going backwards is a new one. The comparison is
+strictly `<`: the several merges of a single superstep report it unchanged
+rather than higher, and clearing on those would wipe the run as it went.
+
+The real fix is an API the core does not have — a per-superstep hook on the
+master, `control:reduced` in `docs/api-design.md` §3.7 / §4.5. With one, the
+epoch's error would be read where it is produced and none of this would live in
+an upvalue.
+
 ## Files
 
 | file | what it is |
