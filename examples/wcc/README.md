@@ -30,7 +30,7 @@ get right before running this on a graph of your own.
 
 | file | what it is |
 | --- | --- |
-| `config.yaml` | the cluster config: one master, three workers, credentials, `roles_cfg` |
+| `config.yaml` | the cluster config: one master, three workers, the credentials role and the user carrying it, the job's spaces granted on the worker replicasets, `roles_cfg` |
 | `instances.yml` | the four instance names, for `tt` |
 | `tt.yaml` | makes this directory a `tt` application |
 | `app.lua` | `compute`, `combiner`, `obtain_name`, `master_preload` |
@@ -92,8 +92,9 @@ supersteps about eight and a half.
 
 Counting the components means counting distinct labels, which each worker can
 do over its own shard. Which shard is which is settled before anything runs: a
-vertex name is hashed onto one of the `workers` entries, and every instance
-sorts that list by the URI string first, so bucket 1 is `worker1`
+vertex name is hashed onto one of the job's workers — the instances the cluster
+config gives the worker role to — and every instance sorts that list by the URI
+string first, so bucket 1 is `worker1`
 (`127.0.0.1:3302`), bucket 2 is `worker2` (`:3303`) and bucket 3 is `worker3`
 (`:3304`) — the same three numbers below on every machine and after every
 restart. This is the same graph `examples/max-value` runs on, and the shard

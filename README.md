@@ -57,7 +57,12 @@ LUA_PATH="$PWD/?.lua;$PWD/?/init.lua;;" tarantool your-script.lua
 
 `pregel.roles.master` and `pregel.roles.worker` are Tarantool 3 roles, so a
 whole job is a cluster config plus one Lua module. Nothing is created by hand:
-the roles applier builds the master and the workers from `roles_cfg`.
+the roles applier builds the master and the workers out of the config, and out
+of the config alone — who the participants are comes from `roles`, the login
+and the privileges from `credentials`, and only what is genuinely this job's
+own from `roles_cfg`. This is how vshard is configured under Tarantool 3, and
+for the same reason: a fact spelled twice in a cluster config is a fact that
+can disagree with itself.
 
 The app module is what makes the job this job rather than another one. Both
 roles `require()` it by the name in `roles_cfg.app` and read the same fields
@@ -135,23 +140,31 @@ The cluster config below runs that module over one master and three workers:
 
 ```yaml
 credentials:
-  users:
-    replicator:
-      password: 'replicator-secret'
-      roles: [replication]
-    # The user pregel connects to its own peers as. Every message between a
-    # master and a worker is a conn:call() on one of these four names, so this
-    # grant is the whole privilege story -- the library asks for no universe
-    # grant and uses no conn:eval().
+  roles:
+    # The credentials role does two things at once. It marks the user pregel
+    # connects to its own peers as -- the roles look for the one user that
+    # carries it, and take that user's password -- and it carries what that
+    # user may do. Every message between a master and a worker is a conn:call()
+    # on one of these four names, so this is the first half of the privilege
+    # story; the library asks for no universe grant and uses no conn:eval().
     pregel:
-      password: 'pregel-secret'
       privileges:
         - permissions: [execute]
-          lua_call:
+          lua_call: &pregel_entry_points
             - pregel.worker.deliver
             - pregel.worker.deliver_batch
             - pregel.worker.wait
             - pregel.master.deliver
+  users:
+    replicator:
+      password: 'replicator-secret'
+      roles: [replication]
+    # Not called `pregel`: a credentials role and a user share one namespace,
+    # and the applier would die with "User 'pregel' already exists" before any
+    # role is applied.
+    pregel_peer:
+      password: 'pregel-secret'
+      roles: [pregel]
 
 iproto:
   advertise:
@@ -179,9 +192,34 @@ groups:
                 name: maxvalue          # job name
                 app: maxvalue           # the Lua module above
                 autostart: true         # run the job as soon as it can
-                user: pregel
-                password: pregel-secret
       r-worker1:
+        # The second half of the privileges: read/write on the job's own
+        # spaces, because a lua_call runs with the caller's privileges and the
+        # entry points write. It goes on the worker replicasets rather than
+        # next to the entry points above -- the master never creates these
+        # spaces, and an instance whose config grants read/write on an object
+        # that never appears keeps a `warn` alert about it and reports
+        # config:info().status as 'check_warnings' for good.
+        #
+        # Respecifying `privileges` at a narrower scope replaces the whole
+        # list, so the entry points are repeated through the anchor.
+        credentials: &worker_credentials
+          roles:
+            pregel:
+              privileges:
+                - permissions: [execute]
+                  lua_call: *pregel_entry_points
+                - permissions: [read, write]
+                  spaces:
+                    - data_maxvalue
+                    - topology_mutation_maxvalue
+                    - pregel_tube_mqueue_first_maxvalue
+                    - pregel_tube_mqueue_second_maxvalue
+                  # data_<job> has a string primary key and no sequence.
+                  sequences:
+                    - topology_mutation_maxvalue_seq
+                    - pregel_tube_mqueue_first_maxvalue_seq
+                    - pregel_tube_mqueue_second_maxvalue_seq
         instances:
           worker1:
             iproto:
@@ -192,9 +230,8 @@ groups:
               pregel.roles.worker:
                 name: maxvalue
                 app: maxvalue
-                user: pregel
-                password: pregel-secret
       r-worker2:
+        credentials: *worker_credentials
         instances:
           worker2:
             iproto:
@@ -203,6 +240,7 @@ groups:
             roles: [pregel.roles.worker]
             roles_cfg: *worker_cfg
       r-worker3:
+        credentials: *worker_credentials
         instances:
           worker3:
             iproto:
@@ -212,11 +250,27 @@ groups:
             roles_cfg: *worker_cfg
 ```
 
-Neither `workers` nor `master` appears in any `roles_cfg` here. Both roles fall
-back to reading the cluster config and taking every instance that runs the
-other role for a job of this `name`, so the config says who the participants
-are exactly once. Spell the URIs out instead when the participants are not all
-in one cluster config.
+Three things are not in `roles_cfg` and cannot be put there.
+
+**Who the participants are.** No `workers` list, no `master` URI: each role
+reads the cluster config and takes every instance whose `roles` names the other
+pregel role and whose `roles_cfg` for it says the same `name`. The config
+therefore says who is in the job exactly once — in `roles` — and every instance
+computes the same list from it, which is what makes them agree on the sharding.
+The cost is that a job cannot span two cluster configs, and that a replicated
+worker needs a config that names its leader (see [Replicas](#replicas)).
+
+**Which login they use.** No `user`, no `password`: the pregel user is the one
+carrying the credentials role `pregel`, and its password is that user's own.
+Exactly one user must carry it — every instance resolves this for itself, and
+two marked users are two instances that may pick different logins. This is how
+the framework identifies a vshard storage's user as well, through the
+semi-default `sharding` role.
+
+**What that login may do.** Both halves of the privileges are in `credentials`,
+and the roles grant nothing themselves. The spaces are named after the job and
+do not exist when the credentials applier first runs; it grants them from a
+trigger a few milliseconds after the worker role creates them.
 
 ### Putting those two files where `tt` will find them
 
@@ -325,18 +379,21 @@ Both roles take:
 * `name` — the job name (required). It names the spaces, and it is what the
   discovery above matches on, so one cluster can run several jobs.
 * `app` — the Lua module name both roles `require()` (required).
-* `workers` — array of every worker's net.box URI. Left out, it is discovered
-  from the cluster config.
+* `app_cfg` — an opaque table, handed to the app module and never read by the
+  roles. See [what an app module is told](#what-an-app-module-is-told).
 * `pool_size` — messages per outgoing batch (default 1000).
-* `user`, `password` — the net.box credentials for outgoing calls. A
-  `password` without a `user` is refused: the peers would connect as `guest`
-  and the password would go unused.
 * `connect_timeout` — seconds the role keeps trying to reach its peers before
-  giving up (default 300).
+  giving up (default 300). It also bounds the wait for the privileges the
+  `credentials` section grants, which normally arrive in milliseconds.
+
+That is the whole list. The participants, the login and the privileges are not
+options here — they come from `roles`, `credentials.users` and
+`credentials.roles.pregel` — and a `roles_cfg` that still spells `workers`,
+`master`, `user` or `password` is refused by name rather than ignored, so a
+config written for the older shape stops rather than half-works.
 
 `pregel.roles.worker` also takes:
 
-* `master` — the master's net.box URI; discovered when left out.
 * `squash_only` (default `false`) — run the app's combiner once per superstep
   instead of on every message put.
 * `queue_engine` — `space` (default, so the message queue survives a restart)
@@ -345,9 +402,15 @@ Both roles take:
   rather than memory, for a preload that produces more messages than fit in
   memory.
 
-`pregel.roles.master` also takes `autostart` (default `false`), which starts a
-background fiber that waits for every worker, preloads the graph and runs the
-supersteps.
+`pregel.roles.master` also takes:
+
+* `autostart` (default `false`) — start a background fiber that waits for every
+  worker, preloads the graph and runs the supersteps.
+* `max_supersteps` — a positive integer bounding the superstep loop; unset
+  means unbounded. Reaching it is a failure rather than a finish (the run did
+  not answer the question), so `status()` reports `failed` with the limit in
+  the message. Worth setting for an algorithm that is not known to converge,
+  and especially with `autostart`, where nobody is watching the job.
 
 One limit is deliberate: a running job cannot be reconfigured. An apply that
 changes `roles_cfg` while the job exists fails with a message saying to stop
@@ -355,8 +418,38 @@ the role first, because the worker list is resolved once and moving it under a
 running job cannot be done consistently.
 
 An unknown key in `roles_cfg` is refused by name rather than ignored, so a
-typo stops the config from applying. So is an empty `name`, `app`, `master` or
-`user`, and an aggregator option the app module misspells.
+typo stops the config from applying. So is an empty `name` or `app`, and an
+aggregator option the app module misspells.
+
+### What an app module is told
+
+An app module is `require()`d by name and handed two things, because a compute
+function is given nothing but its vertex and an app that read the cluster config
+itself would be tied to one deployment.
+
+The first is `roles_cfg.app_cfg`, opaque to the roles: where the graph is, which
+vertex is the source, what the threshold is. It arrives as the second argument
+of `master_preload` / `worker_preload` and, when `worker_context` is a function,
+as the argument that builds the context every compute function reads through
+`vertex:get_worker_context()`.
+
+The second is the job context, which is what the roles know and `app_cfg` would
+otherwise have to repeat — the third argument of the two preloads, and the
+second of a callable `worker_context`:
+
+```lua
+{name = 'maxvalue',            -- the job name, which its spaces are named after
+ user = 'pregel_peer',         -- the login pregel connects to its peers as
+ instance = 'worker1',         -- this instance's name in the cluster config
+ dir = '/opt/app'}             -- the directory the app module was loaded from
+```
+
+`user` is there for an app module that creates a space of its own: whatever a
+compute function writes to is written inside a `lua_call`, with the caller's
+privileges, so that space has to be readable and writable by the same user —
+and the app cannot read `roles_cfg` to find out who that is. `dir` is the only
+stable base for a relative path, since under `tt` an instance's working
+directory is its own, somewhere under `var/lib`.
 
 ### Waiting for the peers
 
@@ -394,20 +487,48 @@ participant of the job, not one per instance. It is addressed through the
 instance that will be read-write — the only one, if only one carries the role;
 otherwise the `rw` one under `replication.failover: off`, or the replicaset's
 `leader` under `manual`. Under `election` and `supervised` failover the config
-names no leader, so the role says so and asks for an explicit `workers` list
-rather than guessing.
+names no leader, and there is no list left to fall back to — the role says so
+and names the two ways out: run the worker on a replicaset of one instance, or
+use `manual` failover with a `leader`. It will not guess which replica is about
+to be writable and put a whole shard there.
 
 A discovered peer keeps the transport parameters of its `iproto.listen` entry,
 so a cluster listening with `transport: ssl` (Enterprise) is dialled over SSL.
 It does not keep the login from `iproto.advertise.peer`: that is the
-replication user, and the graph traffic connects as `roles_cfg.user`.
+replication user, and the graph traffic connects as the user marked with the
+credentials role `pregel`.
 
-Neither the `lua_call` grant nor the `credentials` section can name the job's
-spaces, because they do not exist when the credentials applier first runs. The
-worker role grants read/write on them itself, to the `user` from `roles_cfg`,
-right after creating them. A config that sets no `user` gets no such grant:
-the peers then connect as `guest`, and giving `guest` write access to the graph
-is a decision for the operator.
+### Privileges
+
+Both halves come from `credentials` and the roles grant nothing themselves.
+
+* `execute` on `lua_call` for the four entry points, at global scope: that is
+  every call one pregel instance makes to another.
+* `read,write` on the job's spaces and their sequences, on the *worker
+  replicasets*: `data_<job>`, `topology_mutation_<job>`,
+  `pregel_tube_mqueue_first_<job>`, `pregel_tube_mqueue_second_<job>`, and the
+  sequences behind the last three (`data_<job>` has a string primary key and
+  none). With `delayed_push`, the bucket spaces `pregel_mpool_<job>_NN` and
+  their `_seq` as well. This half is needed because a `lua_call` runs with the
+  caller's privileges and the entry points write.
+
+Those spaces do not exist when the credentials applier first runs — they are
+named after the job and created by the worker role. The applier grants them
+anyway: it keeps `on_replace` triggers on `_space` and `_sequence` and applies
+what the config lists as soon as the object appears. Measured at 8.9 ms after
+the space is created on CE 3.9 and 9.1 ms on EE 3.7, again after a
+`config:reload()`, and again after the spaces are dropped and re-created.
+
+Scope matters as much as the list. On an instance that never creates the object
+— the master, for the worker spaces — the applier keeps retrying, keeps a
+`warn` alert about it, and holds `config:info().status` at `check_warnings` for
+good. And respecifying `privileges` at replicaset scope replaces the whole
+list, so the entry points are repeated there.
+
+If something is missing, the role says which privilege on which object, and
+where to write it, through `status().error` and a `warn` alert — rather than
+letting the job connect, start, and fail inside a superstep with an access
+error from a remote call.
 
 Without `autostart`, nothing happens until someone drives the job. Both roles
 expose `get()` for that, returning the live object:
@@ -517,7 +638,9 @@ CRC-32 of the name (`pregel.mpool.guava_name`), so every instance computes the
 same owner without talking to anything, and adding a worker moves only the
 names it must.
 
-`worker.grant(user[, instance_name])` and `master.grant(user)` hand out
+`worker.grant(user[, instance_name])` and `master.grant(user)` are for this
+programmatic use only; the roles grant nothing and leave it to the
+`credentials` section. They hand out
 `execute` on `lua_call` for the entry points those modules publish —
 `pregel.worker.deliver`, `pregel.worker.deliver_batch`, `pregel.worker.wait`
 and `pregel.master.deliver`. Given an instance name as well, `worker.grant`

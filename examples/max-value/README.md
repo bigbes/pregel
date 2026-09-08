@@ -27,7 +27,7 @@ from the master without touching a worker.
 
 | file | what it is |
 | --- | --- |
-| `config.yaml` | the Tarantool 3 cluster config: one master and three workers, the `pregel` user and its `lua_call` privileges, and `roles_cfg` for each instance |
+| `config.yaml` | the Tarantool 3 cluster config: one master and three workers, the credentials role `pregel` and the user that carries it, the privileges (entry points globally, the job's spaces on the worker replicasets) and `roles_cfg` for each instance |
 | `instances.yml` | the four instance names, for `tt` |
 | `tt.yaml` | makes this directory a `tt` application |
 | `app.lua` | the app module: `compute`, `combiner`, `obtain_name`, `master_preload`, `aggregators` |
@@ -105,8 +105,8 @@ Each worker keeps its own shard in the space `data_<job name>` — here
 `data_maxvalue` — as `{name, halted, value, edges}`.
 
 Which worker holds what is decided without anyone being told: a vertex name is
-hashed onto one of the `workers` entries, and every instance orders that list
-the same way — by the URI string, sorted — so bucket N means the same worker
+hashed onto one of the job's workers — the instances the cluster config gives
+the worker role to — and every instance orders that list the same way — by the URI string, sorted — so bucket N means the same worker
 everywhere. For the ports in this `config.yaml` that makes bucket 1 `worker1`
 (`127.0.0.1:3302`), bucket 2 `worker2` (`:3303`) and bucket 3 `worker3`
 (`:3304`), and the split below is the same on every machine and after every

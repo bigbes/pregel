@@ -122,8 +122,9 @@ The dangling value is `F`'s rank, which is what it should be: `F` is the only
 vertex with no out-edges.
 
 Which worker holds what is fixed rather than incidental: a vertex name is
-hashed onto one of the `workers` entries, and every instance sorts that list by
-the URI string first, so bucket N means the same worker everywhere. For the
+hashed onto one of the job's workers — the instances the cluster config gives
+the worker role to — and every instance sorts that list by the URI string
+first, so bucket N means the same worker everywhere. For the
 ports in this `config.yaml` that is bucket 1 = `worker1` (`127.0.0.1:3302`),
 bucket 2 = `worker2` (`:3303`), bucket 3 = `worker3` (`:3304`), and the split
 below comes out the same on every machine and after every restart.

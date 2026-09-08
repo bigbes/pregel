@@ -93,8 +93,9 @@ is written as a pipe instead, so it can be pasted as it stands.
 
 The graph is small enough to print whole. Each tuple is
 `{name, halted, value, edges}`. Which worker a vertex lands on is fixed: the
-name is hashed onto one of the `workers` entries, and every instance sorts that
-list by the URI string first, so bucket 1 is `worker1` (`127.0.0.1:3302`),
+name is hashed onto one of the job's workers — the instances the cluster config
+gives the worker role to — and every instance sorts that list by the URI string
+first, so bucket 1 is `worker1` (`127.0.0.1:3302`),
 bucket 2 is `worker2` (`:3303`) and bucket 3 is `worker3` (`:3304`) — the
 placement below is the same on every machine and after every restart.
 

@@ -52,8 +52,9 @@ autostart nothing happens until an operator drives it:
 All seven listen on `127.0.0.1:3301`…`3304`, so run one at a time.
 
 Every per-worker transcript in these READMEs is reproducible, not a snapshot:
-a vertex name is hashed onto one of the `workers` entries, and every instance
-sorts that list by the URI string before hashing, so bucket 1 is always
+a vertex name is hashed onto one of the job's workers — the instances the
+cluster config gives the worker role to — and every instance sorts that list by
+the URI string before hashing, so bucket 1 is always
 `worker1` (`127.0.0.1:3302`), bucket 2 `worker2` (`:3303`) and bucket 3
 `worker3` (`:3304`). The same vertex lands on the same worker on every machine
 and after every restart.
@@ -69,10 +70,17 @@ a function) as the argument that builds the context every compute function
 reads through `vertex:get_worker_context()`. Those two are the whole channel,
 because a compute function is handed nothing but its vertex.
 
+Alongside it the roles hand over what they know and `app_cfg` would otherwise
+have to repeat — `{name, user, instance, dir}`, the job name, the login pregel
+connects as, this instance's name and the app module's own directory. It is the
+last argument of the two preloads and the second of a callable
+`worker_context`; see the roles reference in the top-level README.
+
 Paths in `app_cfg` are relative to the example's own directory, resolved by
 `examples/common.lua` against the directory the app module was loaded from —
 the process's working directory is no use, since it differs between `tt` and
-the test suite.
+the test suite. (The job context's `dir` is the same directory, and is what a
+new app module should use.)
 
 ## The tests
 
