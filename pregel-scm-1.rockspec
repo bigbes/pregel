@@ -39,5 +39,6 @@ build = {
         ['pregel.math.gd']           = 'pregel/math/gd.lua',
         ['pregel.math.auc']          = 'pregel/math/auc.lua',
         ['pregel.math.percentile']   = 'pregel/math/percentile.lua',
+        ['pregel.math']              = 'pregel/math/init.lua',
     },
 }
