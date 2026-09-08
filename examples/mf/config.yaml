@@ -1,0 +1,93 @@
+# One master and three workers, each the read-write leader of a replicaset of
+# its own. The master loads the ratings and drives the epochs; the workers need
+# app_cfg all the same, because rank, epochs, the learning rate, its decay and
+# lambda are read by the compute function through the worker context.
+
+credentials:
+  users:
+    pregel:
+      password: 'secret'
+      privileges:
+        - permissions: [execute]
+          lua_call:
+            - pregel.worker.deliver
+            - pregel.worker.deliver_batch
+            - pregel.worker.wait
+            - pregel.master.deliver
+
+wal:
+  mode: none
+
+groups:
+  pregel:
+    replicasets:
+      master:
+        instances:
+          master:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3301'
+            roles: [pregel.roles.master]
+            roles_cfg:
+              pregel.roles.master:
+                name: mf
+                app: app
+                autostart: true
+                user: pregel
+                password: 'secret'
+                workers:
+                  - '127.0.0.1:3302'
+                  - '127.0.0.1:3303'
+                  - '127.0.0.1:3304'
+                app_cfg: &app_cfg
+                  # Paths are relative to examples/mf/ and resolved by the app
+                  # module: an instance's own working directory is under
+                  # var/lib and is no use as a base.
+                  train: '../../test/fixtures/ratings/train.avro'
+                  # Not read by the job. examples/mf/evaluate.lua takes this
+                  # path as its argument, and naming it here is what keeps the
+                  # two halves of the example pointing at one dataset.
+                  test: '../../test/fixtures/ratings/test.avro'
+                  rank: 3
+                  epochs: 30
+                  lr: 0.05
+                  decay: 0.98
+                  lambda: 0.05
+      worker1:
+        instances:
+          worker1:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3302'
+            roles: [pregel.roles.worker]
+            roles_cfg: &worker_cfg
+              pregel.roles.worker:
+                name: mf
+                app: app
+                master: '127.0.0.1:3301'
+                workers:
+                  - '127.0.0.1:3302'
+                  - '127.0.0.1:3303'
+                  - '127.0.0.1:3304'
+                user: pregel
+                password: 'secret'
+                # The same table as the master's: the paths are ignored here
+                # (this app has no worker_preload) and the hyperparameters are
+                # ignored there. One anchor beats two lists that can drift.
+                app_cfg: *app_cfg
+      worker2:
+        instances:
+          worker2:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3303'
+            roles: [pregel.roles.worker]
+            roles_cfg: *worker_cfg
+      worker3:
+        instances:
+          worker3:
+            iproto:
+              listen:
+                - uri: '127.0.0.1:3304'
+            roles: [pregel.roles.worker]
+            roles_cfg: *worker_cfg
