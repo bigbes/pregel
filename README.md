@@ -651,6 +651,9 @@ position after it, so a concatenation of records can be walked; `avro.skip`
 walks past one without building it. Lua maps onto Avro the obvious way, with
 one wrinkle: a `null` nested in a record, array or map decodes to `box.NULL`
 (exported as `avro.NULL`), because a Lua `nil` would take the key with it.
+Ranges are enforced: an `int` outside 32 bits or a `long` outside 64 bits is
+refused by `encode` and `validate` rather than wrapped, and a union such as
+`["long", "double"]` picks the branch that can actually hold the value.
 
 ### Object container files
 
