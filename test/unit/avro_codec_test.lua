@@ -270,6 +270,28 @@ g.test_record_uses_a_default_for_a_missing_field = function()
     t.assert_equals(hex(codec.encode(sc, {a = 1})), '02 06 7a 7a 7a')
 end
 
+g.test_explicit_null_is_not_an_absent_field = function()
+    -- box.NULL compares equal to nil in LuaJIT, so a `v == nil` test cannot
+    -- tell a key holding an explicit null from a key that is not there. An
+    -- explicit null must encode as the null branch, not fall back to a default.
+    local sc = schema.parse([[{"type":"record","name":"R","fields":[
+        {"name":"a","type":["null","int"],"default":null},
+        {"name":"b","type":["int","null"],"default":7}
+    ]}]])
+    -- a = null branch 0, b = explicit null selects branch 1.
+    t.assert_equals(hex(codec.encode(sc, {a = NULL, b = NULL})), '00 02')
+    -- Absent fields fall back to the declared defaults instead.
+    t.assert_equals(hex(codec.encode(sc, {})), '00 00 0e')
+end
+
+g.test_validate_separates_absent_from_explicit_null = function()
+    local sc = schema.parse('{"type":"record","name":"R","fields":[' ..
+                            '{"name":"a","type":["null","int"]}]}')
+    t.assert_equals(codec.validate(sc, {a = NULL}), true)
+    -- No default and no value at all: not encodable.
+    t.assert_equals(codec.validate(sc, {}), false)
+end
+
 g.test_record_missing_field_without_a_default_is_an_error = function()
     local sc = schema.parse('{"type":"record","name":"R","fields":[' ..
                             '{"name":"a","type":["null","int"]}]}')

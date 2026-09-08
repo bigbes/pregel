@@ -57,6 +57,17 @@ end
 -- Number classification
 --------------------------------------------------------------------------------
 
+--- True only for a real Lua nil.
+--
+-- `box.NULL == nil` is true -- a NULL pointer cdata compares equal to nil in
+-- LuaJIT -- so `v == nil` cannot tell an absent table key from a key holding an
+-- explicit null. Everywhere that difference matters, ask for the type instead.
+local function is_absent(v)
+    return type(v) == 'nil'
+end
+
+M.is_absent = is_absent
+
 local function is_int64(v)
     return type(v) == 'cdata' and (ffi.istype(ct_i64, v) or ffi.istype(ct_u64, v))
 end
@@ -379,7 +390,7 @@ encoders['record'] = function(sc, value, out)
     for i = 1, #fields do
         local f = fields[i]
         local v = value[f.name]
-        if v == nil then
+        if is_absent(v) then
             local default, present = avro_schema.field_default(f)
             if present then
                 v = default
@@ -646,7 +657,7 @@ validators['record'] = function(sc, v)
     for i = 1, #sc.fields do
         local f = sc.fields[i]
         local item = v[f.name]
-        if item == nil then
+        if is_absent(item) then
             if not f.has_default and f.type.kind ~= 'null' then
                 return false
             end

@@ -563,6 +563,132 @@ function schema_mt:canonical()
 end
 
 --------------------------------------------------------------------------------
+-- Full JSON form
+--------------------------------------------------------------------------------
+
+local function put_props(out, props)
+    if props == nil then
+        return
+    end
+    -- Sorted so that the same schema always serialises to the same bytes.
+    local keys = {}
+    for k in pairs(props) do
+        keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    for i = 1, #keys do
+        out[#out + 1] = ',' .. quote(keys[i]) .. ':' .. json.encode(props[keys[i]])
+    end
+end
+
+local function put_names(out, names)
+    if names == nil then
+        return
+    end
+    local parts = {}
+    for i = 1, #names do
+        parts[i] = quote(names[i])
+    end
+    out[#out + 1] = ',"aliases":[' .. table.concat(parts, ',') .. ']'
+end
+
+local tojson_of
+
+tojson_of = function(sc, seen, out)
+    local kind = sc.kind
+    if PRIMITIVE[kind] then
+        if sc.props == nil then
+            out[#out + 1] = '"' .. kind .. '"'
+        else
+            out[#out + 1] = '{"type":"' .. kind .. '"'
+            put_props(out, sc.props)
+            out[#out + 1] = '}'
+        end
+        return out
+    end
+    if kind == 'union' then
+        out[#out + 1] = '['
+        for i = 1, #sc.types do
+            if i > 1 then
+                out[#out + 1] = ','
+            end
+            tojson_of(sc.types[i], seen, out)
+        end
+        out[#out + 1] = ']'
+        return out
+    end
+    if kind == 'array' or kind == 'map' then
+        out[#out + 1] = '{"type":"' .. kind .. '","' ..
+                        (kind == 'array' and 'items' or 'values') .. '":'
+        tojson_of(kind == 'array' and sc.items or sc.values, seen, out)
+        put_props(out, sc.props)
+        out[#out + 1] = '}'
+        return out
+    end
+    if seen[sc.fullname] then
+        out[#out + 1] = quote(sc.fullname)
+        return out
+    end
+    seen[sc.fullname] = true
+    -- The name is emitted as a fullname, which makes the namespace attribute
+    -- redundant and the result independent of where the type is nested.
+    out[#out + 1] = '{"type":"' .. kind .. '","name":' .. quote(sc.fullname)
+    if sc.doc ~= nil then
+        out[#out + 1] = ',"doc":' .. quote(sc.doc)
+    end
+    put_names(out, sc.aliases)
+    if kind == 'record' then
+        out[#out + 1] = ',"fields":['
+        for i = 1, #sc.fields do
+            local f = sc.fields[i]
+            if i > 1 then
+                out[#out + 1] = ','
+            end
+            out[#out + 1] = '{"name":' .. quote(f.name) .. ',"type":'
+            tojson_of(f.type, seen, out)
+            if f.doc ~= nil then
+                out[#out + 1] = ',"doc":' .. quote(f.doc)
+            end
+            if f.has_default then
+                out[#out + 1] = ',"default":' .. json.encode(f.default_json)
+            end
+            if f.order ~= nil then
+                out[#out + 1] = ',"order":' .. quote(f.order)
+            end
+            put_names(out, f.aliases)
+            put_props(out, f.props)
+            out[#out + 1] = '}'
+        end
+        out[#out + 1] = ']'
+    elseif kind == 'enum' then
+        local parts = {}
+        for i = 1, #sc.symbols do
+            parts[i] = quote(sc.symbols[i])
+        end
+        out[#out + 1] = ',"symbols":[' .. table.concat(parts, ',') .. ']'
+        if sc.default ~= nil then
+            out[#out + 1] = ',"default":' .. quote(sc.default)
+        end
+    elseif kind == 'fixed' then
+        out[#out + 1] = ',"size":' .. string.format('%d', sc.size)
+    end
+    put_props(out, sc.props)
+    out[#out + 1] = '}'
+    return out
+end
+
+--- The schema as JSON, keeping everything a parse would keep: docs, aliases,
+--  defaults, field order and any extra attributes such as logicalType. This is
+--  what goes into an object container file's `avro.schema` metadata, where the
+--  canonical form would be wrong -- it strips the defaults a reader needs.
+function schema_mt:tojson()
+    if self._json == nil then
+        self._json = table.concat(tojson_of(self, {}, {}))
+    end
+    return self._json
+end
+
+--------------------------------------------------------------------------------
 -- CRC-64-AVRO fingerprint
 --------------------------------------------------------------------------------
 
@@ -715,7 +841,9 @@ default_to_lua = function(sc, value)
         for i = 1, #sc.fields do
             local f = sc.fields[i]
             local got = value[f.name]
-            if got ~= nil then
+            -- type() rather than ~= nil: box.NULL compares equal to nil, so an
+            -- explicit null default would otherwise read as an absent one.
+            if type(got) ~= 'nil' then
                 out[f.name] = default_to_lua(f.type, got)
             elseif f.has_default then
                 out[f.name] = default_to_lua(f.type, f.default_json)
